@@ -34,7 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 HERE = Path(__file__).resolve().parent
 PAGE = HERE / "page.html"
@@ -45,6 +45,7 @@ REPEAT_WARNING_S = 300     # before the same kind of warning shows again
 WINDOW_S = 180             # how much of the conversation the AI sees
 AI_TIMEOUT_S = 120
 CONTEXT_MAX_CHARS = 8000   # of your context file that goes into each prompt
+PROMPT_MAX_CHARS = 20000   # of your prompt file (it goes on the claude command line)
 
 # ---------------------------------------------------------------- config
 
@@ -172,6 +173,28 @@ class Settings:
                 self.notices.append(f"context file not found or unreadable, ignored: {p}")
         self.language = g("LANGUAGE").strip()
 
+        # Optional: your own text in place of the built-in suggestions prompt (PROMPT_ASSIST).
+        # Missing, unreadable or empty: one note, and the built-in prompt.
+        self.prompt = ""
+        pf = g("PROMPT_FILE")
+        if pf:
+            p = Path(_expand(pf))
+            try:
+                text = p.read_text(encoding="utf-8-sig").strip()
+            except (OSError, UnicodeDecodeError) as e:
+                self.notices.append(f"prompt file not found or unreadable, using the built-in prompt: {p} "
+                                    f"({e.__class__.__name__})")
+            else:
+                if not text:
+                    self.notices.append(f"prompt file is empty, using the built-in prompt: {p}")
+                else:
+                    if len(text) > PROMPT_MAX_CHARS:
+                        self.notices.append(f"prompt file has {len(text)} characters; only the first "
+                                            f"{PROMPT_MAX_CHARS} are used: {p}")
+                        text = text[:PROMPT_MAX_CHARS]
+                    self.prompt = text
+                    self.notices.extend(check_prompt(text, p))
+
         hosts = [h.strip() for h in g("EXTRA_HOSTS").split(",") if h.strip()]
         self.hosts_ok = {f"127.0.0.1:{self.port}", f"localhost:{self.port}", *hosts}
         self.origins_ok = {f"http://127.0.0.1:{self.port}", f"http://localhost:{self.port}",
@@ -247,18 +270,62 @@ SCHEMA_ASSIST = {
 }
 
 
+def language_text() -> str:
+    if not S.language:
+        return ""
+    return (f"Write every item in {S.language}, whatever language the meeting uses "
+            "(keep the word EMPTY as is).")
+
+
+def context_text() -> str:
+    return "## About the user (from their context file)\n" + S.context if S.context else ""
+
+
 def personalize(prompt: str) -> str:
     """Add your language and context file (MEETING_COPILOT_LANGUAGE, MEETING_COPILOT_CONTEXT_FILE)."""
     if S.language:
-        prompt += (f"\nWrite every item in {S.language}, whatever language the meeting uses "
-                   "(keep the word EMPTY as is).\n")
+        prompt += f"\n{language_text()}\n"
     if S.context:
-        prompt += "\n## About the user (from their context file)\n" + S.context + "\n"
+        prompt += f"\n{context_text()}\n"
     return prompt
 
 
+# Placeholders a prompt file may use. The built-in suggestions prompt has none in its text: the language
+# and context lines are added at its end. Your file may put them where you want with {language} and
+# {context} (each becomes "" when that setting is empty); a part your file does not place is added at the
+# end, as for the built-in prompt.
+PROMPT_PLACEHOLDERS = ("{language}", "{context}")
+# The suggestions call returns JSON in a fixed shape (--json-schema, SCHEMA_ASSIST), so a prompt file can't
+# break the parser. It can leave the lists empty if it never asks for them: these words must stay in it.
+PROMPT_REQUIRED_WORDS = ("say", "ask")
+
+
+def check_prompt(text: str, path) -> list[str]:
+    """Startup notes about a prompt file: output fields it never names, and {words} that are no placeholder."""
+    import re
+    notes = []
+    missing = [w for w in PROMPT_REQUIRED_WORDS if not re.search(r"\b" + w + r"\b", text)]
+    if missing:
+        notes.append(f"prompt file {path} never names the output field(s) {', '.join(missing)}: the suggestions "
+                     "come back in the fields say, ask, corrections, goals_covered; without asking for "
+                     f"{' and '.join(missing)} that list may stay empty")
+    unknown = sorted(set(re.findall(r"\{[a-z_]+\}", text)) - set(PROMPT_PLACEHOLDERS))
+    if unknown:
+        notes.append(f"prompt file {path}: {', '.join(unknown)} is not a placeholder and stays as written "
+                     f"(placeholders: {', '.join(PROMPT_PLACEHOLDERS)})")
+    return notes
+
+
 def assist_prompt() -> str:
-    return personalize(PROMPT_ASSIST)
+    if not S.prompt:
+        return personalize(PROMPT_ASSIST)
+    prompt, tail = S.prompt, []
+    for key, value in (("{language}", language_text()), ("{context}", context_text())):
+        if key in prompt:
+            prompt = prompt.replace(key, value)
+        elif value:
+            tail.append(value)
+    return prompt + "".join(f"\n{t}\n" for t in tail) if tail else prompt + "\n"
 
 
 def data_prompt() -> str:
