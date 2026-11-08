@@ -100,13 +100,15 @@ def load_config(environ=None) -> dict:
     cfg: dict[str, str] = {}
     path = config_path(environ)
     if path.is_file():
-        for line in path.read_text(encoding="utf-8").splitlines():
+        # utf-8-sig: a BOM from an editor is fine; a stray non-UTF-8 byte never stops the program
+        for line in path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
             k, v = line.split("=", 1)
             v = v.strip()
-            if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+            # "one quoted value" loses its quotes; "a" "b" (quoted words inside) is kept as written
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'" and v[0] not in v[1:-1]:
                 v = v[1:-1]
             cfg[k.strip()] = v
     for k, v in environ.items():
@@ -117,7 +119,7 @@ def load_config(environ=None) -> dict:
 
 class Settings:
     def __init__(self, cfg: dict) -> None:
-        g = lambda k, d="": cfg.get("MEETING_COPILOT_" + k, d)  # noqa: E731
+        g = lambda k, d="": cfg.get("MEETING_COPILOT_" + k) or d  # noqa: E731  (KEY= with no value: the default)
         self.db = Path(_expand(g("DB"))) if g("DB") else default_db()
         self.port = int(g("PORT", "4390"))
         self.model = g("MODEL", "sonnet")

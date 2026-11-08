@@ -193,6 +193,30 @@ class Config(unittest.TestCase):
                                capture_output=True, text=True)
             self.assertEqual((p.returncode, p.stdout.strip()), (0, want))
 
+    def test_quotes_kept_when_the_value_has_quoted_words_inside(self):
+        cfg_file = os.path.join(self.t, "config")
+        with open(cfg_file, "w") as f:
+            f.write('MEETING_COPILOT_OPEN_CMD="/Applications/My Browser.app/x" "{url}"\n'
+                    'MEETING_COPILOT_MODEL="haiku"\nMEETING_COPILOT_LANGUAGE=\'Portuguese\'\n')
+        cfg = copilot.load_config({"MEETING_COPILOT_CONFIG": cfg_file})
+        self.assertEqual(cfg["MEETING_COPILOT_OPEN_CMD"], '"/Applications/My Browser.app/x" "{url}"')
+        self.assertEqual(cfg["MEETING_COPILOT_MODEL"], "haiku")          # one quoted value: quotes go
+        self.assertEqual(cfg["MEETING_COPILOT_LANGUAGE"], "Portuguese")
+
+    def test_empty_value_means_the_default(self):
+        cfg_file = os.path.join(self.t, "config")
+        with open(cfg_file, "w") as f:
+            f.write("MEETING_COPILOT_PORT=\nMEETING_COPILOT_DATA_MODEL=\nMEETING_COPILOT_POLL_S=\n")
+        s = copilot.Settings(copilot.load_config({"MEETING_COPILOT_CONFIG": cfg_file, "MEETING_COPILOT_MODEL": ""}))
+        self.assertEqual((s.port, s.model, s.data_model, s.poll_s), (4390, "sonnet", "sonnet", 5.0))
+
+    def test_bom_or_bad_bytes_in_the_file_do_not_crash(self):
+        cfg_file = os.path.join(self.t, "config")
+        with open(cfg_file, "wb") as f:
+            f.write(b"\xef\xbb\xbfMEETING_COPILOT_PORT=4555\n# caf\xe9 latin-1 note\nMEETING_COPILOT_MODEL=haiku\n")
+        s = copilot.Settings(copilot.load_config({"MEETING_COPILOT_CONFIG": cfg_file}))
+        self.assertEqual((s.port, s.model), (4555, "haiku"))
+
 # ------------------------------------------------------------------ first run: your config file
 
 
@@ -670,6 +694,54 @@ class Tools(unittest.TestCase):
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
             with open(opened) as f:
                 self.assertEqual(f.read(), f"-x|http://127.0.0.1:{port}|")
+        finally:
+            subprocess.run(["bash", launcher, "stop"], env=env, capture_output=True, text=True, timeout=30)
+
+    @unittest.skipIf(WIN, NO_BASH_WHY)
+    def test_open_cmd_that_keeps_running_does_not_hold_the_launcher(self):
+        db = os.path.join(self.t, "muesli.db")
+        fake_meeting.prepare(copilot.Path(db))
+        port = free_port()
+        opened = os.path.join(self.t, "opened.txt")
+        opener = os.path.join(self.t, "my-browser")
+        with open(opener, "w") as f:   # like a browser binary started directly: it stays running
+            f.write('#!/bin/sh\nprintf "%s|" "$@" > "$OPENED"\nexec sleep 60\n')
+        os.chmod(opener, 0o755)
+        cfg_file = os.path.join(self.t, "config")
+        with open(cfg_file, "w") as f:
+            f.write(f"MEETING_COPILOT_PORT={port}\nMEETING_COPILOT_OPEN_CMD={opener} {{url}} --again {{url}}\n")
+        launcher = os.path.join(ROOT, "bin", "meeting-copilot")
+        env = dict(self.env)
+        env.update(MEETING_COPILOT_DB=db, MEETING_COPILOT_CONFIG=cfg_file, OPENED=opened,
+                   MEETING_COPILOT_CLAUDE=os.path.join(self.t, "no-claude"), MEETING_COPILOT_PYTHON=PY)
+        try:
+            p = subprocess.run(["bash", launcher], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               stdin=subprocess.DEVNULL, text=True, timeout=20)
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            url = f"http://127.0.0.1:{port}"
+            wait_for(lambda: os.path.exists(opened) and os.path.getsize(opened) > 0, timeout=5)
+            with open(opened) as f:
+                self.assertEqual(f.read(), f"{url}|--again|{url}|")      # every {url} is the URL
+        finally:
+            subprocess.run(["bash", launcher, "stop"], env=env, capture_output=True, text=True, timeout=30)
+            subprocess.run(["pkill", "-f", opener], capture_output=True)
+
+    @unittest.skipIf(WIN, NO_BASH_WHY)
+    def test_open_cmd_that_fails_is_reported(self):
+        db = os.path.join(self.t, "muesli.db")
+        fake_meeting.prepare(copilot.Path(db))
+        port = free_port()
+        cfg_file = os.path.join(self.t, "config")
+        with open(cfg_file, "w") as f:
+            f.write(f"MEETING_COPILOT_PORT={port}\nMEETING_COPILOT_OPEN_CMD=false\n")
+        launcher = os.path.join(ROOT, "bin", "meeting-copilot")
+        env = dict(self.env, MEETING_COPILOT_DB=db, MEETING_COPILOT_CONFIG=cfg_file,
+                   MEETING_COPILOT_CLAUDE=os.path.join(self.t, "no-claude"), MEETING_COPILOT_PYTHON=PY)
+        try:
+            p = subprocess.run(["bash", launcher], env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            self.assertIn("MEETING_COPILOT_OPEN_CMD failed", p.stderr)
+            self.assertIn(f"open http://127.0.0.1:{port} in your browser", p.stdout)
         finally:
             subprocess.run(["bash", launcher, "stop"], env=env, capture_output=True, text=True, timeout=30)
 

@@ -97,7 +97,7 @@ Every key:
 | `MEETING_COPILOT_ASSIST_S`, `_DATA_S`, `_POLL_S` | `25`, `45`, `5` | Intervals in seconds |
 | `MEETING_COPILOT_CONTEXT_FILE` | empty | A text file about you that both AI calls read: your name and role, your projects, what your notes folders and MCP tools hold, words the transcript tends to get wrong. The first 8000 characters are used |
 | `MEETING_COPILOT_LANGUAGE` | empty (the meeting's language) | Language for every suggestion and fact, e.g. `Brazilian Portuguese` |
-| `MEETING_COPILOT_OPEN_CMD` | `open` (macOS) or `xdg-open` | Command that opens the page. The URL is passed as one argument where `{url}` is, or at the end, e.g. `open -g -a "Firefox"` |
+| `MEETING_COPILOT_OPEN_CMD` | `open` (macOS) or `xdg-open` | Command that opens the page. The URL is passed as one argument wherever `{url}` is (no quotes around it), or at the end, e.g. `open -g -a "Firefox"` |
 | `MEETING_COPILOT_DATA_DIR`, `_LOG`, `_PYTHON` | `~/.local/share/meeting-copilot`, its `meeting-copilot.log`, `python3` | Data folder, log file and Python used by `meeting-copilot` (environment only for `_LOG` and `_PYTHON`) |
 
 Example config:

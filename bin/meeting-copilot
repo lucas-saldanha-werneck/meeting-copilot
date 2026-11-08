@@ -66,11 +66,16 @@ open_url() {
   cmd="$(setting OPEN_CMD)"
   if [ -n "$cmd" ]; then
     case "$cmd" in
-      *"{url}"*) cmd="${cmd%%\{url\}*}\"\$1\"${cmd#*\{url\}}" ;;
+      *"{url}"*) cmd="${cmd//\{url\}/\"\$1\"}" ;;
       *) cmd="$cmd \"\$1\"" ;;
     esac
-    bash -c "$cmd" meeting-copilot "$URL" && return 0
-    echo "meeting-copilot: MEETING_COPILOT_OPEN_CMD failed" >&2
+    # In the background, so a browser started directly (it keeps running) never holds the
+    # terminal; a command that fails within 3 s is still reported. Its output goes to the log.
+    bash -c "$cmd" meeting-copilot "$URL" </dev/null >>"$LOG" 2>&1 &
+    local pid=$! i
+    for i in $(seq 1 15); do kill -0 "$pid" 2>/dev/null || break; sleep 0.2; done
+    if kill -0 "$pid" 2>/dev/null || wait "$pid"; then return 0; fi
+    echo "meeting-copilot: MEETING_COPILOT_OPEN_CMD failed (see $LOG)" >&2
     return 1
   fi
   if [ "$(uname -s)" = "Darwin" ] && command -v open >/dev/null 2>&1; then

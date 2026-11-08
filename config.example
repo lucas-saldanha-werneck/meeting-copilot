@@ -3,6 +3,7 @@
 # One KEY=VALUE per line; # starts a comment; ~ and $VARS expand in paths.
 # Every line below is commented out and shows the default, so this file changes
 # nothing until you remove the # in front of a line and edit its value.
+# A key with nothing after = means its default.
 # A MEETING_COPILOT_* environment variable wins over the same key here.
 # Environment only (not read from this file): MEETING_COPILOT_CONFIG (another
 # file instead of this one), MEETING_COPILOT_LOG, MEETING_COPILOT_PYTHON.
@@ -39,7 +40,8 @@
 #MEETING_COPILOT_LANGUAGE=
 
 # Command that opens the page. The URL goes in as one argument where {url} is,
-# or at the end, e.g. open -g -a "Firefox". Empty: open (macOS) or xdg-open.
+# or at the end, e.g. open -g -a "Firefox"; leave {url} without quotes around it.
+# Empty: open (macOS) or xdg-open.
 #MEETING_COPILOT_OPEN_CMD=
 
 # Extra host names allowed to load the page (behind your own reverse proxy or
