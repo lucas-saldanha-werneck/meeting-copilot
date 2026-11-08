@@ -38,6 +38,7 @@ __version__ = "0.2.0"
 
 HERE = Path(__file__).resolve().parent
 PAGE = HERE / "page.html"
+STARTER = HERE.parent / "config.example"   # copied to your config path on first run (seed_config)
 
 COOLDOWN_WARNING_S = 120   # between any two warnings
 REPEAT_WARNING_S = 300     # before the same kind of warning shows again
@@ -61,12 +62,43 @@ def _expand(v: str) -> str:
     return os.path.expanduser(os.path.expandvars(v.strip()))
 
 
+def config_path(environ=None) -> Path:
+    """Your config file: $MEETING_COPILOT_CONFIG, else $XDG_CONFIG_HOME or ~/.config, then meeting-copilot/config."""
+    environ = os.environ if environ is None else environ
+    base = environ.get("XDG_CONFIG_HOME") or "~/.config"
+    return Path(_expand(environ.get("MEETING_COPILOT_CONFIG", "") or os.path.join(base, "meeting-copilot", "config")))
+
+
+def seed_config(environ=None) -> None:
+    """First run: create your config file from config.example (every line commented out) when missing.
+
+    Never overwrites or changes a file that is there, skips a path that is not absolute, and
+    ignores every error: the program then runs on its defaults, as without a file."""
+    try:
+        path = config_path(environ)
+        if not path.is_absolute() or os.path.lexists(path):
+            return
+        data = STARTER.read_bytes()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # O_EXCL: if the file shows up meanwhile, this fails instead of overwriting it.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+    except Exception:
+        return
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+    except Exception:
+        try:
+            os.remove(path)  # the half-written file is ours: remove it so the next run tries again
+        except OSError:
+            pass
+
+
 def load_config(environ=None) -> dict:
     """KEY=VALUE lines from the config file, then MEETING_COPILOT_* environment variables (these win)."""
     environ = os.environ if environ is None else environ
     cfg: dict[str, str] = {}
-    base = environ.get("XDG_CONFIG_HOME") or "~/.config"
-    path = Path(_expand(environ.get("MEETING_COPILOT_CONFIG", "") or os.path.join(base, "meeting-copilot", "config")))
+    path = config_path(environ)
     if path.is_file():
         for line in path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
@@ -709,6 +741,7 @@ def main(argv=None) -> None:
     ap.add_argument("--version", action="version", version=f"meeting-copilot {__version__}")
     ap.add_argument("--get", metavar="KEY", help=argparse.SUPPRESS)  # for bin/meeting-copilot: PORT, OPEN_CMD
     args = ap.parse_args(argv)
+    seed_config()   # bin/meeting-copilot calls --get first, so any first command creates it
     cfg = load_config()
     if args.get:
         v = cfg.get("MEETING_COPILOT_" + args.get, "")

@@ -4,9 +4,11 @@
 Everything runs in temporary folders with a fake HOME: a fake Muesli database built here with an
 invented meeting, and a fake `claude` first on PATH (tests/fake_claude.py). No real Muesli, no AI.
 """
+import filecmp
 import hashlib
 import json
 import os
+import re
 import signal
 import socket
 import sqlite3
@@ -190,6 +192,141 @@ class Config(unittest.TestCase):
             p = subprocess.run([PY, os.path.join(ROOT, "lib", "copilot.py"), "--get", key], env=env,
                                capture_output=True, text=True)
             self.assertEqual((p.returncode, p.stdout.strip()), (0, want))
+
+# ------------------------------------------------------------------ first run: your config file
+
+
+STARTER = os.path.join(ROOT, "config.example")
+
+
+def read_bytes(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
+class Seed(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.t = os.path.realpath(self.tmp.name)
+        self.home = os.path.join(self.t, "home")
+        os.makedirs(self.home)
+
+    def tearDown(self):
+        for root, dirs, _ in os.walk(self.t):
+            for d in dirs:
+                os.chmod(os.path.join(root, d), 0o700)
+        self.tmp.cleanup()
+
+    def env(self, **extra):
+        """A clean environment: fake HOME, no XDG_CONFIG_HOME, no MEETING_COPILOT_*, no API keys."""
+        drop = ("MEETING_COPILOT", "XDG_CONFIG_HOME", "OPENROUTER_API_KEY", "OPENAI_API_KEY", "GROQ_API_KEY")
+        env = {k: v for k, v in os.environ.items() if not k.startswith(drop)}
+        env.update(HOME=self.home, USERPROFILE=self.home, **extra)
+        return env
+
+    def get(self, env, key="PORT"):
+        return subprocess.run([PY, os.path.join(ROOT, "lib", "copilot.py"), "--get", key], env=env,
+                              capture_output=True, text=True, timeout=30)
+
+    def test_first_command_creates_the_file_under_home(self):
+        p = self.get(self.env())
+        self.assertEqual((p.returncode, p.stdout, p.stderr), (0, "\n", ""))
+        path = os.path.join(self.home, ".config", "meeting-copilot", "config")
+        self.assertEqual(read_bytes(path), read_bytes(STARTER))
+
+    def test_xdg_config_home_is_respected(self):
+        xdg = os.path.join(self.t, "xdg", "not-there-yet")
+        copilot.seed_config({"XDG_CONFIG_HOME": xdg})
+        self.assertEqual(read_bytes(os.path.join(xdg, "meeting-copilot", "config")), read_bytes(STARTER))
+
+    def test_meeting_copilot_config_is_respected(self):
+        xdg = os.path.join(self.t, "xdg")
+        mine = os.path.join(self.t, "sub", "my-config")
+        self.assertEqual(self.get(self.env(XDG_CONFIG_HOME=xdg, MEETING_COPILOT_CONFIG=mine)).returncode, 0)
+        self.assertEqual(read_bytes(mine), read_bytes(STARTER))
+        self.assertFalse(os.path.exists(xdg))
+
+    def test_existing_file_is_never_changed(self):
+        for content in (b"MEETING_COPILOT_PORT=4555\n", b"", b"garbage \xff\xfe\r\n"):
+            with self.subTest(content=content):
+                path = os.path.join(self.t, "config")
+                with open(path, "wb") as f:
+                    f.write(content)
+                copy = os.path.join(self.t, "config.before")
+                with open(copy, "wb") as f:
+                    f.write(content)
+                before = os.stat(path).st_mtime_ns
+                copilot.seed_config({"MEETING_COPILOT_CONFIG": path})
+                self.get(self.env(MEETING_COPILOT_CONFIG=path))
+                self.assertTrue(filecmp.cmp(path, copy, shallow=False))
+                self.assertEqual(os.stat(path).st_mtime_ns, before)
+
+    def test_cannot_create_no_crash(self):
+        blocker = os.path.join(self.t, "a-file")
+        with open(blocker, "w") as f:
+            f.write("x")
+        copilot.seed_config({"XDG_CONFIG_HOME": blocker})     # folder inside a regular file: fails on every OS
+        p = self.get(self.env(MEETING_COPILOT_CONFIG=os.path.join(blocker, "config")), "MODEL")
+        self.assertEqual((p.returncode, p.stdout, p.stderr), (0, "\n", ""))
+
+    @unittest.skipIf(WIN or (hasattr(os, "geteuid") and os.geteuid() == 0),
+                     "read-only folders need POSIX permissions and a non-root user")
+    def test_read_only_folder_no_crash(self):
+        ro = os.path.join(self.t, "ro")
+        os.makedirs(ro)
+        os.chmod(ro, 0o500)
+        p = self.get(self.env(XDG_CONFIG_HOME=ro))
+        self.assertEqual((p.returncode, p.stdout, p.stderr), (0, "\n", ""))
+        self.assertFalse(os.path.exists(os.path.join(ro, "meeting-copilot")))
+
+    def test_relative_path_is_skipped(self):
+        cwd = os.path.join(self.t, "cwd")
+        os.makedirs(cwd)
+        p = subprocess.run([PY, os.path.join(ROOT, "lib", "copilot.py"), "--get", "PORT"], cwd=cwd,
+                           env=self.env(MEETING_COPILOT_CONFIG="relative-config"), capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0)
+        self.assertEqual(os.listdir(cwd), [])
+
+    def test_seeded_defaults_behave_like_no_file(self):
+        none = {"XDG_CONFIG_HOME": os.path.join(self.t, "none")}
+        seeded = {"XDG_CONFIG_HOME": os.path.join(self.t, "seeded")}
+        copilot.seed_config(seeded)
+        self.assertTrue(os.path.isfile(os.path.join(self.t, "seeded", "meeting-copilot", "config")))
+        self.assertEqual(copilot.load_config(seeded), copilot.load_config(none))
+        self.assertEqual(copilot.load_config(seeded), {})
+        self.assertEqual(vars(copilot.Settings(copilot.load_config(seeded))),
+                         vars(copilot.Settings(copilot.load_config(none))))
+        # what bin/meeting-copilot reads through --get; "no file" sits inside a regular file, so the
+        # seed cannot create it there either
+        blocker = os.path.join(self.t, "a-file")
+        with open(blocker, "w") as f:
+            f.write("x")
+        no_file = self.env(MEETING_COPILOT_CONFIG=os.path.join(blocker, "config"))
+        with_file = self.env(MEETING_COPILOT_CONFIG=os.path.join(self.t, "seeded", "meeting-copilot", "config"))
+        for key in ("PORT", "DATA_DIR", "OPEN_CMD", "MODEL", "DB"):
+            self.assertEqual(self.get(with_file, key).stdout, self.get(no_file, key).stdout)
+        self.assertFalse(os.path.exists(os.path.join(self.t, "none")))
+
+    def test_starter_lists_every_key_commented_out(self):
+        with open(os.path.join(ROOT, "lib", "copilot.py"), encoding="utf-8") as f:
+            code = f.read()
+        keys = set(re.findall(r'g\("([A-Z_]+)"', code)) | {"OPEN_CMD"}
+        self.assertGreater(len(keys), 15)
+        with open(STARTER, encoding="utf-8") as f:
+            text = f.read()
+        for k in sorted(keys):
+            self.assertIn(f"\n#MEETING_COPILOT_{k}=", text, k)
+        active = [ln for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+        self.assertEqual(active, [])
+
+    @unittest.skipIf(WIN, NO_BASH_WHY)
+    def test_launcher_first_use_creates_it(self):
+        env = self.env(MEETING_COPILOT_PYTHON=PY, XDG_DATA_HOME=os.path.join(self.t, "data"))
+        p = subprocess.run(["bash", os.path.join(ROOT, "bin", "meeting-copilot"), "status"], env=env,
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(p.stdout.strip(), "not running")
+        path = os.path.join(self.home, ".config", "meeting-copilot", "config")
+        self.assertEqual(read_bytes(path), read_bytes(STARTER))
 
 # ------------------------------------------------------------------ the real program, as a process
 

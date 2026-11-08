@@ -76,6 +76,11 @@ Your settings live in your own file, outside the program folder, so updating mee
 - one `KEY=VALUE` per line; `#` starts a comment; `~` and `$VARS` expand in paths
 - each key also works as an environment variable, which wins over the file
 
+You don't have to create it: the first `meeting-copilot` command you run creates it, a copy of
+[`config.example`](config.example) with every key listed at its default and commented out (so it
+changes nothing until you remove a `#` and edit the line). If the file is already there, it is
+never rewritten or changed, not even by an update.
+
 Every key:
 
 | Variable | Default | Meaning |

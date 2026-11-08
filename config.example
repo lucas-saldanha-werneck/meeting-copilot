@@ -1,0 +1,60 @@
+# meeting-copilot settings. Updating meeting-copilot never touches this file.
+#
+# One KEY=VALUE per line; # starts a comment; ~ and $VARS expand in paths.
+# Every line below is commented out and shows the default, so this file changes
+# nothing until you remove the # in front of a line and edit its value.
+# A MEETING_COPILOT_* environment variable wins over the same key here.
+# Environment only (not read from this file): MEETING_COPILOT_CONFIG (another
+# file instead of this one), MEETING_COPILOT_LOG, MEETING_COPILOT_PYTHON.
+
+# Muesli database, opened read-only.
+#MEETING_COPILOT_DB=~/Library/Application Support/Muesli/muesli.db
+
+# Local port. The server listens on 127.0.0.1 only.
+#MEETING_COPILOT_PORT=4390
+
+# Path to the Claude Code CLI. Default: `claude` on your PATH.
+#MEETING_COPILOT_CLAUDE=claude
+
+# Model for suggestions, and for the fact search (default: the same as MODEL).
+#MEETING_COPILOT_MODEL=sonnet
+#MEETING_COPILOT_DATA_MODEL=
+
+# Folders the AI may search for facts, separated by : (; on Windows). Empty: none.
+#MEETING_COPILOT_SEARCH_DIRS=
+
+# An MCP config file ({"mcpServers": {...}}) for the fact search, and the
+# comma-separated allowlist of its tools, e.g. mcp__notes__search. Without the
+# allowlist MCP stays off. Only allow read-only tools.
+#MEETING_COPILOT_MCP_CONFIG=
+#MEETING_COPILOT_MCP_TOOLS=
+
+# A text file about you that both AI calls read (name, role, projects, where your
+# notes are, words the transcript gets wrong). The first 8000 characters are used.
+#MEETING_COPILOT_CONTEXT_FILE=
+
+# Language for every suggestion and fact, e.g. Brazilian Portuguese.
+# Empty: the meeting's language.
+#MEETING_COPILOT_LANGUAGE=
+
+# Command that opens the page. The URL goes in as one argument where {url} is,
+# or at the end, e.g. open -g -a "Firefox". Empty: open (macOS) or xdg-open.
+#MEETING_COPILOT_OPEN_CMD=
+
+# Extra host names allowed to load the page (behind your own reverse proxy or
+# tunnel), comma-separated. Empty: none.
+#MEETING_COPILOT_EXTRA_HOSTS=
+
+# Intervals in seconds: suggestions, fact search, reading the transcript.
+#MEETING_COPILOT_ASSIST_S=25
+#MEETING_COPILOT_DATA_S=45
+#MEETING_COPILOT_POLL_S=5
+
+# Data folder (log, pid file). Default: $XDG_DATA_HOME/meeting-copilot,
+# or ~/.local/share/meeting-copilot.
+#MEETING_COPILOT_DATA_DIR=
+
+# Where each meeting's transcript and suggestions are saved when it ends
+# (default: the sessions folder inside the data folder). 0 turns saving off.
+#MEETING_COPILOT_SESSIONS_DIR=
+#MEETING_COPILOT_SAVE_SESSIONS=1
