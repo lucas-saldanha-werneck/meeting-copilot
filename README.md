@@ -97,6 +97,7 @@ Every key:
 | `MEETING_COPILOT_ASSIST_S`, `_DATA_S`, `_POLL_S` | `25`, `45`, `5` | Intervals in seconds |
 | `MEETING_COPILOT_CONTEXT_FILE` | empty | A text file about you that both AI calls read: your name and role, your projects, what your notes folders and MCP tools hold, words the transcript tends to get wrong. The first 8000 characters are used |
 | `MEETING_COPILOT_LANGUAGE` | empty (the meeting's language) | Language for every suggestion and fact, e.g. `Brazilian Portuguese` |
+| `MEETING_COPILOT_PROMPT_FILE` | empty (the built-in prompt) | A text file that replaces the built-in suggestions prompt. See [Your own prompt](#your-own-prompt) |
 | `MEETING_COPILOT_OPEN_CMD` | `open` (macOS) or `xdg-open` | Command that opens the page. The URL is passed as one argument wherever `{url}` is (no quotes around it), or at the end, e.g. `open -g -a "Firefox"` |
 | `MEETING_COPILOT_DATA_DIR`, `_LOG`, `_PYTHON` | `~/.local/share/meeting-copilot`, its `meeting-copilot.log`, `python3` | Data folder, log file and Python used by `meeting-copilot` (environment only for `_LOG` and `_PYTHON`) |
 
@@ -121,6 +122,35 @@ The transcript often writes "Solarix" as "solar X".
 ```
 
 Only allow read-only MCP tools: the fact search runs during your meeting without asking you.
+
+### Your own prompt
+
+`MEETING_COPILOT_PROMPT_FILE` names a text file whose text replaces the built-in suggestions prompt
+(`PROMPT_ASSIST` in `lib/copilot.py`, the call behind "Say this", "Ask this", corrections and goals).
+Start from a copy of that prompt. The fact-search prompt is not replaced.
+
+Placeholders (written as is, with the braces):
+
+| Placeholder | Becomes |
+|---|---|
+| `{language}` | The language name from `MEETING_COPILOT_LANGUAGE` (e.g. `answer in {language}`), or `the language the meeting is using` when that is empty |
+| `{context}` | Your `MEETING_COPILOT_CONTEXT_FILE` text under a heading, or nothing when that is empty |
+
+The built-in prompt has no placeholder in its text: it gets the language line ("Write every item in
+...") and the context block added at its end. Your file gets the same for any part it does not
+place. Other `{words}` stay as written. If the file is cut at the 20000-character limit, the cut
+never splits a placeholder.
+
+What must stay: the reply always comes back as JSON with the fields `say`, `ask`, `corrections`
+and `goals_covered` (Claude Code's `--json-schema`), so your text cannot break the parser. But if it
+never asks for `say` and `ask`, those lists may stay empty. Name them in your text; at startup the
+log shows a `note:` line when a file never mentions `say` or `ask`, or uses a `{word}` that is not a
+placeholder. The word `EMPTY` belongs to the fact-search prompt, which this setting does not touch.
+
+If the file is missing, unreadable, not UTF-8 or empty, the log shows one `note:` line (a separate
+one for a file that is not UTF-8) and the
+built-in prompt is used. Only the first 20000 characters are used (the prompt goes on the `claude`
+command line).
 
 ## Optional requirements
 

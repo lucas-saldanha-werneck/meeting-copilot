@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import signal
 import socketserver
@@ -34,7 +35,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 HERE = Path(__file__).resolve().parent
 PAGE = HERE / "page.html"
@@ -45,6 +46,7 @@ REPEAT_WARNING_S = 300     # before the same kind of warning shows again
 WINDOW_S = 180             # how much of the conversation the AI sees
 AI_TIMEOUT_S = 120
 CONTEXT_MAX_CHARS = 8000   # of your context file that goes into each prompt
+PROMPT_MAX_CHARS = 20000   # of your prompt file (it goes on the claude command line)
 
 # ---------------------------------------------------------------- config
 
@@ -167,10 +169,41 @@ class Settings:
         if ctx:
             p = Path(_expand(ctx))
             try:
-                self.context = p.read_text(encoding="utf-8").strip()[:CONTEXT_MAX_CHARS]
+                self.context = p.read_text(encoding="utf-8-sig").strip()[:CONTEXT_MAX_CHARS]
             except OSError:
                 self.notices.append(f"context file not found or unreadable, ignored: {p}")
+            except UnicodeDecodeError:
+                self.notices.append(f"context file is not UTF-8 text, ignored: {p}")
         self.language = g("LANGUAGE").strip()
+
+        # Optional: your own text in place of the built-in suggestions prompt (PROMPT_ASSIST).
+        # Missing, unreadable or empty: one note, and the built-in prompt.
+        self.prompt = ""
+        pf = g("PROMPT_FILE")
+        if pf:
+            p = Path(_expand(pf))
+            try:
+                text = p.read_text(encoding="utf-8-sig").strip()
+            except OSError as e:
+                self.notices.append(f"prompt file not found or unreadable, using the built-in prompt: {p} "
+                                    f"({e.__class__.__name__})")
+            except UnicodeDecodeError:
+                self.notices.append(f"prompt file is not UTF-8 text, using the built-in prompt: {p} "
+                                    "(save it as UTF-8)")
+            else:
+                if not text:
+                    self.notices.append(f"prompt file is empty, using the built-in prompt: {p}")
+                else:
+                    if len(text) > PROMPT_MAX_CHARS:
+                        self.notices.append(f"prompt file has {len(text)} characters; only the first "
+                                            f"{PROMPT_MAX_CHARS} are used: {p}")
+                        cut = PROMPT_MAX_CHARS
+                        brace = text.rfind("{", 0, cut)  # never cut a {placeholder} in half
+                        if brace != -1 and "}" not in text[brace:cut] and cut - brace <= max(map(len, PROMPT_PLACEHOLDERS)):
+                            cut = brace
+                        text = text[:cut]
+                    self.prompt = text
+                    self.notices.extend(check_prompt(text, p))
 
         hosts = [h.strip() for h in g("EXTRA_HOSTS").split(",") if h.strip()]
         self.hosts_ok = {f"127.0.0.1:{self.port}", f"localhost:{self.port}", *hosts}
@@ -247,18 +280,59 @@ SCHEMA_ASSIST = {
 }
 
 
+def language_text() -> str:
+    if not S.language:
+        return ""
+    return (f"Write every item in {S.language}, whatever language the meeting uses "
+            "(keep the word EMPTY as is).")
+
+
+def context_text() -> str:
+    return "## About the user (from their context file)\n" + S.context if S.context else ""
+
+
+# Placeholders a prompt file may use. The built-in prompts have none in their text: the language line and
+# the context block are added at their end. A prompt file may place them instead: {language} becomes the
+# language name (or "the language the meeting is using" when MEETING_COPILOT_LANGUAGE is empty), {context}
+# the context block (or nothing). A part the file does not place is added at the end, as for the built-in.
+PROMPT_PLACEHOLDERS = ("{language}", "{context}")
+
+
 def personalize(prompt: str) -> str:
-    """Add your language and context file (MEETING_COPILOT_LANGUAGE, MEETING_COPILOT_CONTEXT_FILE)."""
-    if S.language:
-        prompt += (f"\nWrite every item in {S.language}, whatever language the meeting uses "
-                   "(keep the word EMPTY as is).\n")
-    if S.context:
-        prompt += "\n## About the user (from their context file)\n" + S.context + "\n"
-    return prompt
+    """Add your language and context file (MEETING_COPILOT_LANGUAGE, MEETING_COPILOT_CONTEXT_FILE): in place
+    of {language} / {context} when the prompt has them, else at the end."""
+    tail = []
+    if "{language}" in prompt:
+        prompt = prompt.replace("{language}", S.language or "the language the meeting is using")
+    elif S.language:
+        tail.append(language_text())
+    if "{context}" in prompt:
+        prompt = prompt.replace("{context}", context_text())
+    elif S.context:
+        tail.append(context_text())
+    return prompt + "".join(f"\n{t}\n" for t in tail)
+# The suggestions call returns JSON in a fixed shape (--json-schema, SCHEMA_ASSIST), so a prompt file can't
+# break the parser. It can leave the lists empty if it never asks for them: these words must stay in it.
+PROMPT_REQUIRED_WORDS = ("say", "ask")
+
+
+def check_prompt(text: str, path) -> list[str]:
+    """Startup notes about a prompt file: output fields it never names, and {words} that are no placeholder."""
+    notes = []
+    missing = [w for w in PROMPT_REQUIRED_WORDS if not re.search(r"\b" + w + r"\b", text, re.I)]
+    if missing:
+        notes.append(f"prompt file {path} never names the output field(s) {', '.join(missing)}: the suggestions "
+                     "come back in the fields say, ask, corrections, goals_covered; without asking for "
+                     f"{' and '.join(missing)} that list may stay empty")
+    unknown = sorted(set(re.findall(r"\{[A-Za-z_]+\}", text)) - set(PROMPT_PLACEHOLDERS))
+    if unknown:
+        notes.append(f"prompt file {path}: {', '.join(unknown)} is not a placeholder and stays as written "
+                     f"(placeholders: {', '.join(PROMPT_PLACEHOLDERS)})")
+    return notes
 
 
 def assist_prompt() -> str:
-    return personalize(PROMPT_ASSIST)
+    return personalize(S.prompt or PROMPT_ASSIST)
 
 
 def data_prompt() -> str:

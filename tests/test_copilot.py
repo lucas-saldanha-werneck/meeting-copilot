@@ -180,6 +180,118 @@ class Config(unittest.TestCase):
         self.assertEqual(len(copilot.Settings({"MEETING_COPILOT_CONTEXT_FILE": big}).context),
                          copilot.CONTEXT_MAX_CHARS)
 
+    def with_settings(self, cfg):
+        old = copilot.S
+        copilot.S = copilot.Settings(cfg)
+        self.addCleanup(setattr, copilot, "S", old)
+        return copilot.S
+
+    def write(self, name, text, encoding="utf-8"):
+        p = os.path.join(self.t, name)
+        with open(p, "w", encoding=encoding) as f:
+            f.write(text)
+        return p
+
+    def test_prompt_file_absent_or_empty_value_is_the_built_in_prompt(self):
+        for cfg in ({}, {"MEETING_COPILOT_PROMPT_FILE": ""}):
+            s = self.with_settings(cfg)
+            self.assertEqual((s.prompt, s.notices), ("", []))
+            self.assertEqual(copilot.assist_prompt(), copilot.PROMPT_ASSIST)
+
+    def test_prompt_file_replaces_the_built_in_prompt(self):
+        p = self.write("prompt.md", "Coach me. Fill say and ask with one short line each.\n")
+        s = self.with_settings({"MEETING_COPILOT_PROMPT_FILE": p})
+        self.assertEqual(s.notices, [])
+        prompt = copilot.assist_prompt()
+        self.assertTrue(prompt.startswith("Coach me. Fill say and ask"))
+        self.assertNotIn("live meeting copilot", prompt)
+        self.assertEqual(copilot.data_prompt(), copilot.PROMPT_DATA.format(sources=""), "fact search unchanged")
+
+    def test_prompt_file_placeholders_and_tail(self):
+        ctx = self.write("me.md", "I am Ana.\n")
+        placed = self.write("p1.md", "Top.\n{context}\nMiddle say/ask.\n{language}\nEnd.")
+        self.with_settings({"MEETING_COPILOT_PROMPT_FILE": placed, "MEETING_COPILOT_CONTEXT_FILE": ctx,
+                            "MEETING_COPILOT_LANGUAGE": "Spanish"})
+        prompt = copilot.assist_prompt()
+        self.assertEqual(prompt, "Top.\n## About the user (from their context file)\nI am Ana.\nMiddle say/ask.\n"
+                                 "Spanish\nEnd.", "{language} is the name; placed parts are not added again")
+        # not placed: added at the end, like the built-in prompt
+        bare = self.write("p2.md", "Give say and ask.")
+        self.with_settings({"MEETING_COPILOT_PROMPT_FILE": bare, "MEETING_COPILOT_CONTEXT_FILE": ctx,
+                            "MEETING_COPILOT_LANGUAGE": "Spanish"})
+        prompt = copilot.assist_prompt()
+        self.assertTrue(prompt.startswith("Give say and ask."))
+        self.assertLess(prompt.index("Write every item in Spanish"), prompt.index("I am Ana."))
+        # settings empty: {context} becomes nothing, {language} the meeting's language
+        self.with_settings({"MEETING_COPILOT_PROMPT_FILE": placed})
+        self.assertEqual(copilot.assist_prompt(), "Top.\n\nMiddle say/ask.\nthe language the meeting is using\nEnd.")
+        natural = self.write("p3.md", "Give say and ask in {language}.")
+        self.with_settings({"MEETING_COPILOT_PROMPT_FILE": natural, "MEETING_COPILOT_LANGUAGE": "Spanish"})
+        self.assertEqual(copilot.assist_prompt(), "Give say and ask in Spanish.")
+
+    def test_prompt_file_missing_unreadable_or_empty_falls_back_with_one_note(self):
+        bad_utf8 = os.path.join(self.t, "latin1.md")
+        with open(bad_utf8, "wb") as f:
+            f.write(b"say and ask \xff\xfe\xe9")
+        cases = {os.path.join(self.t, "nope.md"): "not found or unreadable",
+                 self.t: "not found or unreadable",          # a folder
+                 bad_utf8: "is not UTF-8 text",
+                 self.write("empty.md", "  \n\n"): "is empty"}
+        for path, why in cases.items():
+            s = self.with_settings({"MEETING_COPILOT_PROMPT_FILE": path})
+            self.assertEqual(len(s.notices), 1, (path, s.notices))
+            self.assertIn(why, s.notices[0])
+            self.assertIn("built-in prompt", s.notices[0])
+            self.assertEqual(copilot.assist_prompt(), copilot.PROMPT_ASSIST)
+
+    def test_prompt_file_checked_at_startup(self):
+        p = self.write("p.md", "Help me in {meeting_title}. Return what to say.")
+        s = self.with_settings({"MEETING_COPILOT_PROMPT_FILE": p})
+        notes = " | ".join(s.notices)
+        self.assertIn("never names the output field(s) ask", notes)
+        self.assertIn("{meeting_title} is not a placeholder", notes)
+        self.assertIn("{meeting_title}", copilot.assist_prompt(), "left as written, no crash")
+        braces = self.write("b.md", "say and ask. JSON like {\"say\": []} and {0} and {")
+        s = self.with_settings({"MEETING_COPILOT_PROMPT_FILE": braces})
+        self.assertEqual(s.notices, [])
+        self.assertIn('{"say": []} and {0} and {', copilot.assist_prompt())
+
+    def test_prompt_check_ignores_case_of_field_names_but_not_of_placeholders(self):
+        self.assertEqual(copilot.check_prompt("Say: one line. Ask: one question.", "p"), [])
+        notes = copilot.check_prompt("Use {Language} and {CONTEXT}. say, ask", "p")
+        self.assertEqual(len(notes), 1)
+        self.assertIn("{CONTEXT}, {Language} is not a placeholder", notes[0])
+
+    def test_context_file_not_utf8_or_with_bom_does_not_crash(self):
+        latin = os.path.join(self.t, "latin.md")
+        with open(latin, "wb") as f:
+            f.write(b"caf\xe9")
+        s = copilot.Settings({"MEETING_COPILOT_CONTEXT_FILE": latin})
+        self.assertEqual(s.context, "")
+        self.assertIn("not UTF-8", s.notices[0])
+        bom = self.write("bom.md", "\ufeffI am Ana.", encoding="utf-8")
+        self.assertEqual(copilot.Settings({"MEETING_COPILOT_CONTEXT_FILE": bom}).context, "I am Ana.")
+
+    def test_prompt_cut_never_splits_a_placeholder(self):
+        text = "say ask " + "x" * (copilot.PROMPT_MAX_CHARS - 13) + "{context} tail"
+        s = self.with_settings({"MEETING_COPILOT_PROMPT_FILE": self.write("cut.md", text)})
+        self.assertTrue(s.prompt.endswith("x"), s.prompt[-12:])
+        self.assertNotIn("{", s.prompt)
+
+    def test_built_in_prompts_unchanged_with_language_and_context(self):
+        ctx = self.write("me.md", "I am Ana.")
+        self.with_settings({"MEETING_COPILOT_CONTEXT_FILE": ctx, "MEETING_COPILOT_LANGUAGE": "Spanish"})
+        tail = ("\nWrite every item in Spanish, whatever language the meeting uses (keep the word EMPTY as is).\n"
+                "\n## About the user (from their context file)\nI am Ana.\n")
+        self.assertEqual(copilot.assist_prompt(), copilot.PROMPT_ASSIST + tail)
+        self.assertEqual(copilot.data_prompt(), copilot.PROMPT_DATA.format(sources="") + tail)
+
+    def test_prompt_file_too_long_is_cut(self):
+        p = self.write("long.md", "say ask " + "x" * (copilot.PROMPT_MAX_CHARS + 100))
+        s = self.with_settings({"MEETING_COPILOT_PROMPT_FILE": p})
+        self.assertEqual(len(s.prompt), copilot.PROMPT_MAX_CHARS)
+        self.assertIn("only the first", s.notices[0])
+
     def test_get_prints_a_setting(self):
         cfg_file = os.path.join(self.t, "config")
         with open(cfg_file, "w") as f:
@@ -517,6 +629,29 @@ class Live(unittest.TestCase):
         prompt = a[a.index("--append-system-prompt") + 1]
         self.assertIn("WhatsApp sessions: ana, shop.", prompt)
         self.assertIn("Write every item in Spanish", prompt)
+
+    @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
+    def test_prompt_file_goes_to_claude_and_suggestions_still_parse(self):
+        pf = os.path.join(self.t, "prompt.md")
+        with open(pf, "w", encoding="utf-8") as f:
+            f.write("MY PROMPT: give say and ask in {language}.\n")
+        self.start(MEETING_COPILOT_PROMPT_FILE=pf, MEETING_COPILOT_LANGUAGE="Spanish")
+        self.speak()
+        self.assertTrue(wait_for(lambda: (self.state() or {}).get("say")), self.log())
+        a = [c for c in self.claude_calls() if "--json-schema" in c["argv"]][0]["argv"]
+        prompt = a[a.index("--append-system-prompt") + 1]
+        self.assertEqual(prompt, "MY PROMPT: give say and ask in Spanish.")
+        self.assertNotIn("live meeting copilot", prompt)
+        self.assertNotIn("note: prompt file", self.log())
+
+    @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
+    def test_missing_prompt_file_logs_one_line_and_uses_the_built_in(self):
+        self.start(MEETING_COPILOT_PROMPT_FILE=os.path.join(self.t, "nope.md"))
+        self.speak()
+        self.assertTrue(wait_for(lambda: (self.state() or {}).get("say")), self.log())
+        self.assertEqual(self.log().count("note: prompt file not found or unreadable"), 1, self.log())
+        a = [c for c in self.claude_calls() if "--json-schema" in c["argv"]][0]["argv"]
+        self.assertEqual(a[a.index("--append-system-prompt") + 1], copilot.PROMPT_ASSIST)
 
     @unittest.skipIf(WIN, "SIGTERM cannot be delivered as a signal on Windows")
     def test_sigterm_saves_session(self):

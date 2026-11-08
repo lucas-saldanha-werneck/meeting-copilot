@@ -39,6 +39,15 @@
 # Empty: the meeting's language.
 #MEETING_COPILOT_LANGUAGE=
 
+# A text file that replaces the built-in suggestions prompt (the "Say this" /
+# "Ask this" call). {language} becomes your LANGUAGE (e.g. "answer in
+# {language}") and {context} your CONTEXT_FILE text; whatever the file does not
+# place is added at the end.
+# Keep asking for say and ask (see README, "Your own prompt"). Missing or
+# unreadable: one note in the log, and the built-in prompt.
+# Empty: the built-in prompt.
+#MEETING_COPILOT_PROMPT_FILE=
+
 # Command that opens the page. The URL goes in as one argument where {url} is,
 # or at the end, e.g. open -g -a "Firefox"; leave {url} without quotes around it.
 # Empty: open (macOS) or xdg-open.
