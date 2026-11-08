@@ -21,6 +21,7 @@ import json
 import os
 import shutil
 import signal
+import socketserver
 import sqlite3
 import subprocess
 import sys
@@ -657,6 +658,17 @@ def _stop(*_):
     raise KeyboardInterrupt
 
 
+class _Server(ThreadingHTTPServer):
+    """ThreadingHTTPServer without the reverse-DNS lookup in server_bind.
+
+    HTTPServer.server_bind calls socket.getfqdn(), which can block for many seconds on some
+    Macs (GitHub's macOS runners hang there). We only serve 127.0.0.1, so the name is fixed."""
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = "127.0.0.1", self.server_address[1]
+
+
 def main(argv=None) -> None:
     global S
     ap = argparse.ArgumentParser(description="Live meeting copilot (reads the Muesli app's live transcript).")
@@ -686,7 +698,7 @@ def main(argv=None) -> None:
     # `meeting-copilot stop` sends SIGTERM: turn it into a normal exit so the session is saved
     signal.signal(signal.SIGTERM, _stop)
     threading.Thread(target=loop, args=(S.db,), daemon=True).start()
-    srv = ThreadingHTTPServer(("127.0.0.1", S.port), Page)
+    srv = _Server(("127.0.0.1", S.port), Page)
     print(f"meeting-copilot on http://127.0.0.1:{S.port}  (database: {S.db})", flush=True)
     try:
         srv.serve_forever()
