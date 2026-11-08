@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import signal
 import socketserver
@@ -168,9 +169,11 @@ class Settings:
         if ctx:
             p = Path(_expand(ctx))
             try:
-                self.context = p.read_text(encoding="utf-8").strip()[:CONTEXT_MAX_CHARS]
+                self.context = p.read_text(encoding="utf-8-sig").strip()[:CONTEXT_MAX_CHARS]
             except OSError:
                 self.notices.append(f"context file not found or unreadable, ignored: {p}")
+            except UnicodeDecodeError:
+                self.notices.append(f"context file is not UTF-8 text, ignored: {p}")
         self.language = g("LANGUAGE").strip()
 
         # Optional: your own text in place of the built-in suggestions prompt (PROMPT_ASSIST).
@@ -181,9 +184,12 @@ class Settings:
             p = Path(_expand(pf))
             try:
                 text = p.read_text(encoding="utf-8-sig").strip()
-            except (OSError, UnicodeDecodeError) as e:
+            except OSError as e:
                 self.notices.append(f"prompt file not found or unreadable, using the built-in prompt: {p} "
                                     f"({e.__class__.__name__})")
+            except UnicodeDecodeError:
+                self.notices.append(f"prompt file is not UTF-8 text, using the built-in prompt: {p} "
+                                    "(save it as UTF-8)")
             else:
                 if not text:
                     self.notices.append(f"prompt file is empty, using the built-in prompt: {p}")
@@ -191,7 +197,11 @@ class Settings:
                     if len(text) > PROMPT_MAX_CHARS:
                         self.notices.append(f"prompt file has {len(text)} characters; only the first "
                                             f"{PROMPT_MAX_CHARS} are used: {p}")
-                        text = text[:PROMPT_MAX_CHARS]
+                        cut = PROMPT_MAX_CHARS
+                        brace = text.rfind("{", 0, cut)  # never cut a {placeholder} in half
+                        if brace != -1 and "}" not in text[brace:cut] and cut - brace <= max(map(len, PROMPT_PLACEHOLDERS)):
+                            cut = brace
+                        text = text[:cut]
                     self.prompt = text
                     self.notices.extend(check_prompt(text, p))
 
@@ -281,20 +291,26 @@ def context_text() -> str:
     return "## About the user (from their context file)\n" + S.context if S.context else ""
 
 
-def personalize(prompt: str) -> str:
-    """Add your language and context file (MEETING_COPILOT_LANGUAGE, MEETING_COPILOT_CONTEXT_FILE)."""
-    if S.language:
-        prompt += f"\n{language_text()}\n"
-    if S.context:
-        prompt += f"\n{context_text()}\n"
-    return prompt
-
-
-# Placeholders a prompt file may use. The built-in suggestions prompt has none in its text: the language
-# and context lines are added at its end. Your file may put them where you want with {language} and
-# {context} (each becomes "" when that setting is empty); a part your file does not place is added at the
-# end, as for the built-in prompt.
+# Placeholders a prompt file may use. The built-in prompts have none in their text: the language line and
+# the context block are added at their end. A prompt file may place them instead: {language} becomes the
+# language name (or "the language the meeting is using" when MEETING_COPILOT_LANGUAGE is empty), {context}
+# the context block (or nothing). A part the file does not place is added at the end, as for the built-in.
 PROMPT_PLACEHOLDERS = ("{language}", "{context}")
+
+
+def personalize(prompt: str) -> str:
+    """Add your language and context file (MEETING_COPILOT_LANGUAGE, MEETING_COPILOT_CONTEXT_FILE): in place
+    of {language} / {context} when the prompt has them, else at the end."""
+    tail = []
+    if "{language}" in prompt:
+        prompt = prompt.replace("{language}", S.language or "the language the meeting is using")
+    elif S.language:
+        tail.append(language_text())
+    if "{context}" in prompt:
+        prompt = prompt.replace("{context}", context_text())
+    elif S.context:
+        tail.append(context_text())
+    return prompt + "".join(f"\n{t}\n" for t in tail)
 # The suggestions call returns JSON in a fixed shape (--json-schema, SCHEMA_ASSIST), so a prompt file can't
 # break the parser. It can leave the lists empty if it never asks for them: these words must stay in it.
 PROMPT_REQUIRED_WORDS = ("say", "ask")
@@ -302,14 +318,13 @@ PROMPT_REQUIRED_WORDS = ("say", "ask")
 
 def check_prompt(text: str, path) -> list[str]:
     """Startup notes about a prompt file: output fields it never names, and {words} that are no placeholder."""
-    import re
     notes = []
-    missing = [w for w in PROMPT_REQUIRED_WORDS if not re.search(r"\b" + w + r"\b", text)]
+    missing = [w for w in PROMPT_REQUIRED_WORDS if not re.search(r"\b" + w + r"\b", text, re.I)]
     if missing:
         notes.append(f"prompt file {path} never names the output field(s) {', '.join(missing)}: the suggestions "
                      "come back in the fields say, ask, corrections, goals_covered; without asking for "
                      f"{' and '.join(missing)} that list may stay empty")
-    unknown = sorted(set(re.findall(r"\{[a-z_]+\}", text)) - set(PROMPT_PLACEHOLDERS))
+    unknown = sorted(set(re.findall(r"\{[A-Za-z_]+\}", text)) - set(PROMPT_PLACEHOLDERS))
     if unknown:
         notes.append(f"prompt file {path}: {', '.join(unknown)} is not a placeholder and stays as written "
                      f"(placeholders: {', '.join(PROMPT_PLACEHOLDERS)})")
@@ -317,15 +332,7 @@ def check_prompt(text: str, path) -> list[str]:
 
 
 def assist_prompt() -> str:
-    if not S.prompt:
-        return personalize(PROMPT_ASSIST)
-    prompt, tail = S.prompt, []
-    for key, value in (("{language}", language_text()), ("{context}", context_text())):
-        if key in prompt:
-            prompt = prompt.replace(key, value)
-        elif value:
-            tail.append(value)
-    return prompt + "".join(f"\n{t}\n" for t in tail) if tail else prompt + "\n"
+    return personalize(S.prompt or PROMPT_ASSIST)
 
 
 def data_prompt() -> str:

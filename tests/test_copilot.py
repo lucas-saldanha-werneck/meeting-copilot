@@ -213,11 +213,8 @@ class Config(unittest.TestCase):
         self.with_settings({"MEETING_COPILOT_PROMPT_FILE": placed, "MEETING_COPILOT_CONTEXT_FILE": ctx,
                             "MEETING_COPILOT_LANGUAGE": "Spanish"})
         prompt = copilot.assist_prompt()
-        self.assertNotIn("{context}", prompt)
-        self.assertNotIn("{language}", prompt)
-        self.assertLess(prompt.index("I am Ana."), prompt.index("Middle"))
-        self.assertLess(prompt.index("Middle"), prompt.index("Write every item in Spanish"))
-        self.assertTrue(prompt.rstrip().endswith("End."), "placed parts are not added again at the end")
+        self.assertEqual(prompt, "Top.\n## About the user (from their context file)\nI am Ana.\nMiddle say/ask.\n"
+                                 "Spanish\nEnd.", "{language} is the name; placed parts are not added again")
         # not placed: added at the end, like the built-in prompt
         bare = self.write("p2.md", "Give say and ask.")
         self.with_settings({"MEETING_COPILOT_PROMPT_FILE": bare, "MEETING_COPILOT_CONTEXT_FILE": ctx,
@@ -225,9 +222,12 @@ class Config(unittest.TestCase):
         prompt = copilot.assist_prompt()
         self.assertTrue(prompt.startswith("Give say and ask."))
         self.assertLess(prompt.index("Write every item in Spanish"), prompt.index("I am Ana."))
-        # settings empty: the placeholders become nothing
+        # settings empty: {context} becomes nothing, {language} the meeting's language
         self.with_settings({"MEETING_COPILOT_PROMPT_FILE": placed})
-        self.assertEqual(copilot.assist_prompt(), "Top.\n\nMiddle say/ask.\n\nEnd.\n")
+        self.assertEqual(copilot.assist_prompt(), "Top.\n\nMiddle say/ask.\nthe language the meeting is using\nEnd.")
+        natural = self.write("p3.md", "Give say and ask in {language}.")
+        self.with_settings({"MEETING_COPILOT_PROMPT_FILE": natural, "MEETING_COPILOT_LANGUAGE": "Spanish"})
+        self.assertEqual(copilot.assist_prompt(), "Give say and ask in Spanish.")
 
     def test_prompt_file_missing_unreadable_or_empty_falls_back_with_one_note(self):
         bad_utf8 = os.path.join(self.t, "latin1.md")
@@ -235,7 +235,7 @@ class Config(unittest.TestCase):
             f.write(b"say and ask \xff\xfe\xe9")
         cases = {os.path.join(self.t, "nope.md"): "not found or unreadable",
                  self.t: "not found or unreadable",          # a folder
-                 bad_utf8: "not found or unreadable",
+                 bad_utf8: "is not UTF-8 text",
                  self.write("empty.md", "  \n\n"): "is empty"}
         for path, why in cases.items():
             s = self.with_settings({"MEETING_COPILOT_PROMPT_FILE": path})
@@ -255,6 +255,36 @@ class Config(unittest.TestCase):
         s = self.with_settings({"MEETING_COPILOT_PROMPT_FILE": braces})
         self.assertEqual(s.notices, [])
         self.assertIn('{"say": []} and {0} and {', copilot.assist_prompt())
+
+    def test_prompt_check_ignores_case_of_field_names_but_not_of_placeholders(self):
+        self.assertEqual(copilot.check_prompt("Say: one line. Ask: one question.", "p"), [])
+        notes = copilot.check_prompt("Use {Language} and {CONTEXT}. say, ask", "p")
+        self.assertEqual(len(notes), 1)
+        self.assertIn("{CONTEXT}, {Language} is not a placeholder", notes[0])
+
+    def test_context_file_not_utf8_or_with_bom_does_not_crash(self):
+        latin = os.path.join(self.t, "latin.md")
+        with open(latin, "wb") as f:
+            f.write(b"caf\xe9")
+        s = copilot.Settings({"MEETING_COPILOT_CONTEXT_FILE": latin})
+        self.assertEqual(s.context, "")
+        self.assertIn("not UTF-8", s.notices[0])
+        bom = self.write("bom.md", "\ufeffI am Ana.", encoding="utf-8")
+        self.assertEqual(copilot.Settings({"MEETING_COPILOT_CONTEXT_FILE": bom}).context, "I am Ana.")
+
+    def test_prompt_cut_never_splits_a_placeholder(self):
+        text = "say ask " + "x" * (copilot.PROMPT_MAX_CHARS - 13) + "{context} tail"
+        s = self.with_settings({"MEETING_COPILOT_PROMPT_FILE": self.write("cut.md", text)})
+        self.assertTrue(s.prompt.endswith("x"), s.prompt[-12:])
+        self.assertNotIn("{", s.prompt)
+
+    def test_built_in_prompts_unchanged_with_language_and_context(self):
+        ctx = self.write("me.md", "I am Ana.")
+        self.with_settings({"MEETING_COPILOT_CONTEXT_FILE": ctx, "MEETING_COPILOT_LANGUAGE": "Spanish"})
+        tail = ("\nWrite every item in Spanish, whatever language the meeting uses (keep the word EMPTY as is).\n"
+                "\n## About the user (from their context file)\nI am Ana.\n")
+        self.assertEqual(copilot.assist_prompt(), copilot.PROMPT_ASSIST + tail)
+        self.assertEqual(copilot.data_prompt(), copilot.PROMPT_DATA.format(sources="") + tail)
 
     def test_prompt_file_too_long_is_cut(self):
         p = self.write("long.md", "say ask " + "x" * (copilot.PROMPT_MAX_CHARS + 100))
@@ -610,7 +640,7 @@ class Live(unittest.TestCase):
         self.assertTrue(wait_for(lambda: (self.state() or {}).get("say")), self.log())
         a = [c for c in self.claude_calls() if "--json-schema" in c["argv"]][0]["argv"]
         prompt = a[a.index("--append-system-prompt") + 1]
-        self.assertTrue(prompt.startswith("MY PROMPT: give say and ask in Write every item in Spanish"))
+        self.assertEqual(prompt, "MY PROMPT: give say and ask in Spanish.")
         self.assertNotIn("live meeting copilot", prompt)
         self.assertNotIn("note: prompt file", self.log())
 

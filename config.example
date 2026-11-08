@@ -40,8 +40,9 @@
 #MEETING_COPILOT_LANGUAGE=
 
 # A text file that replaces the built-in suggestions prompt (the "Say this" /
-# "Ask this" call). {language} and {context} place your LANGUAGE and
-# CONTEXT_FILE text; whatever the file does not place is added at the end.
+# "Ask this" call). {language} becomes your LANGUAGE (e.g. "answer in
+# {language}") and {context} your CONTEXT_FILE text; whatever the file does not
+# place is added at the end.
 # Keep asking for say and ask (see README, "Your own prompt"). Missing or
 # unreadable: one note in the log, and the built-in prompt.
 # Empty: the built-in prompt.

@@ -133,11 +133,13 @@ Placeholders (written as is, with the braces):
 
 | Placeholder | Becomes |
 |---|---|
-| `{language}` | The line that asks for every item in `MEETING_COPILOT_LANGUAGE`, or nothing when that is empty |
+| `{language}` | The language name from `MEETING_COPILOT_LANGUAGE` (e.g. `answer in {language}`), or `the language the meeting is using` when that is empty |
 | `{context}` | Your `MEETING_COPILOT_CONTEXT_FILE` text under a heading, or nothing when that is empty |
 
-The built-in prompt has no placeholder in its text: it gets those two parts added at its end. Your
-file gets the same for any part it does not place. Other `{words}` stay as written.
+The built-in prompt has no placeholder in its text: it gets the language line ("Write every item in
+...") and the context block added at its end. Your file gets the same for any part it does not
+place. Other `{words}` stay as written. If the file is cut at the 20000-character limit, the cut
+never splits a placeholder.
 
 What must stay: the reply always comes back as JSON with the fields `say`, `ask`, `corrections`
 and `goals_covered` (Claude Code's `--json-schema`), so your text cannot break the parser. But if it
@@ -145,7 +147,8 @@ never asks for `say` and `ask`, those lists may stay empty. Name them in your te
 log shows a `note:` line when a file never mentions `say` or `ask`, or uses a `{word}` that is not a
 placeholder. The word `EMPTY` belongs to the fact-search prompt, which this setting does not touch.
 
-If the file is missing, unreadable, not UTF-8 or empty, the log shows one `note:` line and the
+If the file is missing, unreadable, not UTF-8 or empty, the log shows one `note:` line (a separate
+one for a file that is not UTF-8) and the
 built-in prompt is used. Only the first 20000 characters are used (the prompt goes on the `claude`
 command line).
 
