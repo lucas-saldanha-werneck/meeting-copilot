@@ -33,6 +33,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote
 
+__version__ = "0.1.0"
+
 HERE = Path(__file__).resolve().parent
 PAGE = HERE / "page.html"
 
@@ -660,6 +662,7 @@ def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description="Live meeting copilot (reads the Muesli app's live transcript).")
     ap.add_argument("--db", type=Path, help="Muesli database (opened read-only)")
     ap.add_argument("--port", type=int, help="local port (default 4390)")
+    ap.add_argument("--version", action="version", version=f"meeting-copilot {__version__}")
     args = ap.parse_args(argv)
     cfg = load_config()
     if args.db:
