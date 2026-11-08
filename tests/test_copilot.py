@@ -4,9 +4,11 @@
 Everything runs in temporary folders with a fake HOME: a fake Muesli database built here with an
 invented meeting, and a fake `claude` first on PATH (tests/fake_claude.py). No real Muesli, no AI.
 """
+import filecmp
 import hashlib
 import json
 import os
+import re
 import signal
 import socket
 import sqlite3
@@ -144,6 +146,211 @@ class Config(unittest.TestCase):
         self.assertIn("copilot.example.com", s.hosts_ok)
         self.assertIn("https://copilot.example.com", s.origins_ok)
         self.assertIn("http://127.0.0.1:4400", s.origins_ok)
+
+    def test_config_file_follows_xdg_config_home(self):
+        os.makedirs(os.path.join(self.t, "meeting-copilot"))
+        with open(os.path.join(self.t, "meeting-copilot", "config"), "w") as f:
+            f.write("MEETING_COPILOT_MODEL=haiku\n")
+        self.assertEqual(copilot.load_config({"XDG_CONFIG_HOME": self.t})["MEETING_COPILOT_MODEL"], "haiku")
+
+    def test_context_file_and_language_reach_both_prompts(self):
+        ctx = os.path.join(self.t, "me.md")
+        with open(ctx, "w", encoding="utf-8") as f:
+            f.write("I am Ana, head of ops. Notes: wiki/ is my personal wiki.\n")
+        old = copilot.S
+        try:
+            copilot.S = copilot.Settings({"MEETING_COPILOT_CONTEXT_FILE": ctx,
+                                          "MEETING_COPILOT_LANGUAGE": "Brazilian Portuguese"})
+            for prompt in (copilot.assist_prompt(), copilot.data_prompt()):
+                self.assertIn("I am Ana, head of ops.", prompt)
+                self.assertIn("Write every item in Brazilian Portuguese", prompt)
+            self.assertTrue(copilot.assist_prompt().startswith(copilot.PROMPT_ASSIST))
+            copilot.S = copilot.Settings({})
+            self.assertEqual(copilot.assist_prompt(), copilot.PROMPT_ASSIST)   # unchanged without settings
+        finally:
+            copilot.S = old
+
+    def test_context_file_missing_or_too_long(self):
+        s = copilot.Settings({"MEETING_COPILOT_CONTEXT_FILE": os.path.join(self.t, "nope.md")})
+        self.assertEqual(s.context, "")
+        self.assertIn("context file", s.notices[0])
+        big = os.path.join(self.t, "big.md")
+        with open(big, "w") as f:
+            f.write("x" * (copilot.CONTEXT_MAX_CHARS + 500))
+        self.assertEqual(len(copilot.Settings({"MEETING_COPILOT_CONTEXT_FILE": big}).context),
+                         copilot.CONTEXT_MAX_CHARS)
+
+    def test_get_prints_a_setting(self):
+        cfg_file = os.path.join(self.t, "config")
+        with open(cfg_file, "w") as f:
+            f.write('MEETING_COPILOT_OPEN_CMD=open -a "Some Browser"\nMEETING_COPILOT_PORT=4555\n'
+                    'MEETING_COPILOT_DATA_DIR=$MC_TEST_BASE/data\n')
+        env = {k: v for k, v in os.environ.items() if not k.startswith("MEETING_COPILOT")}
+        env.update(MEETING_COPILOT_CONFIG=cfg_file, MC_TEST_BASE=self.t)
+        for key, want in (("OPEN_CMD", 'open -a "Some Browser"'), ("PORT", "4555"), ("NOPE", ""),
+                          ("DATA_DIR", self.t + "/data")):                      # $VARS expand
+            p = subprocess.run([PY, os.path.join(ROOT, "lib", "copilot.py"), "--get", key], env=env,
+                               capture_output=True, text=True)
+            self.assertEqual((p.returncode, p.stdout.strip()), (0, want))
+
+    def test_quotes_kept_when_the_value_has_quoted_words_inside(self):
+        cfg_file = os.path.join(self.t, "config")
+        with open(cfg_file, "w") as f:
+            f.write('MEETING_COPILOT_OPEN_CMD="/Applications/My Browser.app/x" "{url}"\n'
+                    'MEETING_COPILOT_MODEL="haiku"\nMEETING_COPILOT_LANGUAGE=\'Portuguese\'\n')
+        cfg = copilot.load_config({"MEETING_COPILOT_CONFIG": cfg_file})
+        self.assertEqual(cfg["MEETING_COPILOT_OPEN_CMD"], '"/Applications/My Browser.app/x" "{url}"')
+        self.assertEqual(cfg["MEETING_COPILOT_MODEL"], "haiku")          # one quoted value: quotes go
+        self.assertEqual(cfg["MEETING_COPILOT_LANGUAGE"], "Portuguese")
+
+    def test_empty_value_means_the_default(self):
+        cfg_file = os.path.join(self.t, "config")
+        with open(cfg_file, "w") as f:
+            f.write("MEETING_COPILOT_PORT=\nMEETING_COPILOT_DATA_MODEL=\nMEETING_COPILOT_POLL_S=\n")
+        s = copilot.Settings(copilot.load_config({"MEETING_COPILOT_CONFIG": cfg_file, "MEETING_COPILOT_MODEL": ""}))
+        self.assertEqual((s.port, s.model, s.data_model, s.poll_s), (4390, "sonnet", "sonnet", 5.0))
+
+    def test_bom_or_bad_bytes_in_the_file_do_not_crash(self):
+        cfg_file = os.path.join(self.t, "config")
+        with open(cfg_file, "wb") as f:
+            f.write(b"\xef\xbb\xbfMEETING_COPILOT_PORT=4555\n# caf\xe9 latin-1 note\nMEETING_COPILOT_MODEL=haiku\n")
+        s = copilot.Settings(copilot.load_config({"MEETING_COPILOT_CONFIG": cfg_file}))
+        self.assertEqual((s.port, s.model), (4555, "haiku"))
+
+# ------------------------------------------------------------------ first run: your config file
+
+
+STARTER = os.path.join(ROOT, "config.example")
+
+
+def read_bytes(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
+class Seed(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.t = os.path.realpath(self.tmp.name)
+        self.home = os.path.join(self.t, "home")
+        os.makedirs(self.home)
+
+    def tearDown(self):
+        for root, dirs, _ in os.walk(self.t):
+            for d in dirs:
+                os.chmod(os.path.join(root, d), 0o700)
+        self.tmp.cleanup()
+
+    def env(self, **extra):
+        """A clean environment: fake HOME, no XDG_CONFIG_HOME, no MEETING_COPILOT_*, no API keys."""
+        drop = ("MEETING_COPILOT", "XDG_CONFIG_HOME", "OPENROUTER_API_KEY", "OPENAI_API_KEY", "GROQ_API_KEY")
+        env = {k: v for k, v in os.environ.items() if not k.startswith(drop)}
+        env.update(HOME=self.home, USERPROFILE=self.home, **extra)
+        return env
+
+    def get(self, env, key="PORT"):
+        return subprocess.run([PY, os.path.join(ROOT, "lib", "copilot.py"), "--get", key], env=env,
+                              capture_output=True, text=True, timeout=30)
+
+    def test_first_command_creates_the_file_under_home(self):
+        p = self.get(self.env())
+        self.assertEqual((p.returncode, p.stdout, p.stderr), (0, "\n", ""))
+        path = os.path.join(self.home, ".config", "meeting-copilot", "config")
+        self.assertEqual(read_bytes(path), read_bytes(STARTER))
+
+    def test_xdg_config_home_is_respected(self):
+        xdg = os.path.join(self.t, "xdg", "not-there-yet")
+        copilot.seed_config({"XDG_CONFIG_HOME": xdg})
+        self.assertEqual(read_bytes(os.path.join(xdg, "meeting-copilot", "config")), read_bytes(STARTER))
+
+    def test_meeting_copilot_config_is_respected(self):
+        xdg = os.path.join(self.t, "xdg")
+        mine = os.path.join(self.t, "sub", "my-config")
+        self.assertEqual(self.get(self.env(XDG_CONFIG_HOME=xdg, MEETING_COPILOT_CONFIG=mine)).returncode, 0)
+        self.assertEqual(read_bytes(mine), read_bytes(STARTER))
+        self.assertFalse(os.path.exists(xdg))
+
+    def test_existing_file_is_never_changed(self):
+        for content in (b"MEETING_COPILOT_PORT=4555\n", b"", b"garbage \xff\xfe\r\n"):
+            with self.subTest(content=content):
+                path = os.path.join(self.t, "config")
+                with open(path, "wb") as f:
+                    f.write(content)
+                copy = os.path.join(self.t, "config.before")
+                with open(copy, "wb") as f:
+                    f.write(content)
+                before = os.stat(path).st_mtime_ns
+                copilot.seed_config({"MEETING_COPILOT_CONFIG": path})
+                self.get(self.env(MEETING_COPILOT_CONFIG=path))
+                self.assertTrue(filecmp.cmp(path, copy, shallow=False))
+                self.assertEqual(os.stat(path).st_mtime_ns, before)
+
+    def test_cannot_create_no_crash(self):
+        blocker = os.path.join(self.t, "a-file")
+        with open(blocker, "w") as f:
+            f.write("x")
+        copilot.seed_config({"XDG_CONFIG_HOME": blocker})     # folder inside a regular file: fails on every OS
+        p = self.get(self.env(MEETING_COPILOT_CONFIG=os.path.join(blocker, "config")), "MODEL")
+        self.assertEqual((p.returncode, p.stdout, p.stderr), (0, "\n", ""))
+
+    @unittest.skipIf(WIN or (hasattr(os, "geteuid") and os.geteuid() == 0),
+                     "read-only folders need POSIX permissions and a non-root user")
+    def test_read_only_folder_no_crash(self):
+        ro = os.path.join(self.t, "ro")
+        os.makedirs(ro)
+        os.chmod(ro, 0o500)
+        p = self.get(self.env(XDG_CONFIG_HOME=ro))
+        self.assertEqual((p.returncode, p.stdout, p.stderr), (0, "\n", ""))
+        self.assertFalse(os.path.exists(os.path.join(ro, "meeting-copilot")))
+
+    def test_relative_path_is_skipped(self):
+        cwd = os.path.join(self.t, "cwd")
+        os.makedirs(cwd)
+        p = subprocess.run([PY, os.path.join(ROOT, "lib", "copilot.py"), "--get", "PORT"], cwd=cwd,
+                           env=self.env(MEETING_COPILOT_CONFIG="relative-config"), capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0)
+        self.assertEqual(os.listdir(cwd), [])
+
+    def test_seeded_defaults_behave_like_no_file(self):
+        none = {"XDG_CONFIG_HOME": os.path.join(self.t, "none")}
+        seeded = {"XDG_CONFIG_HOME": os.path.join(self.t, "seeded")}
+        copilot.seed_config(seeded)
+        self.assertTrue(os.path.isfile(os.path.join(self.t, "seeded", "meeting-copilot", "config")))
+        self.assertEqual(copilot.load_config(seeded), copilot.load_config(none))
+        self.assertEqual(copilot.load_config(seeded), {})
+        self.assertEqual(vars(copilot.Settings(copilot.load_config(seeded))),
+                         vars(copilot.Settings(copilot.load_config(none))))
+        # what bin/meeting-copilot reads through --get; "no file" sits inside a regular file, so the
+        # seed cannot create it there either
+        blocker = os.path.join(self.t, "a-file")
+        with open(blocker, "w") as f:
+            f.write("x")
+        no_file = self.env(MEETING_COPILOT_CONFIG=os.path.join(blocker, "config"))
+        with_file = self.env(MEETING_COPILOT_CONFIG=os.path.join(self.t, "seeded", "meeting-copilot", "config"))
+        for key in ("PORT", "DATA_DIR", "OPEN_CMD", "MODEL", "DB"):
+            self.assertEqual(self.get(with_file, key).stdout, self.get(no_file, key).stdout)
+        self.assertFalse(os.path.exists(os.path.join(self.t, "none")))
+
+    def test_starter_lists_every_key_commented_out(self):
+        with open(os.path.join(ROOT, "lib", "copilot.py"), encoding="utf-8") as f:
+            code = f.read()
+        keys = set(re.findall(r'g\("([A-Z_]+)"', code)) | {"OPEN_CMD"}
+        self.assertGreater(len(keys), 15)
+        with open(STARTER, encoding="utf-8") as f:
+            text = f.read()
+        for k in sorted(keys):
+            self.assertIn(f"\n#MEETING_COPILOT_{k}=", text, k)
+        active = [ln for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+        self.assertEqual(active, [])
+
+    @unittest.skipIf(WIN, NO_BASH_WHY)
+    def test_launcher_first_use_creates_it(self):
+        env = self.env(MEETING_COPILOT_PYTHON=PY, XDG_DATA_HOME=os.path.join(self.t, "data"))
+        p = subprocess.run(["bash", os.path.join(ROOT, "bin", "meeting-copilot"), "status"], env=env,
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(p.stdout.strip(), "not running")
+        path = os.path.join(self.home, ".config", "meeting-copilot", "config")
+        self.assertEqual(read_bytes(path), read_bytes(STARTER))
 
 # ------------------------------------------------------------------ the real program, as a process
 
@@ -297,6 +504,20 @@ class Live(unittest.TestCase):
         self.assertTrue(all("--json-schema" in c["argv"] for c in calls))
         self.assertIn("fact search is off", self.log())
 
+    @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
+    def test_context_file_and_language_go_to_claude(self):
+        ctx = os.path.join(self.t, "me.md")
+        with open(ctx, "w", encoding="utf-8") as f:
+            f.write("The user is Ana; WhatsApp sessions: ana, shop.\n")
+        self.start(MEETING_COPILOT_CONTEXT_FILE=ctx, MEETING_COPILOT_LANGUAGE="Spanish")
+        self.speak()
+        assist = lambda: [c for c in self.claude_calls() if "--json-schema" in c["argv"]]  # noqa: E731
+        self.assertTrue(wait_for(assist), self.log())
+        a = assist()[0]["argv"]
+        prompt = a[a.index("--append-system-prompt") + 1]
+        self.assertIn("WhatsApp sessions: ana, shop.", prompt)
+        self.assertIn("Write every item in Spanish", prompt)
+
     @unittest.skipIf(WIN, "SIGTERM cannot be delivered as a signal on Windows")
     def test_sigterm_saves_session(self):
         self.start(MEETING_COPILOT_CLAUDE=os.path.join(self.t, "no-claude"))
@@ -441,6 +662,88 @@ class Tools(unittest.TestCase):
         self.assertIn("stopped", p.stdout)
         p = subprocess.run(["bash", link, "status"], env=env, capture_output=True, text=True)
         self.assertEqual(p.returncode, 1)
+
+    @unittest.skipIf(WIN, NO_BASH_WHY)
+    def test_launcher_port_from_config_file_and_open_cmd(self):
+        db = os.path.join(self.t, "muesli.db")
+        fake_meeting.prepare(copilot.Path(db))
+        port = free_port()
+        opened = os.path.join(self.t, "opened.txt")
+        opener = os.path.join(self.t, "my-browser")
+        with open(opener, "w") as f:
+            f.write('#!/bin/sh\nprintf "%s|" "$@" > "$OPENED"\n')
+        os.chmod(opener, 0o755)
+        cfg_file = os.path.join(self.t, "config")
+        with open(cfg_file, "w") as f:
+            f.write(f"MEETING_COPILOT_PORT={port}\nMEETING_COPILOT_OPEN_CMD={opener} --new-tab {{url}} --bg\n")
+        launcher = os.path.join(ROOT, "bin", "meeting-copilot")
+        env = dict(self.env)
+        env.pop("MEETING_COPILOT_PORT", None)
+        env.update(MEETING_COPILOT_DB=db, MEETING_COPILOT_CONFIG=cfg_file, OPENED=opened,
+                   MEETING_COPILOT_CLAUDE=os.path.join(self.t, "no-claude"), MEETING_COPILOT_PYTHON=PY)
+        try:
+            p = subprocess.run(["bash", launcher], env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            self.assertIn(f"http://127.0.0.1:{port}", p.stdout)        # the port came from the file
+            with open(opened) as f:
+                self.assertEqual(f.read(), f"--new-tab|http://127.0.0.1:{port}|--bg|")
+            # without {url}, the URL goes at the end (a later line wins)
+            with open(cfg_file, "a") as f:
+                f.write(f"MEETING_COPILOT_OPEN_CMD={opener} -x\n")
+            p = subprocess.run(["bash", launcher], env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            with open(opened) as f:
+                self.assertEqual(f.read(), f"-x|http://127.0.0.1:{port}|")
+        finally:
+            subprocess.run(["bash", launcher, "stop"], env=env, capture_output=True, text=True, timeout=30)
+
+    @unittest.skipIf(WIN, NO_BASH_WHY)
+    def test_open_cmd_that_keeps_running_does_not_hold_the_launcher(self):
+        db = os.path.join(self.t, "muesli.db")
+        fake_meeting.prepare(copilot.Path(db))
+        port = free_port()
+        opened = os.path.join(self.t, "opened.txt")
+        opener = os.path.join(self.t, "my-browser")
+        with open(opener, "w") as f:   # like a browser binary started directly: it stays running
+            f.write('#!/bin/sh\nprintf "%s|" "$@" > "$OPENED"\nexec sleep 60\n')
+        os.chmod(opener, 0o755)
+        cfg_file = os.path.join(self.t, "config")
+        with open(cfg_file, "w") as f:
+            f.write(f"MEETING_COPILOT_PORT={port}\nMEETING_COPILOT_OPEN_CMD={opener} {{url}} --again {{url}}\n")
+        launcher = os.path.join(ROOT, "bin", "meeting-copilot")
+        env = dict(self.env)
+        env.update(MEETING_COPILOT_DB=db, MEETING_COPILOT_CONFIG=cfg_file, OPENED=opened,
+                   MEETING_COPILOT_CLAUDE=os.path.join(self.t, "no-claude"), MEETING_COPILOT_PYTHON=PY)
+        try:
+            p = subprocess.run(["bash", launcher], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               stdin=subprocess.DEVNULL, text=True, timeout=20)
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            url = f"http://127.0.0.1:{port}"
+            wait_for(lambda: os.path.exists(opened) and os.path.getsize(opened) > 0, timeout=5)
+            with open(opened) as f:
+                self.assertEqual(f.read(), f"{url}|--again|{url}|")      # every {url} is the URL
+        finally:
+            subprocess.run(["bash", launcher, "stop"], env=env, capture_output=True, text=True, timeout=30)
+            subprocess.run(["pkill", "-f", opener], capture_output=True)
+
+    @unittest.skipIf(WIN, NO_BASH_WHY)
+    def test_open_cmd_that_fails_is_reported(self):
+        db = os.path.join(self.t, "muesli.db")
+        fake_meeting.prepare(copilot.Path(db))
+        port = free_port()
+        cfg_file = os.path.join(self.t, "config")
+        with open(cfg_file, "w") as f:
+            f.write(f"MEETING_COPILOT_PORT={port}\nMEETING_COPILOT_OPEN_CMD=false\n")
+        launcher = os.path.join(ROOT, "bin", "meeting-copilot")
+        env = dict(self.env, MEETING_COPILOT_DB=db, MEETING_COPILOT_CONFIG=cfg_file,
+                   MEETING_COPILOT_CLAUDE=os.path.join(self.t, "no-claude"), MEETING_COPILOT_PYTHON=PY)
+        try:
+            p = subprocess.run(["bash", launcher], env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            self.assertIn("MEETING_COPILOT_OPEN_CMD failed", p.stderr)
+            self.assertIn(f"open http://127.0.0.1:{port} in your browser", p.stdout)
+        finally:
+            subprocess.run(["bash", launcher, "stop"], env=env, capture_output=True, text=True, timeout=30)
 
 
 if __name__ == "__main__":

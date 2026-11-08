@@ -66,9 +66,22 @@ python3 tools/fake_meeting.py speak /tmp/test.db 4     # one invented line every
 python3 tools/fake_meeting.py end /tmp/test.db
 ```
 
-## Config
+## Your settings
 
-Environment variables, or the same `KEY=VALUE` lines in `~/.config/meeting-copilot/config` (environment wins):
+Your settings live in your own file, outside the program folder, so updating meeting-copilot
+(`git pull` or a new download) never touches them:
+
+- `~/.config/meeting-copilot/config` (or `$XDG_CONFIG_HOME/meeting-copilot/config` when
+  `XDG_CONFIG_HOME` is set), or any file named by `MEETING_COPILOT_CONFIG`
+- one `KEY=VALUE` per line; `#` starts a comment; `~` and `$VARS` expand in paths
+- each key also works as an environment variable, which wins over the file
+
+You don't have to create it: the first `meeting-copilot` command you run creates it, a copy of
+[`config.example`](config.example) with every key listed at its default and commented out (so it
+changes nothing until you remove a `#` and edit the line). If the file is already there, it is
+never rewritten or changed, not even by an update.
+
+Every key:
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -82,6 +95,10 @@ Environment variables, or the same `KEY=VALUE` lines in `~/.config/meeting-copil
 | `MEETING_COPILOT_SESSIONS_DIR` | `~/.local/share/meeting-copilot/sessions` | Where each meeting's transcript and suggestions are saved when it ends (`MEETING_COPILOT_SAVE_SESSIONS=0` to turn off) |
 | `MEETING_COPILOT_EXTRA_HOSTS` | empty | Extra host names allowed to load the page, e.g. behind your own reverse proxy or tunnel (POSTs then accept `https://<host>` as origin) |
 | `MEETING_COPILOT_ASSIST_S`, `_DATA_S`, `_POLL_S` | `25`, `45`, `5` | Intervals in seconds |
+| `MEETING_COPILOT_CONTEXT_FILE` | empty | A text file about you that both AI calls read: your name and role, your projects, what your notes folders and MCP tools hold, words the transcript tends to get wrong. The first 8000 characters are used |
+| `MEETING_COPILOT_LANGUAGE` | empty (the meeting's language) | Language for every suggestion and fact, e.g. `Brazilian Portuguese` |
+| `MEETING_COPILOT_OPEN_CMD` | `open` (macOS) or `xdg-open` | Command that opens the page. The URL is passed as one argument wherever `{url}` is (no quotes around it), or at the end, e.g. `open -g -a "Firefox"` |
+| `MEETING_COPILOT_DATA_DIR`, `_LOG`, `_PYTHON` | `~/.local/share/meeting-copilot`, its `meeting-copilot.log`, `python3` | Data folder, log file and Python used by `meeting-copilot` (environment only for `_LOG` and `_PYTHON`) |
 
 Example config:
 
@@ -89,6 +106,18 @@ Example config:
 MEETING_COPILOT_SEARCH_DIRS=$HOME/notes:$HOME/work/docs
 MEETING_COPILOT_MCP_CONFIG=$HOME/.config/meeting-copilot/mcp.json
 MEETING_COPILOT_MCP_TOOLS=mcp__chat__MessageHistory,mcp__chat__ContactFindOne
+MEETING_COPILOT_CONTEXT_FILE=~/.config/meeting-copilot/context.md
+MEETING_COPILOT_LANGUAGE=Brazilian Portuguese
+MEETING_COPILOT_OPEN_CMD=open -g -a "Google Chrome"
+```
+
+Example `context.md`:
+
+```
+I am Ana, head of operations at a small solar installer.
+My notes: ~/notes is my wiki (one page per client). The chat tools read WhatsApp, read-only:
+session "ana" is personal, session "shop" is the company number.
+The transcript often writes "Solarix" as "solar X".
 ```
 
 Only allow read-only MCP tools: the fact search runs during your meeting without asking you.

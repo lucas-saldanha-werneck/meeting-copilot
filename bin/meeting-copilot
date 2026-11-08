@@ -16,12 +16,18 @@ done
 ROOT="$(cd "$(dirname "$src")/.." && pwd)"
 APP="$ROOT/lib/copilot.py"
 
-DATA="${MEETING_COPILOT_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/meeting-copilot}"
-PIDFILE="$DATA/meeting-copilot.pid"
-LOG="${MEETING_COPILOT_LOG:-$DATA/meeting-copilot.log}"
 PY="${MEETING_COPILOT_PYTHON:-python3}"
 
-port="${MEETING_COPILOT_PORT:-4390}"
+# A setting from the environment or the config file (~/.config/meeting-copilot/config).
+setting() { "$PY" "$APP" --get "$1" 2>/dev/null; }
+
+DATA="$(setting DATA_DIR)"
+DATA="${DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/meeting-copilot}"
+PIDFILE="$DATA/meeting-copilot.pid"
+LOG="${MEETING_COPILOT_LOG:-$DATA/meeting-copilot.log}"
+
+port="$(setting PORT)"
+port="${port:-4390}"
 open_page=1
 args=()
 cmd=start
@@ -54,6 +60,24 @@ page_up() {
 }
 
 open_url() {
+  # MEETING_COPILOT_OPEN_CMD: your own command, e.g. open -a "Firefox". The URL goes in as one
+  # argument where {url} is, or at the end; it is never pasted into the command text.
+  local cmd
+  cmd="$(setting OPEN_CMD)"
+  if [ -n "$cmd" ]; then
+    case "$cmd" in
+      *"{url}"*) cmd="${cmd//\{url\}/\"\$1\"}" ;;
+      *) cmd="$cmd \"\$1\"" ;;
+    esac
+    # In the background, so a browser started directly (it keeps running) never holds the
+    # terminal; a command that fails within 3 s is still reported. Its output goes to the log.
+    bash -c "$cmd" meeting-copilot "$URL" </dev/null >>"$LOG" 2>&1 &
+    local pid=$! i
+    for i in $(seq 1 15); do kill -0 "$pid" 2>/dev/null || break; sleep 0.2; done
+    if kill -0 "$pid" 2>/dev/null || wait "$pid"; then return 0; fi
+    echo "meeting-copilot: MEETING_COPILOT_OPEN_CMD failed (see $LOG)" >&2
+    return 1
+  fi
   if [ "$(uname -s)" = "Darwin" ] && command -v open >/dev/null 2>&1; then
     open "$URL" && return 0
   elif command -v xdg-open >/dev/null 2>&1; then

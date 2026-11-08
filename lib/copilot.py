@@ -11,7 +11,7 @@ Reads the live transcript that the Muesli app writes while a meeting is recordin
   - Speaking-habit warnings                  (no AI, every 5 s)
 
 The AI runs through the `claude -p` command line (Claude Code). Nothing else leaves the machine.
-Configuration: environment variables or ~/.config/meeting-copilot/config (see README).
+Configuration: environment variables or ~/.config/meeting-copilot/config (see README, "Your settings").
 """
 
 from __future__ import annotations
@@ -34,15 +34,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 HERE = Path(__file__).resolve().parent
 PAGE = HERE / "page.html"
+STARTER = HERE.parent / "config.example"   # copied to your config path on first run (seed_config)
 
 COOLDOWN_WARNING_S = 120   # between any two warnings
 REPEAT_WARNING_S = 300     # before the same kind of warning shows again
 WINDOW_S = 180             # how much of the conversation the AI sees
 AI_TIMEOUT_S = 120
+CONTEXT_MAX_CHARS = 8000   # of your context file that goes into each prompt
 
 # ---------------------------------------------------------------- config
 
@@ -60,19 +62,53 @@ def _expand(v: str) -> str:
     return os.path.expanduser(os.path.expandvars(v.strip()))
 
 
+def config_path(environ=None) -> Path:
+    """Your config file: $MEETING_COPILOT_CONFIG, else $XDG_CONFIG_HOME or ~/.config, then meeting-copilot/config."""
+    environ = os.environ if environ is None else environ
+    base = environ.get("XDG_CONFIG_HOME") or "~/.config"
+    return Path(_expand(environ.get("MEETING_COPILOT_CONFIG", "") or os.path.join(base, "meeting-copilot", "config")))
+
+
+def seed_config(environ=None) -> None:
+    """First run: create your config file from config.example (every line commented out) when missing.
+
+    Never overwrites or changes a file that is there, skips a path that is not absolute, and
+    ignores every error: the program then runs on its defaults, as without a file."""
+    try:
+        path = config_path(environ)
+        if not path.is_absolute() or os.path.lexists(path):
+            return
+        data = STARTER.read_bytes()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # O_EXCL: if the file shows up meanwhile, this fails instead of overwriting it.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+    except Exception:
+        return
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+    except Exception:
+        try:
+            os.remove(path)  # the half-written file is ours: remove it so the next run tries again
+        except OSError:
+            pass
+
+
 def load_config(environ=None) -> dict:
     """KEY=VALUE lines from the config file, then MEETING_COPILOT_* environment variables (these win)."""
     environ = os.environ if environ is None else environ
     cfg: dict[str, str] = {}
-    path = Path(_expand(environ.get("MEETING_COPILOT_CONFIG", "") or "~/.config/meeting-copilot/config"))
+    path = config_path(environ)
     if path.is_file():
-        for line in path.read_text(encoding="utf-8").splitlines():
+        # utf-8-sig: a BOM from an editor is fine; a stray non-UTF-8 byte never stops the program
+        for line in path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
             k, v = line.split("=", 1)
             v = v.strip()
-            if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+            # "one quoted value" loses its quotes; "a" "b" (quoted words inside) is kept as written
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'" and v[0] not in v[1:-1]:
                 v = v[1:-1]
             cfg[k.strip()] = v
     for k, v in environ.items():
@@ -83,7 +119,7 @@ def load_config(environ=None) -> dict:
 
 class Settings:
     def __init__(self, cfg: dict) -> None:
-        g = lambda k, d="": cfg.get("MEETING_COPILOT_" + k, d)  # noqa: E731
+        g = lambda k, d="": cfg.get("MEETING_COPILOT_" + k) or d  # noqa: E731  (KEY= with no value: the default)
         self.db = Path(_expand(g("DB"))) if g("DB") else default_db()
         self.port = int(g("PORT", "4390"))
         self.model = g("MODEL", "sonnet")
@@ -123,6 +159,18 @@ class Settings:
                                     "MCP tools are off (list the read-only tools you allow)")
             else:
                 self.mcp_config, self.mcp_tools = p.resolve(), tools
+
+        # Optional: what the AI should know about you (name, role, projects, where your notes are),
+        # and the language every suggestion and fact is written in.
+        self.context = ""
+        ctx = g("CONTEXT_FILE")
+        if ctx:
+            p = Path(_expand(ctx))
+            try:
+                self.context = p.read_text(encoding="utf-8").strip()[:CONTEXT_MAX_CHARS]
+            except OSError:
+                self.notices.append(f"context file not found or unreadable, ignored: {p}")
+        self.language = g("LANGUAGE").strip()
 
         hosts = [h.strip() for h in g("EXTRA_HOSTS").split(",") if h.strip()]
         self.hosts_ok = {f"127.0.0.1:{self.port}", f"localhost:{self.port}", *hosts}
@@ -197,6 +245,24 @@ SCHEMA_ASSIST = {
     },
     "required": ["say", "ask", "corrections", "goals_covered"],
 }
+
+
+def personalize(prompt: str) -> str:
+    """Add your language and context file (MEETING_COPILOT_LANGUAGE, MEETING_COPILOT_CONTEXT_FILE)."""
+    if S.language:
+        prompt += (f"\nWrite every item in {S.language}, whatever language the meeting uses "
+                   "(keep the word EMPTY as is).\n")
+    if S.context:
+        prompt += "\n## About the user (from their context file)\n" + S.context + "\n"
+    return prompt
+
+
+def assist_prompt() -> str:
+    return personalize(PROMPT_ASSIST)
+
+
+def data_prompt() -> str:
+    return personalize(PROMPT_DATA.format(sources=data_sources_text()))
 
 
 def data_sources_text() -> str:
@@ -458,7 +524,7 @@ def assist_round() -> None:
     msg = (f"{ctx}\n\n## ALREADY SHOWN\n" + ("\n".join(f"- {j}" for j in shown) or "(nothing)")
            + "\n\n" + transcript(lines, seen))
     t0 = now()
-    out = run_claude(PROMPT_ASSIST, msg, S.model, schema=SCHEMA_ASSIST)
+    out = run_claude(assist_prompt(), msg, S.model, schema=SCHEMA_ASSIST)
     r = out.get("structured_output")
     if isinstance(r, str):
         r = json.loads(r)
@@ -495,7 +561,7 @@ def data_round() -> None:
            + "\n\n" + transcript(lines, seen))
     t0 = now()
     tools = ["Read", "Grep", "Glob"] if S.search_dirs else []
-    out = run_claude(PROMPT_DATA.format(sources=data_sources_text()), msg, S.data_model,
+    out = run_claude(data_prompt(), msg, S.data_model,
                      tools=tools, mcp_tools=S.mcp_tools if S.mcp_config else [],
                      dirs=S.search_dirs, max_turns=8)
     text = (out.get("result") or "").strip()
@@ -675,8 +741,14 @@ def main(argv=None) -> None:
     ap.add_argument("--db", type=Path, help="Muesli database (opened read-only)")
     ap.add_argument("--port", type=int, help="local port (default 4390)")
     ap.add_argument("--version", action="version", version=f"meeting-copilot {__version__}")
+    ap.add_argument("--get", metavar="KEY", help=argparse.SUPPRESS)  # for bin/meeting-copilot: PORT, OPEN_CMD
     args = ap.parse_args(argv)
+    seed_config()   # bin/meeting-copilot calls --get first, so any first command creates it
     cfg = load_config()
+    if args.get:
+        v = cfg.get("MEETING_COPILOT_" + args.get, "")
+        print(_expand(v) if v and args.get == "DATA_DIR" else v)
+        return
     if args.db:
         cfg["MEETING_COPILOT_DB"] = str(args.db)
     if args.port:
