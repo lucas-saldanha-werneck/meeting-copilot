@@ -11,7 +11,7 @@ Reads the live transcript that the Muesli app writes while a meeting is recordin
   - Speaking-habit warnings                  (no AI, every 5 s)
 
 The AI runs through the `claude -p` command line (Claude Code). Nothing else leaves the machine.
-Configuration: environment variables or ~/.config/meeting-copilot/config (see README).
+Configuration: environment variables or ~/.config/meeting-copilot/config (see README, "Your settings").
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 HERE = Path(__file__).resolve().parent
 PAGE = HERE / "page.html"
@@ -43,6 +43,7 @@ COOLDOWN_WARNING_S = 120   # between any two warnings
 REPEAT_WARNING_S = 300     # before the same kind of warning shows again
 WINDOW_S = 180             # how much of the conversation the AI sees
 AI_TIMEOUT_S = 120
+CONTEXT_MAX_CHARS = 8000   # of your context file that goes into each prompt
 
 # ---------------------------------------------------------------- config
 
@@ -64,7 +65,8 @@ def load_config(environ=None) -> dict:
     """KEY=VALUE lines from the config file, then MEETING_COPILOT_* environment variables (these win)."""
     environ = os.environ if environ is None else environ
     cfg: dict[str, str] = {}
-    path = Path(_expand(environ.get("MEETING_COPILOT_CONFIG", "") or "~/.config/meeting-copilot/config"))
+    base = environ.get("XDG_CONFIG_HOME") or "~/.config"
+    path = Path(_expand(environ.get("MEETING_COPILOT_CONFIG", "") or os.path.join(base, "meeting-copilot", "config")))
     if path.is_file():
         for line in path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
@@ -123,6 +125,18 @@ class Settings:
                                     "MCP tools are off (list the read-only tools you allow)")
             else:
                 self.mcp_config, self.mcp_tools = p.resolve(), tools
+
+        # Optional: what the AI should know about you (name, role, projects, where your notes are),
+        # and the language every suggestion and fact is written in.
+        self.context = ""
+        ctx = g("CONTEXT_FILE")
+        if ctx:
+            p = Path(_expand(ctx))
+            try:
+                self.context = p.read_text(encoding="utf-8").strip()[:CONTEXT_MAX_CHARS]
+            except OSError:
+                self.notices.append(f"context file not found or unreadable, ignored: {p}")
+        self.language = g("LANGUAGE").strip()
 
         hosts = [h.strip() for h in g("EXTRA_HOSTS").split(",") if h.strip()]
         self.hosts_ok = {f"127.0.0.1:{self.port}", f"localhost:{self.port}", *hosts}
@@ -197,6 +211,24 @@ SCHEMA_ASSIST = {
     },
     "required": ["say", "ask", "corrections", "goals_covered"],
 }
+
+
+def personalize(prompt: str) -> str:
+    """Add your language and context file (MEETING_COPILOT_LANGUAGE, MEETING_COPILOT_CONTEXT_FILE)."""
+    if S.language:
+        prompt += (f"\nWrite every item in {S.language}, whatever language the meeting uses "
+                   "(keep the word EMPTY as is).\n")
+    if S.context:
+        prompt += "\n## About the user (from their context file)\n" + S.context + "\n"
+    return prompt
+
+
+def assist_prompt() -> str:
+    return personalize(PROMPT_ASSIST)
+
+
+def data_prompt() -> str:
+    return personalize(PROMPT_DATA.format(sources=data_sources_text()))
 
 
 def data_sources_text() -> str:
@@ -458,7 +490,7 @@ def assist_round() -> None:
     msg = (f"{ctx}\n\n## ALREADY SHOWN\n" + ("\n".join(f"- {j}" for j in shown) or "(nothing)")
            + "\n\n" + transcript(lines, seen))
     t0 = now()
-    out = run_claude(PROMPT_ASSIST, msg, S.model, schema=SCHEMA_ASSIST)
+    out = run_claude(assist_prompt(), msg, S.model, schema=SCHEMA_ASSIST)
     r = out.get("structured_output")
     if isinstance(r, str):
         r = json.loads(r)
@@ -495,7 +527,7 @@ def data_round() -> None:
            + "\n\n" + transcript(lines, seen))
     t0 = now()
     tools = ["Read", "Grep", "Glob"] if S.search_dirs else []
-    out = run_claude(PROMPT_DATA.format(sources=data_sources_text()), msg, S.data_model,
+    out = run_claude(data_prompt(), msg, S.data_model,
                      tools=tools, mcp_tools=S.mcp_tools if S.mcp_config else [],
                      dirs=S.search_dirs, max_turns=8)
     text = (out.get("result") or "").strip()
@@ -675,8 +707,13 @@ def main(argv=None) -> None:
     ap.add_argument("--db", type=Path, help="Muesli database (opened read-only)")
     ap.add_argument("--port", type=int, help="local port (default 4390)")
     ap.add_argument("--version", action="version", version=f"meeting-copilot {__version__}")
+    ap.add_argument("--get", metavar="KEY", help=argparse.SUPPRESS)  # for bin/meeting-copilot: PORT, OPEN_CMD
     args = ap.parse_args(argv)
     cfg = load_config()
+    if args.get:
+        v = cfg.get("MEETING_COPILOT_" + args.get, "")
+        print(_expand(v) if v and args.get == "DATA_DIR" else v)
+        return
     if args.db:
         cfg["MEETING_COPILOT_DB"] = str(args.db)
     if args.port:

@@ -145,6 +145,52 @@ class Config(unittest.TestCase):
         self.assertIn("https://copilot.example.com", s.origins_ok)
         self.assertIn("http://127.0.0.1:4400", s.origins_ok)
 
+    def test_config_file_follows_xdg_config_home(self):
+        os.makedirs(os.path.join(self.t, "meeting-copilot"))
+        with open(os.path.join(self.t, "meeting-copilot", "config"), "w") as f:
+            f.write("MEETING_COPILOT_MODEL=haiku\n")
+        self.assertEqual(copilot.load_config({"XDG_CONFIG_HOME": self.t})["MEETING_COPILOT_MODEL"], "haiku")
+
+    def test_context_file_and_language_reach_both_prompts(self):
+        ctx = os.path.join(self.t, "me.md")
+        with open(ctx, "w", encoding="utf-8") as f:
+            f.write("I am Ana, head of ops. Notes: wiki/ is my personal wiki.\n")
+        old = copilot.S
+        try:
+            copilot.S = copilot.Settings({"MEETING_COPILOT_CONTEXT_FILE": ctx,
+                                          "MEETING_COPILOT_LANGUAGE": "Brazilian Portuguese"})
+            for prompt in (copilot.assist_prompt(), copilot.data_prompt()):
+                self.assertIn("I am Ana, head of ops.", prompt)
+                self.assertIn("Write every item in Brazilian Portuguese", prompt)
+            self.assertTrue(copilot.assist_prompt().startswith(copilot.PROMPT_ASSIST))
+            copilot.S = copilot.Settings({})
+            self.assertEqual(copilot.assist_prompt(), copilot.PROMPT_ASSIST)   # unchanged without settings
+        finally:
+            copilot.S = old
+
+    def test_context_file_missing_or_too_long(self):
+        s = copilot.Settings({"MEETING_COPILOT_CONTEXT_FILE": os.path.join(self.t, "nope.md")})
+        self.assertEqual(s.context, "")
+        self.assertIn("context file", s.notices[0])
+        big = os.path.join(self.t, "big.md")
+        with open(big, "w") as f:
+            f.write("x" * (copilot.CONTEXT_MAX_CHARS + 500))
+        self.assertEqual(len(copilot.Settings({"MEETING_COPILOT_CONTEXT_FILE": big}).context),
+                         copilot.CONTEXT_MAX_CHARS)
+
+    def test_get_prints_a_setting(self):
+        cfg_file = os.path.join(self.t, "config")
+        with open(cfg_file, "w") as f:
+            f.write('MEETING_COPILOT_OPEN_CMD=open -a "Some Browser"\nMEETING_COPILOT_PORT=4555\n'
+                    'MEETING_COPILOT_DATA_DIR=$MC_TEST_BASE/data\n')
+        env = {k: v for k, v in os.environ.items() if not k.startswith("MEETING_COPILOT")}
+        env.update(MEETING_COPILOT_CONFIG=cfg_file, MC_TEST_BASE=self.t)
+        for key, want in (("OPEN_CMD", 'open -a "Some Browser"'), ("PORT", "4555"), ("NOPE", ""),
+                          ("DATA_DIR", self.t + "/data")):                      # $VARS expand
+            p = subprocess.run([PY, os.path.join(ROOT, "lib", "copilot.py"), "--get", key], env=env,
+                               capture_output=True, text=True)
+            self.assertEqual((p.returncode, p.stdout.strip()), (0, want))
+
 # ------------------------------------------------------------------ the real program, as a process
 
 
@@ -297,6 +343,20 @@ class Live(unittest.TestCase):
         self.assertTrue(all("--json-schema" in c["argv"] for c in calls))
         self.assertIn("fact search is off", self.log())
 
+    @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
+    def test_context_file_and_language_go_to_claude(self):
+        ctx = os.path.join(self.t, "me.md")
+        with open(ctx, "w", encoding="utf-8") as f:
+            f.write("The user is Ana; WhatsApp sessions: ana, shop.\n")
+        self.start(MEETING_COPILOT_CONTEXT_FILE=ctx, MEETING_COPILOT_LANGUAGE="Spanish")
+        self.speak()
+        assist = lambda: [c for c in self.claude_calls() if "--json-schema" in c["argv"]]  # noqa: E731
+        self.assertTrue(wait_for(assist), self.log())
+        a = assist()[0]["argv"]
+        prompt = a[a.index("--append-system-prompt") + 1]
+        self.assertIn("WhatsApp sessions: ana, shop.", prompt)
+        self.assertIn("Write every item in Spanish", prompt)
+
     @unittest.skipIf(WIN, "SIGTERM cannot be delivered as a signal on Windows")
     def test_sigterm_saves_session(self):
         self.start(MEETING_COPILOT_CLAUDE=os.path.join(self.t, "no-claude"))
@@ -441,6 +501,40 @@ class Tools(unittest.TestCase):
         self.assertIn("stopped", p.stdout)
         p = subprocess.run(["bash", link, "status"], env=env, capture_output=True, text=True)
         self.assertEqual(p.returncode, 1)
+
+    @unittest.skipIf(WIN, NO_BASH_WHY)
+    def test_launcher_port_from_config_file_and_open_cmd(self):
+        db = os.path.join(self.t, "muesli.db")
+        fake_meeting.prepare(copilot.Path(db))
+        port = free_port()
+        opened = os.path.join(self.t, "opened.txt")
+        opener = os.path.join(self.t, "my-browser")
+        with open(opener, "w") as f:
+            f.write('#!/bin/sh\nprintf "%s|" "$@" > "$OPENED"\n')
+        os.chmod(opener, 0o755)
+        cfg_file = os.path.join(self.t, "config")
+        with open(cfg_file, "w") as f:
+            f.write(f"MEETING_COPILOT_PORT={port}\nMEETING_COPILOT_OPEN_CMD={opener} --new-tab {{url}} --bg\n")
+        launcher = os.path.join(ROOT, "bin", "meeting-copilot")
+        env = dict(self.env)
+        env.pop("MEETING_COPILOT_PORT", None)
+        env.update(MEETING_COPILOT_DB=db, MEETING_COPILOT_CONFIG=cfg_file, OPENED=opened,
+                   MEETING_COPILOT_CLAUDE=os.path.join(self.t, "no-claude"), MEETING_COPILOT_PYTHON=PY)
+        try:
+            p = subprocess.run(["bash", launcher], env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            self.assertIn(f"http://127.0.0.1:{port}", p.stdout)        # the port came from the file
+            with open(opened) as f:
+                self.assertEqual(f.read(), f"--new-tab|http://127.0.0.1:{port}|--bg|")
+            # without {url}, the URL goes at the end (a later line wins)
+            with open(cfg_file, "a") as f:
+                f.write(f"MEETING_COPILOT_OPEN_CMD={opener} -x\n")
+            p = subprocess.run(["bash", launcher], env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            with open(opened) as f:
+                self.assertEqual(f.read(), f"-x|http://127.0.0.1:{port}|")
+        finally:
+            subprocess.run(["bash", launcher, "stop"], env=env, capture_output=True, text=True, timeout=30)
 
 
 if __name__ == "__main__":
