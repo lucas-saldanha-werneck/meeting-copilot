@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meeting Copilot</title>
+<style>
+  :root {
+    --bg: #0f1115; --card: #181b22; --line: #262a33; --txt: #e6e8ec; --dim: #8b909c;
+    --say: #7cc4ff; --ask: #b69cff; --corr: #ffb35c; --data: #6be3a8; --warn: #ff7a7a;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--txt); font: 14px/1.45 -apple-system, system-ui, sans-serif; }
+  header { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; padding: 10px 16px; border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 15px; margin: 0; }
+  .pill { padding: 2px 8px; border-radius: 99px; background: var(--card); color: var(--dim); font-size: 12px; }
+  .live { background: #3a1214; color: #ff9a9a; }
+  #metrics { display: flex; gap: 12px; flex-wrap: wrap; color: var(--dim); font-size: 12px; }
+  #metrics b { color: var(--txt); }
+  main { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; padding: 12px 16px; }
+  section { background: var(--card); border-radius: 10px; padding: 10px 12px; min-width: 0; }
+  section h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; margin: 0 0 8px; }
+  .item { padding: 8px 0; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
+  .item:first-of-type { border-top: 0; }
+  .item small { color: var(--dim); margin-left: 6px; }
+  .new { animation: flash 2.5s ease-out; }
+  @keyframes flash { from { background: #2a3140; } to { background: transparent; } }
+  #say h2 { color: var(--say); } #ask h2 { color: var(--ask); }
+  #corrections h2 { color: var(--corr); } #data h2 { color: var(--data); } #warnings h2 { color: var(--warn); }
+  .quote { color: var(--dim); font-style: italic; }
+  .empty { color: var(--dim); font-size: 12px; }
+  #data .item { white-space: pre-wrap; }
+  details { padding: 0 16px 16px; }
+  summary { cursor: pointer; color: var(--dim); padding-top: 10px; }
+  textarea { width: 100%; background: var(--card); color: var(--txt); border: 1px solid var(--line); border-radius: 8px; padding: 8px; font: inherit; }
+  button { background: #2b3242; color: var(--txt); border: 0; border-radius: 8px; padding: 6px 12px; cursor: pointer; }
+  .goal.ok { color: var(--data); text-decoration: line-through; }
+  #lines { color: var(--dim); font-size: 12px; padding: 0 16px 8px; }
+  .x { float: right; background: none; color: var(--dim); padding: 0 4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Meeting Copilot</h1>
+  <span id="status" class="pill">…</span>
+  <span id="title" class="pill"></span>
+  <div id="metrics"></div>
+</header>
+
+<details id="ctx">
+  <summary>Objective and goals for this meeting</summary>
+  <p><textarea id="goal" rows="2" placeholder="What do you want out of this meeting?"></textarea></p>
+  <p><textarea id="goalsTxt" rows="4" placeholder="One goal per line"></textarea></p>
+  <button id="save">Save</button> <span id="saved" class="empty"></span>
+  <div id="goals"></div>
+</details>
+
+<main>
+  <section id="warnings"><h2>Warnings</h2><div class="list"></div></section>
+  <section id="ask"><h2>Ask this</h2><div class="list"></div></section>
+  <section id="say"><h2>Say this</h2><div class="list"></div></section>
+  <section id="corrections"><h2>Corrections</h2><div class="list"></div></section>
+  <section id="data"><h2>Relevant facts</h2><div class="list"></div></section>
+</main>
+<div id="lines"></div>
+
+<script>
+const seen = new Set();
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const hhmm = ts => new Date(ts * 1000).toTimeString().slice(0, 5);
+
+function list(id, items, render, emptyText = "nothing yet") {
+  const el = document.querySelector(`#${id} .list`);
+  if (!items.length) { el.innerHTML = `<div class="empty">${esc(emptyText)}</div>`; return; }
+  el.innerHTML = items.slice().reverse().map(it => {
+    const key = id + it.ts + (it.text || it.quote || it.markdown || "");
+    const cls = seen.has(key) ? "item" : "item new";
+    seen.add(key);
+    return `<div class="${cls}">${render(it)}</div>`;
+  }).join("");
+}
+
+let editing = false;
+async function refresh() {
+  let e;
+  try { e = await (await fetch("/state")).json(); }
+  catch { document.getElementById("status").textContent = "copilot stopped"; return; }
+  const st = document.getElementById("status");
+  st.textContent = e.status; st.className = "pill" + (e.live ? " live" : "");
+  document.getElementById("title").textContent = e.meeting ? e.meeting.title : "";
+  const m = e.metrics || {};
+  document.getElementById("metrics").innerHTML = m.minutes == null ? "" :
+    `<span><b>${m.minutes}</b> min</span><span>you <b>${m.you_pct}%</b> (5 min: <b>${m.you_pct_5min}%</b>)</span>` +
+    `<span><b>${m.questions}</b> questions</span><span><b>${m.wpm}</b> words/min</span>` +
+    (m.monologue_s >= 30 ? `<span>monologue <b>${m.monologue_s}s</b></span>` : "");
+
+  list("say", e.say, it => `${esc(it.text)}<small>${hhmm(it.ts)}</small>`);
+  list("ask", e.ask, it => `${esc(it.text)}<small>${hhmm(it.ts)}</small>`);
+  list("corrections", e.corrections, it =>
+    `<div class="quote">"${esc(it.quote)}"</div><div>${esc(it.problem)}</div><div>→ ${esc(it.suggestion)}<small>${hhmm(it.ts)}</small></div>`);
+  list("data", e.data, it => `${esc(it.markdown)}<small>${hhmm(it.ts)}</small>`,
+    e.data_enabled ? "nothing yet" : "fact search is off (see README: search folders / MCP)");
+  list("warnings", e.warnings, it =>
+    `<button class="x" title="do not show this kind again" data-kind="${esc(it.kind)}">✕</button>${esc(it.text)}<small>${hhmm(it.ts)}</small>`);
+
+  document.getElementById("goals").innerHTML = (e.goals || []).map(x =>
+    `<div class="goal ${x.covered ? "ok" : ""}">${x.covered ? "✓" : "○"} ${esc(x.text)}</div>`).join("");
+  if (!editing) {
+    document.getElementById("goal").value = e.goal || "";
+    document.getElementById("goalsTxt").value = (e.goals || []).map(x => x.text).join("\n");
+  }
+  document.getElementById("lines").innerHTML = (e.lines || []).slice(-3).map(f =>
+    `<div>${f.who === "You" ? "You" : "Others"}: ${esc(f.text)}</div>`).join("") +
+    (e.errors || []).map(x => `<div style="color:var(--warn)">${esc(x)}</div>`).join("");
+}
+
+const post = (path, body) =>
+  fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+
+document.getElementById("warnings").addEventListener("click", ev => {
+  const b = ev.target.closest("button.x");
+  if (b) post("/mute", { kind: b.dataset.kind });
+});
+for (const id of ["goal", "goalsTxt"]) {
+  document.getElementById(id).addEventListener("focus", () => editing = true);
+}
+document.getElementById("save").onclick = async () => {
+  await post("/context", {
+    goal: document.getElementById("goal").value,
+    goals: document.getElementById("goalsTxt").value.split("\n"),
+  });
+  editing = false;
+  document.getElementById("saved").textContent = "saved";
+  setTimeout(() => document.getElementById("saved").textContent = "", 2000);
+};
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

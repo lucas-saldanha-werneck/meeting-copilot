@@ -1,0 +1,101 @@
+#!/bin/bash
+# meeting-copilot: live meeting copilot that reads the Muesli app's live transcript.
+#   meeting-copilot [--no-open] [--db PATH] [--port N]   start (if needed) and open the page
+#   meeting-copilot stop                                  stop it
+#   meeting-copilot status                                say whether it is running
+#   meeting-copilot log                                   show the end of the log
+set -u
+
+# Resolve the real script location, also when called through a symlink in ~/.local/bin.
+src="${BASH_SOURCE[0]}"
+while [ -L "$src" ]; do
+  dir="$(cd "$(dirname "$src")" && pwd)"
+  src="$(readlink "$src")"
+  case "$src" in /*) ;; *) src="$dir/$src" ;; esac
+done
+ROOT="$(cd "$(dirname "$src")/.." && pwd)"
+APP="$ROOT/lib/copilot.py"
+
+DATA="${MEETING_COPILOT_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/meeting-copilot}"
+PIDFILE="$DATA/meeting-copilot.pid"
+LOG="${MEETING_COPILOT_LOG:-$DATA/meeting-copilot.log}"
+PY="${MEETING_COPILOT_PYTHON:-python3}"
+
+port="${MEETING_COPILOT_PORT:-4390}"
+open_page=1
+args=()
+cmd=start
+while [ $# -gt 0 ]; do
+  case "$1" in
+    stop|status|log|start) cmd="$1" ;;
+    --no-open) open_page=0 ;;
+    --port) port="$2"; args+=("--port" "$2"); shift ;;
+    --db) args+=("--db" "$2"); shift ;;
+    -h|--help) sed -n '2,6p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "meeting-copilot: unknown argument: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+URL="http://127.0.0.1:$port"
+
+running_pid() {
+  [ -f "$PIDFILE" ] || return 1
+  local p
+  p="$(cat "$PIDFILE" 2>/dev/null)"
+  [ -n "$p" ] && kill -0 "$p" 2>/dev/null && echo "$p"
+}
+
+page_up() {
+  if command -v curl >/dev/null 2>&1; then
+    curl -s -o /dev/null --max-time 1 "$URL/state"
+  else
+    "$PY" -c "import urllib.request,sys; urllib.request.urlopen(sys.argv[1], timeout=1)" "$URL/state" 2>/dev/null
+  fi
+}
+
+open_url() {
+  if [ "$(uname -s)" = "Darwin" ] && command -v open >/dev/null 2>&1; then
+    open "$URL" && return 0
+  elif command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$URL" >/dev/null 2>&1 && return 0
+  fi
+  return 1
+}
+
+case "$cmd" in
+  stop)
+    p="$(running_pid)"
+    if [ -n "$p" ]; then
+      kill "$p" && echo "meeting-copilot stopped"
+      for _ in $(seq 1 20); do kill -0 "$p" 2>/dev/null || break; sleep 0.25; done
+      rm -f "$PIDFILE"
+    else
+      echo "meeting-copilot was not running"
+    fi ;;
+  status)
+    p="$(running_pid)"
+    if [ -n "$p" ]; then echo "running (pid $p) on $URL"; else echo "not running"; exit 1; fi ;;
+  log)
+    tail -n 30 "$LOG" 2>/dev/null || echo "no log yet: $LOG" ;;
+  start)
+    mkdir -p "$DATA" && chmod 700 "$DATA"
+    if [ -z "$(running_pid)" ]; then
+      nohup "$PY" -u "$APP" ${args[@]+"${args[@]}"} >> "$LOG" 2>&1 &
+      echo $! > "$PIDFILE"
+      for _ in $(seq 1 40); do
+        [ -n "$(running_pid)" ] || break
+        page_up && break
+        sleep 0.25
+      done
+    fi
+    if [ -z "$(running_pid)" ]; then
+      rm -f "$PIDFILE"
+      echo "meeting-copilot did not start. Last log lines:" >&2
+      tail -n 5 "$LOG" >&2
+      exit 1
+    fi
+    echo "meeting-copilot on $URL - start a meeting in Muesli"
+    if [ "$open_page" = 1 ]; then
+      open_url || echo "open $URL in your browser"
+    fi ;;
+esac

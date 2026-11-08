@@ -1,0 +1,447 @@
+#!/usr/bin/env python3
+"""meeting-copilot tests. Run: python3 tests/test_copilot.py -v
+
+Everything runs in temporary folders with a fake HOME: a fake Muesli database built here with an
+invented meeting, and a fake `claude` first on PATH (tests/fake_claude.py). No real Muesli, no AI.
+"""
+import hashlib
+import json
+import os
+import signal
+import socket
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+import urllib.error
+import urllib.request
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "lib"))
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+import copilot  # noqa: E402
+import fake_meeting  # noqa: E402
+
+PY = sys.executable
+WIN = sys.platform == "win32"
+NO_FAKE_CLAUDE_WHY = ("the fake `claude` is a shell script on PATH; Windows cannot run it as a command, "
+                      "and the tool itself is macOS-only")
+NO_BASH_WHY = "launcher and install.sh process handling are POSIX-only (the tool targets macOS)"
+
+
+def free_port() -> int:
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    p = s.getsockname()[1]
+    s.close()
+    return p
+
+
+def sha(path) -> str:
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+def wait_for(fn, timeout=20.0, step=0.2):
+    end = time.time() + timeout
+    last = None
+    while time.time() < end:
+        last = fn()
+        if last:
+            return last
+        time.sleep(step)
+    return last
+
+# ------------------------------------------------------------------ pure logic
+
+
+def line(i, who, start, end, text):
+    return {"id": i, "who": who, "start": start, "end": end, "text": text}
+
+
+class Logic(unittest.TestCase):
+    def test_metrics_and_monologue(self):
+        lines = [line(1, "Others", 0, 10, "hi"), line(2, "You", 10, 60, "a b c d e?"),
+                 line(3, "You", 60, 120, "f g h")]
+        m = copilot.compute_metrics(lines)
+        self.assertEqual(m["minutes"], 2.0)
+        self.assertEqual(m["monologue_s"], 110)
+        self.assertEqual(m["questions"], 1)
+        self.assertEqual(m["you_pct"], round(100 * 110 / 120))
+
+    def test_warnings_order_mute_and_repeat(self):
+        m = {"minutes": 5, "you_pct_5min": 80, "monologue_s": 100, "wpm": 200, "questions": 0}
+        self.assertEqual(copilot.check_warnings(m, set(), set())["kind"], "monologue")
+        # a muted rule must not hide the lower-priority ones
+        self.assertEqual(copilot.check_warnings(m, set(), {"monologue"})["kind"], "talks_too_much")
+        self.assertEqual(copilot.check_warnings(m, {"talks_too_much"}, {"monologue"})["kind"], "few_questions")
+        self.assertIsNone(copilot.check_warnings(m, set(), {"monologue", "talks_too_much", "few_questions", "fast"}))
+        self.assertIsNone(copilot.check_warnings({}, set(), set()))
+
+    def test_transcript_before_and_new(self):
+        lines = [line(1, "Others", 0, 5, "old"), line(2, "You", 6, 9, "new one")]
+        t = copilot.transcript(lines, 1)
+        self.assertIn("## BEFORE (context)\n[00:00] Others: old", t)
+        self.assertIn("## NEW\n[00:06] You: new one", t)
+        self.assertIn("(nothing new)", copilot.transcript(lines, 2))
+        far = [line(1, "Others", 0, 5, "too old"), line(2, "You", 400, 405, "recent")]
+        self.assertNotIn("too old", copilot.transcript(far, 0))
+
+    def test_fresh_drops_repeats(self):
+        shown = [{"text": "Ask who owns the budget."}]
+        out = copilot.fresh(["Ask who owns the budget!", "Confirm the date.", "confirm the date",
+                             "Third", "Fourth"], shown)
+        self.assertEqual(out, ["Confirm the date.", "Third"])
+
+    def test_empty_reply(self):
+        for t in ("EMPTY", "  **EMPTY**", "empty.", ""):
+            self.assertTrue(copilot.is_empty(t))
+        self.assertFalse(copilot.is_empty("The price is 10."))
+
+
+class Config(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.t = os.path.realpath(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_file_then_env_wins(self):
+        notes = os.path.join(self.t, "notes")
+        os.makedirs(notes)
+        cfg_file = os.path.join(self.t, "config")
+        with open(cfg_file, "w") as f:
+            f.write(f'# comment\nMEETING_COPILOT_PORT=5000\nMEETING_COPILOT_SEARCH_DIRS="{notes}"\n'
+                    "MEETING_COPILOT_MODEL=haiku\n")
+        cfg = copilot.load_config({"MEETING_COPILOT_CONFIG": cfg_file, "MEETING_COPILOT_MODEL": "opus",
+                                   "OTHER": "x"})
+        s = copilot.Settings(cfg)
+        self.assertEqual(s.port, 5000)
+        self.assertEqual(s.model, "opus")
+        self.assertEqual(s.search_dirs, [copilot.Path(notes).resolve()])
+        self.assertTrue(s.data_enabled)
+        self.assertNotIn("OTHER", cfg)
+
+    def test_optional_sources_missing_or_incomplete(self):
+        mcp = os.path.join(self.t, "mcp.json")
+        with open(mcp, "w") as f:
+            json.dump({"mcpServers": {}}, f)
+        s = copilot.Settings({"MEETING_COPILOT_SEARCH_DIRS": os.path.join(self.t, "nope"),
+                              "MEETING_COPILOT_MCP_CONFIG": mcp,
+                              "MEETING_COPILOT_CLAUDE": os.path.join(self.t, "no-claude")})
+        self.assertFalse(s.data_enabled)          # no allowlist -> MCP stays off
+        self.assertIsNone(s.claude)
+        self.assertEqual(len(s.notices), 2)
+        s2 = copilot.Settings({"MEETING_COPILOT_MCP_CONFIG": mcp, "MEETING_COPILOT_MCP_TOOLS": "mcp__x__read"})
+        self.assertTrue(s2.data_enabled)
+        self.assertEqual(s2.mcp_tools, ["mcp__x__read"])
+
+    def test_extra_hosts(self):
+        s = copilot.Settings({"MEETING_COPILOT_PORT": "4400", "MEETING_COPILOT_EXTRA_HOSTS": "copilot.example.com"})
+        self.assertIn("copilot.example.com", s.hosts_ok)
+        self.assertIn("https://copilot.example.com", s.origins_ok)
+        self.assertIn("http://127.0.0.1:4400", s.origins_ok)
+
+# ------------------------------------------------------------------ the real program, as a process
+
+
+class Live(unittest.TestCase):
+    """Starts lib/copilot.py against a fake Muesli database."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        t = self.t = os.path.realpath(self.tmp.name)
+        self.home = os.path.join(t, "home")
+        os.makedirs(self.home)
+        self.db = os.path.join(t, "muesli.db")
+        self.sessions = os.path.join(t, "sessions")
+        self.claude_log = os.path.join(t, "claude.jsonl")
+        self.port = free_port()
+        self.fakebin = os.path.join(t, "fakebin")
+        os.makedirs(self.fakebin)
+        with open(os.path.join(self.fakebin, "claude"), "w") as f:
+            f.write(f'#!/bin/sh\nexec "{PY}" "{ROOT}/tests/fake_claude.py" "$@"\n')
+        os.chmod(os.path.join(self.fakebin, "claude"), 0o755)
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith(("MEETING_COPILOT", "CLAUDE"))}
+        self.env.update(HOME=self.home, USERPROFILE=self.home, XDG_DATA_HOME=os.path.join(t, "data"),
+                        PATH=self.fakebin + os.pathsep + self.env.get("PATH", ""),
+                        FAKE_CLAUDE_LOG=self.claude_log,
+                        MEETING_COPILOT_CONFIG=os.path.join(t, "no-config"),
+                        MEETING_COPILOT_DB=self.db, MEETING_COPILOT_PORT=str(self.port),
+                        MEETING_COPILOT_SESSIONS_DIR=self.sessions,
+                        MEETING_COPILOT_POLL_S="0.2", MEETING_COPILOT_ASSIST_S="0.5",
+                        MEETING_COPILOT_DATA_S="0.5", PYTHONIOENCODING="utf-8")
+        self.proc = None
+        self.out = os.path.join(t, "copilot.log")
+        fake_meeting.prepare(copilot.Path(self.db))
+
+    def tearDown(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.kill()
+            self.proc.wait()
+        for _ in range(50):
+            try:
+                self.tmp.cleanup()
+                return
+            except OSError:
+                time.sleep(0.2)
+
+    def start(self, **extra):
+        self.env.update(extra)
+        self.logf = open(self.out, "w")
+        self.addCleanup(self.logf.close)
+        self.proc = subprocess.Popen([PY, "-u", os.path.join(ROOT, "lib", "copilot.py")], env=self.env,
+                                     stdout=self.logf, stderr=subprocess.STDOUT)
+        self.assertTrue(wait_for(lambda: self._try_state(), 15), self.log())
+
+    def log(self):
+        with open(self.out, encoding="utf-8", errors="replace") as f:
+            return f.read()
+
+    def _try_state(self):
+        try:
+            return self.state()
+        except (urllib.error.URLError, ConnectionError, OSError):
+            return None
+
+    def request(self, path, data=None, headers=None):
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, headers=headers or {})
+        try:
+            with urllib.request.urlopen(req, timeout=3) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+
+    def state(self):
+        code, body = self.request("/state")
+        return json.loads(body) if code == 200 else None
+
+    def post(self, path, body, origin=None):
+        h = {"Content-Type": "application/json"}
+        h["Origin"] = origin or f"http://127.0.0.1:{self.port}"
+        return self.request(path, json.dumps(body).encode(), h)[0]
+
+    def claude_calls(self):
+        if not os.path.exists(self.claude_log):
+            return []
+        with open(self.claude_log, encoding="utf-8") as f:
+            return [json.loads(x) for x in f if x.strip()]
+
+    def speak(self):
+        fake_meeting.speak(copilot.Path(self.db), 0)
+
+    # -------------------------------------------------------------- with the fake claude
+
+    @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
+    def test_suggestions_corrections_goals_and_facts(self):
+        notes, wiki = os.path.join(self.t, "notes"), os.path.join(self.t, "wiki")
+        os.makedirs(notes)
+        os.makedirs(wiki)
+        with open(os.path.join(notes, "contracts.md"), "w") as f:
+            f.write("Cleaning contract ends 2027-03-31.\n")
+        mcp = os.path.join(self.t, "mcp.json")
+        with open(mcp, "w") as f:
+            json.dump({"mcpServers": {"chat": {"command": "true"}}}, f)
+        self.start(MEETING_COPILOT_SEARCH_DIRS=notes + os.pathsep + wiki,
+                   MEETING_COPILOT_MCP_CONFIG=mcp, MEETING_COPILOT_MCP_TOOLS="mcp__chat__history")
+        self.assertEqual(self.post("/context", {"goal": "Keep the price flat", "goals": ["Price", "End date", ""]}), 200)
+        self.speak()
+        st = wait_for(lambda: (lambda s: s if s and s["say"] and s["data"] and s["corrections"] else None)(self.state()))
+        self.assertTrue(st, self.log())
+        self.assertTrue(st["live"])
+        self.assertEqual(st["meeting"]["title"], fake_meeting.TITLE)
+        self.assertIn("fifteen percent", st["say"][0]["text"])
+        self.assertEqual(st["ask"][0]["text"][:3], "Who")
+        self.assertEqual(st["corrections"][0]["quote"], "someone will sort it out")
+        self.assertIn("2027-03-31", st["data"][0]["markdown"])
+        self.assertEqual([g["covered"] for g in st["goals"]], [True, False])  # kept across meeting start
+        self.assertEqual(st["metrics"]["questions"], 0)
+
+        calls = self.claude_calls()
+        assist = [c for c in calls if "--json-schema" in c["argv"]]
+        data = [c for c in calls if "--json-schema" not in c["argv"]]
+        self.assertTrue(assist and data)
+        a = assist[0]["argv"]
+        self.assertEqual(a[a.index("--tools") + 1], "")                 # suggestions: no tools at all
+        self.assertIn("--strict-mcp-config", a)
+        self.assertNotIn("--mcp-config", a)
+        self.assertIn("## NEW", assist[0]["stdin"])
+        self.assertIn("Keep the price flat", assist[0]["stdin"])
+        d = data[0]["argv"]
+        self.assertEqual(d[d.index("--tools") + 1], "Read,Grep,Glob")
+        self.assertEqual(d[d.index("--allowedTools") + 1], "Read,Grep,Glob,mcp__chat__history")
+        self.assertEqual(d[d.index("--mcp-config") + 1], os.path.realpath(mcp))
+        self.assertEqual(d[d.index("--add-dir") + 1], os.path.realpath(wiki))
+        self.assertEqual(os.path.realpath(data[0]["cwd"]), os.path.realpath(notes))
+        self.assertIn(notes, d[d.index("--append-system-prompt") + 1])
+        # nothing repeats when the same answers come back
+        time.sleep(2)
+        st2 = self.state()
+        self.assertEqual(len(st2["say"]), 1)
+        self.assertEqual(len(st2["data"]), 1)
+
+    @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
+    def test_without_search_or_mcp_only_suggestions(self):
+        self.start()
+        self.speak()
+        self.assertTrue(wait_for(lambda: (self.state() or {}).get("say")), self.log())
+        time.sleep(2)
+        st = self.state()
+        self.assertFalse(st["data_enabled"])
+        self.assertEqual(st["data"], [])
+        calls = self.claude_calls()
+        self.assertTrue(calls)
+        self.assertTrue(all("--json-schema" in c["argv"] for c in calls))
+        self.assertIn("fact search is off", self.log())
+
+    @unittest.skipIf(WIN, "SIGTERM cannot be delivered as a signal on Windows")
+    def test_sigterm_saves_session(self):
+        self.start(MEETING_COPILOT_CLAUDE=os.path.join(self.t, "no-claude"))
+        self.speak()
+        self.assertTrue(wait_for(lambda: (self.state() or {}).get("lines")))
+        self.proc.send_signal(signal.SIGTERM)
+        self.assertEqual(self.proc.wait(10), 0, self.log())
+        files = os.listdir(self.sessions)
+        self.assertEqual(len(files), 1)
+
+    # -------------------------------------------------------------- no claude at all (all systems)
+
+    def test_without_claude_metrics_warnings_and_readonly_db(self):
+        self.start(MEETING_COPILOT_CLAUDE=os.path.join(self.t, "no-claude"))
+        self.speak()
+        before = sha(self.db)
+        st = wait_for(lambda: (lambda s: s if s and s["warnings"] and s["metrics"].get("minutes") == 2.2 else None)(self.state()))
+        self.assertTrue(st, self.log())
+        self.assertEqual(st["warnings"][0]["kind"], "talks_too_much")
+        self.assertEqual(st["metrics"]["you_pct_5min"], 71)
+        self.assertEqual(len(st["lines"]), 8)  # the page gets the last 8 lines
+        self.assertTrue(any("claude command not found" in e for e in st["errors"]))
+        self.assertEqual(st["say"], [])
+        self.assertEqual(self.claude_calls(), [])
+        time.sleep(1)
+        self.assertEqual(sha(self.db), before)  # read-only: the database never changes
+        self.assertIsNone(self.proc.poll())
+
+    def test_http_guards_context_and_mute(self):
+        self.start(MEETING_COPILOT_CLAUDE=os.path.join(self.t, "no-claude"))
+        code, body = self.request("/")
+        self.assertEqual(code, 200)
+        self.assertIn(b"Meeting Copilot", body)
+        self.assertEqual(self.request("/state", headers={"Host": "evil.example:80"})[0], 403)
+        self.assertEqual(self.post("/context", {"goal": "x"}, origin="https://evil.example"), 403)
+        self.assertEqual(self.request("/context", b'{"goal":"x"}', {"Content-Type": "text/plain",
+                         "Origin": f"http://127.0.0.1:{self.port}"})[0], 403)
+        self.assertEqual(self.request("/context", b"not json", {"Content-Type": "application/json",
+                         "Origin": f"http://127.0.0.1:{self.port}"})[0], 400)
+        self.assertEqual(self.post("/context", {"goal": "Agree on the date", "goals": ["a", " ", "b"]}), 200)
+        self.assertEqual(self.post("/mute", {"kind": "fast"}), 200)
+        self.assertEqual(self.post("/nope", {}), 404)
+        st = self.state()
+        self.assertEqual(st["goal"], "Agree on the date")
+        self.assertEqual([g["text"] for g in st["goals"]], ["a", "b"])
+        self.assertEqual(st["status"], "live")  # setUp started a recording meeting
+
+    def test_meeting_end_saves_session(self):
+        self.start(MEETING_COPILOT_CLAUDE=os.path.join(self.t, "no-claude"))
+        self.speak()
+        self.assertTrue(wait_for(lambda: len((self.state() or {}).get("lines", [])) == 8))
+        fake_meeting.end(copilot.Path(self.db))
+        st = wait_for(lambda: (lambda s: s if s and not s["live"] else None)(self.state()))
+        self.assertTrue(st, self.log())
+        self.assertIn("ended", st["status"])
+        files = wait_for(lambda: os.listdir(self.sessions) if os.path.isdir(self.sessions) else None)
+        self.assertEqual(len(files), 1, self.log())
+        with open(os.path.join(self.sessions, files[0]), encoding="utf-8") as f:
+            saved = json.load(f)
+        self.assertEqual(len(saved["lines"]), len(fake_meeting.SCRIPT))
+
+    def test_missing_db_exits_with_message(self):
+        env = dict(self.env, MEETING_COPILOT_DB=os.path.join(self.t, "missing.db"))
+        p = subprocess.run([PY, os.path.join(ROOT, "lib", "copilot.py")], env=env, capture_output=True,
+                           text=True, timeout=20)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("Muesli database not found", p.stderr)
+
+# ------------------------------------------------------------------ helper script, launcher, installer
+
+
+class Tools(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.t = os.path.realpath(self.tmp.name)
+        self.home = os.path.join(self.t, "home")
+        os.makedirs(self.home)
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith(("MEETING_COPILOT", "CLAUDE"))}
+        self.env.update(HOME=self.home, USERPROFILE=self.home, XDG_DATA_HOME=os.path.join(self.t, "data"))
+
+    def tearDown(self):
+        for _ in range(50):
+            try:
+                self.tmp.cleanup()
+                return
+            except OSError:
+                time.sleep(0.2)
+
+    def test_fake_meeting_refuses_real_db_and_runs(self):
+        real = os.path.join(self.home, "Library", "Application Support", "Muesli", "muesli.db")
+        os.makedirs(os.path.dirname(real))
+        sqlite3.connect(real).close()
+        script = os.path.join(ROOT, "tools", "fake_meeting.py")
+        p = subprocess.run([PY, script, "prepare", real], env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("refused", p.stderr)
+        db = os.path.join(self.t, "test.db")
+        for args in (["prepare", db], ["speak", db, "0"], ["end", db]):
+            p = subprocess.run([PY, script, *args], env=self.env, capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stderr)
+        con = sqlite3.connect(db)
+        self.assertEqual(con.execute("SELECT meeting_status FROM meetings").fetchone()[0], "completed")
+        self.assertEqual(con.execute("SELECT count(*) FROM meeting_transcript_checkpoints").fetchone()[0],
+                         len(fake_meeting.SCRIPT))
+        con.close()
+
+    @unittest.skipIf(WIN, NO_BASH_WHY)
+    def test_install_dry_run_install_uninstall(self):
+        inst = os.path.join(ROOT, "install.sh")
+        dest = os.path.join(self.home, ".local", "bin", "meeting-copilot")
+        p = subprocess.run(["bash", inst, "--dry-run"], env=self.env, capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("would run: ln -sfn", p.stdout)
+        self.assertFalse(os.path.lexists(dest))
+        p = subprocess.run(["bash", inst], env=self.env, capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(os.readlink(dest), os.path.join(ROOT, "bin", "meeting-copilot"))
+        p = subprocess.run(["bash", inst, "--uninstall"], env=self.env, capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertFalse(os.path.lexists(dest))
+
+    @unittest.skipIf(WIN, NO_BASH_WHY)
+    def test_launcher_start_status_stop_through_symlink(self):
+        db = os.path.join(self.t, "muesli.db")
+        fake_meeting.prepare(copilot.Path(db))
+        port = free_port()
+        link = os.path.join(self.t, "meeting-copilot")
+        os.symlink(os.path.join(ROOT, "bin", "meeting-copilot"), link)
+        env = dict(self.env, MEETING_COPILOT_DB=db, MEETING_COPILOT_PORT=str(port),
+                   MEETING_COPILOT_CONFIG=os.path.join(self.t, "no-config"),
+                   MEETING_COPILOT_CLAUDE=os.path.join(self.t, "no-claude"), MEETING_COPILOT_PYTHON=PY)
+        try:
+            p = subprocess.run(["bash", link, "--no-open"], env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            self.assertIn(f"http://127.0.0.1:{port}", p.stdout)
+            p = subprocess.run(["bash", link, "status"], env=env, capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stdout)
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/state", timeout=3) as r:
+                self.assertTrue(json.loads(r.read())["live"])
+        finally:
+            p = subprocess.run(["bash", link, "stop"], env=env, capture_output=True, text=True, timeout=30)
+        self.assertIn("stopped", p.stdout)
+        p = subprocess.run(["bash", link, "status"], env=env, capture_output=True, text=True)
+        self.assertEqual(p.returncode, 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
