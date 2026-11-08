@@ -16,9 +16,10 @@
 # Path to the Claude Code CLI. Default: `claude` on your PATH.
 #MEETING_COPILOT_CLAUDE=claude
 
-# Model for suggestions, and for the fact search (default: the same as MODEL).
+# Model for suggestions, and for the fact search. DATA_MODEL left commented out
+# follows MODEL; do not set it to an empty value.
 #MEETING_COPILOT_MODEL=sonnet
-#MEETING_COPILOT_DATA_MODEL=
+#MEETING_COPILOT_DATA_MODEL=sonnet
 
 # Folders the AI may search for facts, separated by : (; on Windows). Empty: none.
 #MEETING_COPILOT_SEARCH_DIRS=
