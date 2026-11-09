@@ -119,6 +119,77 @@ def load_config(environ=None) -> dict:
     return cfg
 
 
+# Placeholders a prompt file may use. The built-in prompts have none for language and context in their
+# text: the language line and the context block are added at their end. A prompt file may place them
+# instead: {language} becomes the language name (or "the language the meeting is using" when
+# MEETING_COPILOT_LANGUAGE is empty), {context} the context block (or nothing). The fact-search prompt also
+# has {sources}: the list of folders and tools it may search. A part the file does not place is added at
+# the end, as for the built-in.
+PROMPT_PLACEHOLDERS = ("{language}", "{context}")
+DATA_PROMPT_PLACEHOLDERS = ("{language}", "{context}", "{sources}")
+PLACEHOLDER_RE = re.compile("|".join(sorted(map(re.escape, set(PROMPT_PLACEHOLDERS + DATA_PROMPT_PLACEHOLDERS)))))
+
+
+# What each call's reply must keep so its parser works, per prompt kind:
+#  assist: JSON in a fixed shape (--json-schema, SCHEMA_ASSIST), so a prompt file can't break the parser. It
+#          can leave the lists empty if it never asks for them: say and ask must stay in it.
+#  data:   free text. A reply that starts with EMPTY means "nothing found" (is_empty); a prompt that never
+#          names that word makes the AI write "nothing found" in prose, and that prose shows as a fact.
+PROMPT_KINDS = {
+    "assist": {"name": "prompt file", "placeholders": PROMPT_PLACEHOLDERS, "words": ("say", "ask"), "case": re.I,
+               "missing": ("never names the output field(s) {missing}: the suggestions come back in the fields "
+                           "say, ask, corrections, goals_covered; without asking for {missing_and} that list "
+                           "may stay empty")},
+    "data": {"name": "data prompt file", "placeholders": DATA_PROMPT_PLACEHOLDERS, "words": ("EMPTY",), "case": 0,
+             "missing": ("never names the word EMPTY: a reply that starts with EMPTY is how the fact search "
+                         "says \"nothing found\"; without it, a no-result answer shows up as a fact")},
+}
+
+
+def load_prompt_file(value: str, kind: str, notices: list[str]) -> str:
+    """Text of a prompt file setting, or "" (= the built-in prompt) with one note when it can't be used."""
+    if not value:
+        return ""
+    name, holders = PROMPT_KINDS[kind]["name"], PROMPT_KINDS[kind]["placeholders"]
+    p = Path(_expand(value))
+    try:
+        text = p.read_text(encoding="utf-8-sig").strip()
+    except OSError as e:
+        notices.append(f"{name} not found or unreadable, using the built-in prompt: {p} ({e.__class__.__name__})")
+        return ""
+    except UnicodeDecodeError:
+        notices.append(f"{name} is not UTF-8 text, using the built-in prompt: {p} (save it as UTF-8)")
+        return ""
+    if not text:
+        notices.append(f"{name} is empty, using the built-in prompt: {p}")
+        return ""
+    if len(text) > PROMPT_MAX_CHARS:
+        notices.append(f"{name} has {len(text)} characters; only the first {PROMPT_MAX_CHARS} are used: {p}")
+        cut = PROMPT_MAX_CHARS
+        brace = text.rfind("{", 0, cut)  # never cut a {placeholder} in half
+        if brace != -1 and "}" not in text[brace:cut] and cut - brace <= max(map(len, holders)):
+            cut = brace
+        text = text[:cut]
+    notices.extend(check_prompt(text, p, kind))
+    return text
+
+
+def check_prompt(text: str, path, kind: str = "assist") -> list[str]:
+    """Startup notes about a prompt file: words its reply's parser needs that it never names, and {words}
+    that are no placeholder."""
+    k = PROMPT_KINDS[kind]
+    notes = []
+    missing = [w for w in k["words"] if not re.search(r"\b" + w + r"\b", text, k["case"])]
+    if missing:
+        notes.append(f"{k['name']} {path} " + k["missing"].format(missing=", ".join(missing),
+                                                                     missing_and=" and ".join(missing)))
+    unknown = sorted(set(re.findall(r"\{[A-Za-z_]+\}", text)) - set(k["placeholders"]))
+    if unknown:
+        notes.append(f"{k['name']} {path}: {', '.join(unknown)} is not a placeholder and stays as written "
+                     f"(placeholders: {', '.join(k['placeholders'])})")
+    return notes
+
+
 class Settings:
     def __init__(self, cfg: dict) -> None:
         g = lambda k, d="": cfg.get("MEETING_COPILOT_" + k) or d  # noqa: E731  (KEY= with no value: the default)
@@ -189,6 +260,9 @@ class Settings:
     @property
     def data_enabled(self) -> bool:
         return bool(self.search_dirs or self.mcp_config)
+
+
+S: Settings = Settings({})
 
 
 
@@ -266,17 +340,6 @@ def context_text() -> str:
     return "## About the user (from their context file)\n" + S.context if S.context else ""
 
 
-# Placeholders a prompt file may use. The built-in prompts have none for language and context in their
-# text: the language line and the context block are added at their end. A prompt file may place them
-# instead: {language} becomes the language name (or "the language the meeting is using" when
-# MEETING_COPILOT_LANGUAGE is empty), {context} the context block (or nothing). The fact-search prompt also
-# has {sources}: the list of folders and tools it may search. A part the file does not place is added at
-# the end, as for the built-in.
-PROMPT_PLACEHOLDERS = ("{language}", "{context}")
-DATA_PROMPT_PLACEHOLDERS = ("{language}", "{context}", "{sources}")
-PLACEHOLDER_RE = re.compile(r"\{(language|context|sources)\}")
-
-
 def personalize(prompt: str, sources: str | None = None) -> str:
     """Add your language and context file (MEETING_COPILOT_LANGUAGE, MEETING_COPILOT_CONTEXT_FILE), and for
     the fact search the sources: in place of {language} / {context} / {sources} when the prompt has them,
@@ -291,68 +354,11 @@ def personalize(prompt: str, sources: str | None = None) -> str:
         tail.append(language_text())
     if S.context and "{context}" not in prompt:
         tail.append(context_text())
-    prompt = PLACEHOLDER_RE.sub(lambda m: values.get(m.group(1), m.group(0)), prompt)
+    if sources is not None and S.language and "{language}" in prompt:
+        # the fact search's "nothing found" word must not be translated (is_empty reads it)
+        tail.append("Keep the word EMPTY in English, as is.")
+    prompt = PLACEHOLDER_RE.sub(lambda m: values.get(m.group(0)[1:-1], m.group(0)), prompt)
     return prompt + "".join(f"\n{t}\n" for t in tail)
-
-
-# What each call's reply must keep so its parser works, per prompt kind:
-#  assist: JSON in a fixed shape (--json-schema, SCHEMA_ASSIST), so a prompt file can't break the parser. It
-#          can leave the lists empty if it never asks for them: say and ask must stay in it.
-#  data:   free text. A reply that starts with EMPTY means "nothing found" (is_empty); a prompt that never
-#          names that word makes the AI write "nothing found" in prose, and that prose shows as a fact.
-PROMPT_KINDS = {
-    "assist": {"name": "prompt file", "placeholders": PROMPT_PLACEHOLDERS, "words": ("say", "ask"), "case": re.I},
-    "data": {"name": "data prompt file", "placeholders": DATA_PROMPT_PLACEHOLDERS, "words": ("EMPTY",), "case": 0},
-}
-PROMPT_REQUIRED_WORDS = PROMPT_KINDS["assist"]["words"]
-
-
-def load_prompt_file(value: str, kind: str, notices: list[str]) -> str:
-    """Text of a prompt file setting, or "" (= the built-in prompt) with one note when it can't be used."""
-    if not value:
-        return ""
-    name, holders = PROMPT_KINDS[kind]["name"], PROMPT_KINDS[kind]["placeholders"]
-    p = Path(_expand(value))
-    try:
-        text = p.read_text(encoding="utf-8-sig").strip()
-    except OSError as e:
-        notices.append(f"{name} not found or unreadable, using the built-in prompt: {p} ({e.__class__.__name__})")
-        return ""
-    except UnicodeDecodeError:
-        notices.append(f"{name} is not UTF-8 text, using the built-in prompt: {p} (save it as UTF-8)")
-        return ""
-    if not text:
-        notices.append(f"{name} is empty, using the built-in prompt: {p}")
-        return ""
-    if len(text) > PROMPT_MAX_CHARS:
-        notices.append(f"{name} has {len(text)} characters; only the first {PROMPT_MAX_CHARS} are used: {p}")
-        cut = PROMPT_MAX_CHARS
-        brace = text.rfind("{", 0, cut)  # never cut a {placeholder} in half
-        if brace != -1 and "}" not in text[brace:cut] and cut - brace <= max(map(len, holders)):
-            cut = brace
-        text = text[:cut]
-    notices.extend(check_prompt(text, p, kind))
-    return text
-
-
-def check_prompt(text: str, path, kind: str = "assist") -> list[str]:
-    """Startup notes about a prompt file: words its reply's parser needs that it never names, and {words}
-    that are no placeholder."""
-    k = PROMPT_KINDS[kind]
-    notes = []
-    missing = [w for w in k["words"] if not re.search(r"\b" + w + r"\b", text, k["case"])]
-    if missing and kind == "assist":
-        notes.append(f"prompt file {path} never names the output field(s) {', '.join(missing)}: the suggestions "
-                     "come back in the fields say, ask, corrections, goals_covered; without asking for "
-                     f"{' and '.join(missing)} that list may stay empty")
-    elif missing:
-        notes.append(f"data prompt file {path} never names the word EMPTY: a reply that starts with EMPTY is how "
-                     "the fact search says \"nothing found\"; without it, a no-result answer shows up as a fact")
-    unknown = sorted(set(re.findall(r"\{[A-Za-z_]+\}", text)) - set(k["placeholders"]))
-    if unknown:
-        notes.append(f"{k['name']} {path}: {', '.join(unknown)} is not a placeholder and stays as written "
-                     f"(placeholders: {', '.join(k['placeholders'])})")
-    return notes
 
 
 def assist_prompt() -> str:
@@ -360,9 +366,7 @@ def assist_prompt() -> str:
 
 
 def data_prompt() -> str:
-    if S.data_prompt:
-        return personalize(S.data_prompt, sources=data_sources_text())
-    return personalize(PROMPT_DATA.format(sources=data_sources_text()))
+    return personalize(S.data_prompt or PROMPT_DATA, sources=data_sources_text())
 
 
 def data_sources_text() -> str:
@@ -373,8 +377,6 @@ def data_sources_text() -> str:
     if S.mcp_tools:
         lines.append("- use these read-only tools: " + ", ".join(S.mcp_tools) + ".")
     return "\n".join(lines)
-
-S: Settings = Settings({})
 
 # ---------------------------------------------------------------- state
 

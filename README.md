@@ -155,15 +155,16 @@ What must stay:
   never asks for `say` and `ask`, those lists may stay empty.
 - Fact search: the reply is free text. A reply that starts with `EMPTY` means "nothing found" and
   shows nothing; anything else shows as a fact. Keep telling the AI to answer exactly `EMPTY` when
-  it has nothing, or every "I found nothing" shows up on the page.
+  it has nothing, or every "I found nothing" shows up on the page. When your fact-search file places
+  `{language}` and a language is set, a line asking to keep `EMPTY` in English is added at the end.
 
 At startup the log shows a `note:` line when a suggestions file never mentions `say` or `ask`, when
 a fact-search file never contains the word `EMPTY` (in capitals), or when a file uses a `{word}` that
 is not one of its placeholders.
 
 If a file is missing, unreadable, not UTF-8 or empty, the log shows one `note:` line (a separate
-one for a file that is not UTF-8) and that call uses its built-in prompt. Only the first 20000 characters are used (the prompt goes on the `claude`
-command line).
+one for a file that is not UTF-8) and that call uses its built-in prompt. Only the first 20000
+characters of a file are used (the prompt goes on the `claude` command line).
 
 ## Optional requirements
 

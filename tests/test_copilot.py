@@ -309,7 +309,8 @@ class Config(unittest.TestCase):
         self.assertEqual(s.notices, [])
         self.assertEqual(copilot.data_prompt(),
                          "Find facts in Spanish.\nSources:\n" + copilot.data_sources_text()
-                         + "\n## About the user (from their context file)\nI am Ana.\nNothing: EMPTY.")
+                         + "\n## About the user (from their context file)\nI am Ana.\nNothing: EMPTY."
+                         + "\nKeep the word EMPTY in English, as is.\n")
         self.assertEqual(copilot.assist_prompt(), copilot.PROMPT_ASSIST + "\n" + copilot.language_text() + "\n"
                          + "\n" + copilot.context_text() + "\n", "the suggestions prompt is untouched")
         # nothing placed: sources, language and context go to the end, in that order
@@ -320,6 +321,27 @@ class Config(unittest.TestCase):
         self.assertTrue(out.startswith("Look things up. Answer EMPTY when there is nothing.\nYou can:\n- search"))
         self.assertLess(out.index("You can:"), out.index("Write every item in Spanish"))
         self.assertLess(out.index("Write every item in Spanish"), out.index("I am Ana."))
+
+    def test_placed_language_still_keeps_empty_untranslated(self):
+        p = self.write("data.md", "Answer in {language}. If nothing, EMPTY.")
+        self.with_settings({"MEETING_COPILOT_DATA_PROMPT_FILE": p, "MEETING_COPILOT_LANGUAGE": "Spanish"})
+        self.assertEqual(copilot.data_prompt(), "Answer in Spanish. If nothing, EMPTY.\n"
+                                                "Keep the word EMPTY in English, as is.\n")
+        self.with_settings({"MEETING_COPILOT_DATA_PROMPT_FILE": p})  # no language set: nothing to keep
+        self.assertEqual(copilot.data_prompt(), "Answer in the language the meeting is using. If nothing, EMPTY.")
+        a = self.write("assist.md", "say and ask in {language}.")
+        self.with_settings({"MEETING_COPILOT_PROMPT_FILE": a, "MEETING_COPILOT_LANGUAGE": "Spanish"})
+        self.assertEqual(copilot.assist_prompt(), "say and ask in Spanish.", "only the fact search uses EMPTY")
+
+    def test_built_in_data_prompt_keeps_a_folder_named_like_a_placeholder(self):
+        odd = os.path.join(self.t, "{context}")
+        os.makedirs(odd)
+        ctx = self.write("me.md", "I am Ana.")
+        self.with_settings({"MEETING_COPILOT_SEARCH_DIRS": odd, "MEETING_COPILOT_CONTEXT_FILE": ctx})
+        out = copilot.data_prompt()
+        self.assertIn(str(copilot.Path(odd).resolve()), out)
+        self.assertEqual(out, copilot.PROMPT_DATA.replace("{sources}", copilot.data_sources_text())
+                         + "\n" + copilot.context_text() + "\n")
 
     def test_placeholders_are_filled_once(self):
         ctx = self.write("me.md", "I write {sources} and {language} literally.")
