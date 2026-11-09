@@ -286,6 +286,101 @@ class Config(unittest.TestCase):
         self.assertEqual(copilot.assist_prompt(), copilot.PROMPT_ASSIST + tail)
         self.assertEqual(copilot.data_prompt(), copilot.PROMPT_DATA.format(sources="") + tail)
 
+    def notes_dir(self):
+        d = os.path.join(self.t, "notes")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def test_data_prompt_file_unset_is_the_built_in_prompt(self):
+        notes = self.notes_dir()
+        for cfg in ({}, {"MEETING_COPILOT_DATA_PROMPT_FILE": ""}):
+            s = self.with_settings(dict(cfg, MEETING_COPILOT_SEARCH_DIRS=notes, MEETING_COPILOT_LANGUAGE="Spanish"))
+            self.assertEqual((s.data_prompt, s.notices), ("", []))
+            built_in = copilot.PROMPT_DATA.format(sources=copilot.data_sources_text())
+            self.assertEqual(copilot.data_prompt(), built_in + "\n" + copilot.language_text() + "\n")
+            self.assertIn(str(copilot.Path(notes).resolve()), copilot.data_prompt())
+
+    def test_data_prompt_file_replaces_the_fact_search_prompt(self):
+        notes = self.notes_dir()
+        ctx = self.write("me.md", "I am Ana.")
+        p = self.write("data.md", "Find facts in {language}.\nSources:\n{sources}\n{context}\nNothing: EMPTY.")
+        s = self.with_settings({"MEETING_COPILOT_DATA_PROMPT_FILE": p, "MEETING_COPILOT_SEARCH_DIRS": notes,
+                                "MEETING_COPILOT_CONTEXT_FILE": ctx, "MEETING_COPILOT_LANGUAGE": "Spanish"})
+        self.assertEqual(s.notices, [])
+        self.assertEqual(copilot.data_prompt(),
+                         "Find facts in Spanish.\nSources:\n" + copilot.data_sources_text()
+                         + "\n## About the user (from their context file)\nI am Ana.\nNothing: EMPTY."
+                         + "\nKeep the word EMPTY in English, as is.\n")
+        self.assertEqual(copilot.assist_prompt(), copilot.PROMPT_ASSIST + "\n" + copilot.language_text() + "\n"
+                         + "\n" + copilot.context_text() + "\n", "the suggestions prompt is untouched")
+        # nothing placed: sources, language and context go to the end, in that order
+        bare = self.write("bare.md", "Look things up. Answer EMPTY when there is nothing.")
+        self.with_settings({"MEETING_COPILOT_DATA_PROMPT_FILE": bare, "MEETING_COPILOT_SEARCH_DIRS": notes,
+                            "MEETING_COPILOT_CONTEXT_FILE": ctx, "MEETING_COPILOT_LANGUAGE": "Spanish"})
+        out = copilot.data_prompt()
+        self.assertTrue(out.startswith("Look things up. Answer EMPTY when there is nothing.\nYou can:\n- search"))
+        self.assertLess(out.index("You can:"), out.index("Write every item in Spanish"))
+        self.assertLess(out.index("Write every item in Spanish"), out.index("I am Ana."))
+
+    def test_placed_language_still_keeps_empty_untranslated(self):
+        p = self.write("data.md", "Answer in {language}. If nothing, EMPTY.")
+        self.with_settings({"MEETING_COPILOT_DATA_PROMPT_FILE": p, "MEETING_COPILOT_LANGUAGE": "Spanish"})
+        self.assertEqual(copilot.data_prompt(), "Answer in Spanish. If nothing, EMPTY.\n"
+                                                "Keep the word EMPTY in English, as is.\n")
+        self.with_settings({"MEETING_COPILOT_DATA_PROMPT_FILE": p})  # no language set: nothing to keep
+        self.assertEqual(copilot.data_prompt(), "Answer in the language the meeting is using. If nothing, EMPTY.")
+        a = self.write("assist.md", "say and ask in {language}.")
+        self.with_settings({"MEETING_COPILOT_PROMPT_FILE": a, "MEETING_COPILOT_LANGUAGE": "Spanish"})
+        self.assertEqual(copilot.assist_prompt(), "say and ask in Spanish.", "only the fact search uses EMPTY")
+
+    def test_built_in_data_prompt_keeps_a_folder_named_like_a_placeholder(self):
+        odd = os.path.join(self.t, "{context}")
+        os.makedirs(odd)
+        ctx = self.write("me.md", "I am Ana.")
+        self.with_settings({"MEETING_COPILOT_SEARCH_DIRS": odd, "MEETING_COPILOT_CONTEXT_FILE": ctx})
+        out = copilot.data_prompt()
+        self.assertIn(str(copilot.Path(odd).resolve()), out)
+        self.assertEqual(out, copilot.PROMPT_DATA.replace("{sources}", copilot.data_sources_text())
+                         + "\n" + copilot.context_text() + "\n")
+
+    def test_placeholders_are_filled_once(self):
+        ctx = self.write("me.md", "I write {sources} and {language} literally.")
+        p = self.write("data.md", "EMPTY or a fact. {context} {sources}")
+        self.with_settings({"MEETING_COPILOT_DATA_PROMPT_FILE": p, "MEETING_COPILOT_CONTEXT_FILE": ctx,
+                            "MEETING_COPILOT_SEARCH_DIRS": self.notes_dir()})
+        self.assertIn("I write {sources} and {language} literally.", copilot.data_prompt())
+
+    def test_data_prompt_file_bad_file_falls_back_with_one_note(self):
+        bad_utf8 = os.path.join(self.t, "latin1.md")
+        with open(bad_utf8, "wb") as f:
+            f.write(b"EMPTY \xff\xe9")
+        cases = {os.path.join(self.t, "nope.md"): "data prompt file not found or unreadable",
+                 self.t: "data prompt file not found or unreadable",
+                 bad_utf8: "data prompt file is not UTF-8 text",
+                 self.write("empty.md", "\n  \n"): "data prompt file is empty"}
+        for path, why in cases.items():
+            s = self.with_settings({"MEETING_COPILOT_DATA_PROMPT_FILE": path})
+            self.assertEqual(len(s.notices), 1, (path, s.notices))
+            self.assertIn(why, s.notices[0])
+            self.assertEqual(copilot.data_prompt(), copilot.PROMPT_DATA.format(sources=""))
+
+    def test_data_prompt_file_contract_check(self):
+        for text in ("Find facts. If none, say nothing.", "Find facts. If none, answer empty."):
+            s = self.with_settings({"MEETING_COPILOT_DATA_PROMPT_FILE": self.write("d.md", text)})
+            self.assertEqual(len(s.notices), 1, s.notices)
+            self.assertIn("never names the word EMPTY", s.notices[0])
+        notes = copilot.check_prompt("EMPTY if none. {sources} {language} {context} {source}", "d", "data")
+        self.assertEqual(notes, ["data prompt file d: {source} is not a placeholder and stays as written "
+                                 "(placeholders: {language}, {context}, {sources})"])
+        self.assertIn("{sources} is not a placeholder", copilot.check_prompt("say ask {sources}", "a")[0])
+        self.assertEqual(copilot.check_prompt("Answer EMPTY.", "d", "data"), [])
+
+    def test_data_prompt_cut_never_splits_sources(self):
+        text = "EMPTY " + "x" * (copilot.PROMPT_MAX_CHARS - 10) + "{sources} tail"
+        s = self.with_settings({"MEETING_COPILOT_DATA_PROMPT_FILE": self.write("cut.md", text)})
+        self.assertTrue(s.data_prompt.endswith("x"), s.data_prompt[-12:])
+        self.assertIn("only the first", s.notices[0])
+
     def test_prompt_file_too_long_is_cut(self):
         p = self.write("long.md", "say ask " + "x" * (copilot.PROMPT_MAX_CHARS + 100))
         s = self.with_settings({"MEETING_COPILOT_PROMPT_FILE": p})
@@ -652,6 +747,35 @@ class Live(unittest.TestCase):
         self.assertEqual(self.log().count("note: prompt file not found or unreadable"), 1, self.log())
         a = [c for c in self.claude_calls() if "--json-schema" in c["argv"]][0]["argv"]
         self.assertEqual(a[a.index("--append-system-prompt") + 1], copilot.PROMPT_ASSIST)
+
+    @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
+    def test_data_prompt_file_goes_to_claude_and_facts_still_show(self):
+        notes = os.path.join(self.t, "notes")
+        os.makedirs(notes)
+        pf = os.path.join(self.t, "data.md")
+        with open(pf, "w", encoding="utf-8") as f:
+            f.write("MY DATA PROMPT. Search {sources}. Answer EMPTY when nothing.\n")
+        self.start(MEETING_COPILOT_DATA_PROMPT_FILE=pf, MEETING_COPILOT_SEARCH_DIRS=notes)
+        self.speak()
+        self.assertTrue(wait_for(lambda: (self.state() or {}).get("data")), self.log())
+        a = [c for c in self.claude_calls() if "--json-schema" not in c["argv"]][0]["argv"]
+        prompt = a[a.index("--append-system-prompt") + 1]
+        self.assertTrue(prompt.startswith("MY DATA PROMPT. Search - search the user's notes in these folders"))
+        self.assertIn("2027-03-31", self.state()["data"][0]["markdown"])
+        s = [c for c in self.claude_calls() if "--json-schema" in c["argv"]][0]["argv"]
+        self.assertEqual(s[s.index("--append-system-prompt") + 1], copilot.PROMPT_ASSIST, "suggestions untouched")
+        self.assertNotIn("note: data prompt file", self.log())
+
+    @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
+    def test_missing_data_prompt_file_logs_one_line_and_uses_the_built_in(self):
+        notes = os.path.join(self.t, "notes")
+        os.makedirs(notes)
+        self.start(MEETING_COPILOT_DATA_PROMPT_FILE=os.path.join(self.t, "nope.md"), MEETING_COPILOT_SEARCH_DIRS=notes)
+        self.speak()
+        self.assertTrue(wait_for(lambda: (self.state() or {}).get("data")), self.log())
+        self.assertEqual(self.log().count("note: data prompt file not found or unreadable"), 1, self.log())
+        a = [c for c in self.claude_calls() if "--json-schema" not in c["argv"]][0]["argv"]
+        self.assertIn("You are a silent fact assistant", a[a.index("--append-system-prompt") + 1])
 
     @unittest.skipIf(WIN, "SIGTERM cannot be delivered as a signal on Windows")
     def test_sigterm_saves_session(self):
