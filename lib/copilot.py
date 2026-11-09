@@ -29,6 +29,7 @@ import sys
 import threading
 import time
 import traceback
+import unicodedata
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -204,17 +205,21 @@ class Settings:
         self.data_dir = Path(_expand(g("DATA_DIR"))) if g("DATA_DIR") else default_data_dir()
         self.sessions_dir = Path(_expand(g("SESSIONS_DIR"))) if g("SESSIONS_DIR") else self.data_dir / "sessions"
         self.save_sessions = g("SAVE_SESSIONS", "1").strip().lower() not in ("0", "no", "false", "off")
+        # CONFIRM_AI=1: no AI call in a meeting until you click "Turn on AI" on the page
+        # (for a copilot that starts at login and should not spend AI on every recording).
+        self.confirm_ai = g("CONFIRM_AI", "0").strip().lower() in ("1", "yes", "true", "on")
+        self.notices: list[str] = []
         # SAVE_FORMAT=markdown: a readable "<Muesli export name>-copilot.md" instead of the JSON
         self.save_format = g("SAVE_FORMAT", "json").strip().lower()
         if self.save_format not in ("json", "markdown"):
             self.notices.append(f"MEETING_COPILOT_SAVE_FORMAT must be json or markdown, using json: {self.save_format}")
             self.save_format = "json"
         # how long to wait for Muesli's own export (it names the file after the final title)
-        self.muesli_wait_s = float(g("MUESLI_WAIT_S", "600"))
-        # CONFIRM_AI=1: no AI call in a meeting until you click "Turn on AI" on the page
-        # (for a copilot that starts at login and should not spend AI on every recording).
-        self.confirm_ai = g("CONFIRM_AI", "0").strip().lower() in ("1", "yes", "true", "on")
-        self.notices: list[str] = []
+        try:
+            self.muesli_wait_s = float(g("MUESLI_WAIT_S", "600"))
+        except ValueError:
+            self.notices.append(f"MEETING_COPILOT_MUESLI_WAIT_S is not a number, using 600: {g('MUESLI_WAIT_S')}")
+            self.muesli_wait_s = 600.0
         claude = _expand(g("CLAUDE") or "claude")
         self.claude = claude if os.path.isfile(claude) else shutil.which(claude)
 
@@ -439,7 +444,10 @@ class State:
     def ai_armed(self) -> bool:
         return self.ai_for == "next" and now() - self.ai_next_at <= NEXT_MEETING_ARM_S
 
-    def public(self) -> dict:
+    def public(self, full: bool = False) -> dict:
+        """The page state. full=True: every item (for the saved session), not only the latest."""
+        def last(items, n):
+            return list(items) if full else items[-n:]
         with self.lock:
             return {
                 "meeting": self.meeting,
@@ -447,18 +455,18 @@ class State:
                 "status": self.status,
                 "goal": self.goal,
                 "goals": self.goals,
-                "say": self.say[-12:],
-                "ask": self.ask[-12:],
-                "corrections": self.corrections[-10:],
-                "data": self.data[-10:],
+                "say": last(self.say, 12),
+                "ask": last(self.ask, 12),
+                "corrections": last(self.corrections, 10),
+                "data": last(self.data, 10),
                 "data_enabled": S.data_enabled,
                 "confirm_ai": S.confirm_ai,
                 "ai_on": self.meeting is not None and self.ai_allowed(),
                 "ai_next": S.confirm_ai and self.ai_armed(),
-                "warnings": self.warnings[-6:],
+                "warnings": last(self.warnings, 6),
                 "metrics": self.metrics,
-                "lines": self.lines[-8:],
-                "errors": STARTUP_ERRORS + self.errors[-3:],
+                "lines": last(self.lines, 8),
+                "errors": STARTUP_ERRORS + last(self.errors, 3),
                 "now": clock(now()),
             }
 
@@ -732,16 +740,12 @@ def data_round() -> None:
 # ---------------------------------------------------------------- main loop
 
 
-def session_snapshot() -> dict:
-    """Everything shown during the meeting, with the full lists (the page only shows the latest)."""
-    state = E.public()
-    with E.lock:
-        state.update(lines=list(E.lines), say=list(E.say), ask=list(E.ask), corrections=list(E.corrections),
-                     data=list(E.data), warnings=list(E.warnings), errors=list(E.errors))
-    return state
-
-
-PENDING: list[dict] = []   # markdown sessions waiting for Muesli's export: {id, ended, snap}
+def parse_iso(text) -> datetime | None:
+    """Muesli's timestamps ('2026-11-09T13:13:13Z') as an aware datetime, or None."""
+    try:
+        return datetime.fromisoformat(str(text).replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def _write_private(path: Path, text: str) -> None:
@@ -752,58 +756,85 @@ def _write_private(path: Path, text: str) -> None:
         pass
 
 
+# Markdown sessions are written to disk as soon as a meeting ends, under a name from the current title.
+# Muesli often renames the meeting and exports it a minute later; until MUESLI_WAIT_S has passed the file
+# waits here and is renamed to "<Muesli export name>-copilot.md" when the export shows up in Muesli's log.
+PENDING: list[dict] = []   # {id, ended, snap, path}
+PENDING_LOCK = threading.Lock()
+
+
 def save_session(final: bool = False) -> None:
-    """Called when a meeting ends (and on exit). JSON is written now; markdown waits for Muesli's
-    export so it can take the same name, unless this is the final save before the copilot exits."""
+    """Called when a meeting ends and on exit (final=True)."""
     if E.meeting and S.save_sessions:
-        snap = session_snapshot()
-        if S.save_format == "markdown":
-            PENDING.append({"id": E.meeting["id"], "ended": now(), "snap": snap})
-        else:
-            S.sessions_dir.mkdir(parents=True, exist_ok=True)
-            path = S.sessions_dir / f"{datetime.now().strftime('%Y-%m-%d')}-meeting-{E.meeting['id']}.json"
-            _write_private(path, json.dumps(snap, ensure_ascii=False, indent=1))
-            print(f"session saved to {path}", flush=True)
-    if final:
-        flush_pending(None, force=True)
+        snap = E.public(full=True)
+        mid = E.meeting["id"]
+        try:
+            if S.save_format == "markdown":
+                with PENDING_LOCK:
+                    if any(it["id"] == mid for it in PENDING):
+                        return   # already saved by the other thread
+                    path = write_markdown(snap, meeting_row(None, mid), None)
+                    if not final:
+                        PENDING.append({"id": mid, "ended": now(), "snap": snap, "path": path})
+            else:
+                S.sessions_dir.mkdir(parents=True, exist_ok=True)
+                path = S.sessions_dir / f"{datetime.now().strftime('%Y-%m-%d')}-meeting-{mid}.json"
+                _write_private(path, json.dumps(snap, ensure_ascii=False, indent=1))
+                print(f"session saved to {path}", flush=True)
+        except Exception as ex:   # never lose the loop or the exit over a save
+            error(f"saving the session: {ex}")
 
 
 def muesli_slug(title: str) -> str:
-    """The file stem Muesli gives an exported meeting (MeetingExporter.suggestedFilename)."""
-    return "-".join(re.findall(r"[^\W_]+", title)).lower()[:50] or "meeting"
+    """The file stem Muesli gives an exported meeting (MeetingExporter.suggestedFilename): runs of
+    letters, marks and digits (Swift CharacterSet.alphanumerics) joined by '-', lowercased, 50 chars."""
+    parts, cur = [], []
+    for ch in title:
+        if unicodedata.category(ch)[0] in "LMN":
+            cur.append(ch)
+        elif cur:
+            parts.append("".join(cur))
+            cur = []
+    if cur:
+        parts.append("".join(cur))
+    return "-".join(parts).lower()[:50] or "meeting"
 
 
 def local_date(start: str) -> str:
-    try:
-        return datetime.fromisoformat(start.replace("Z", "+00:00")).astimezone().strftime("%Y-%m-%d")
-    except (ValueError, AttributeError):
-        return datetime.now().strftime("%Y-%m-%d")
+    d = parse_iso(start)
+    return (d.astimezone() if d else datetime.now()).strftime("%Y-%m-%d")
 
 
 EXPORT_LINE = re.compile(r"^\[([^\]]+)\] exported: id=(\d+) paths=(.*)$")
+_export_cache: dict = {"sig": None, "by_id": {}}
+
+
+def _export_log(db: Path) -> dict[int, list[tuple[float, Path]]]:
+    """Muesli's export log as {meeting id: [(time, .md path), ...]}; parsed again only when it changes."""
+    log = db.parent / "meeting-markdown-export.log"
+    try:
+        st = log.stat()
+    except OSError:
+        return {}
+    sig = (str(log), st.st_size, st.st_mtime)
+    if _export_cache["sig"] != sig:
+        by_id: dict[int, list[tuple[float, Path]]] = {}
+        for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
+            m = EXPORT_LINE.match(line.strip())
+            d = parse_iso(m.group(1)) if m else None
+            if not d:
+                continue
+            for part in re.split(r", (?=/)", m.group(3)):
+                if part.strip().lower().endswith(".md"):
+                    by_id.setdefault(int(m.group(2)), []).append((d.timestamp(), Path(part.strip())))
+        _export_cache.update(sig=sig, by_id=by_id)
+    return _export_cache["by_id"]
 
 
 def muesli_export(db: Path, meeting_id: int, since: float) -> Path | None:
-    """The Markdown file Muesli auto-exported for this meeting after `since`, read from its export log."""
-    found = None
-    try:
-        text = (db.parent / "meeting-markdown-export.log").read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
-    for line in text.splitlines():
-        m = EXPORT_LINE.match(line.strip())
-        if not m or int(m.group(2)) != meeting_id:
-            continue
-        try:
-            ts = datetime.fromisoformat(m.group(1).replace("Z", "+00:00")).timestamp()
-        except ValueError:
-            continue
-        if ts < since - 60:
-            continue
-        for p in re.split(r", (?=/)", m.group(3)):
-            if p.strip().lower().endswith(".md"):
-                found = Path(p.strip())
-    return found
+    """The Markdown file Muesli auto-exported for this meeting after `since` (the latest one)."""
+    found = [p for ts, p in _export_log(db).get(meeting_id, []) if ts >= since - 60]
+    return found[-1] if found else None
 
 
 def meeting_row(con: sqlite3.Connection | None, meeting_id: int) -> dict:
@@ -812,24 +843,30 @@ def meeting_row(con: sqlite3.Connection | None, meeting_id: int) -> dict:
     try:
         if con is None:
             con, close = open_db(S.db), True
-        r = con.execute("SELECT title, start_time FROM meetings WHERE id = ?",
-                        (meeting_id,)).fetchone()
+        r = con.execute("SELECT title, start_time FROM meetings WHERE id = ?", (meeting_id,)).fetchone()
         return dict(r) if r else {}
     except sqlite3.Error:
         return {}
     finally:
-        if close:
+        if close and con is not None:
             con.close()
 
 
-def flush_pending(con: sqlite3.Connection | None, force: bool = False) -> None:
-    for item in list(PENDING):
-        md = muesli_export(S.db, item["id"], item["ended"])
-        if md or force or now() - item["ended"] >= S.muesli_wait_s:
-            PENDING.remove(item)
+def flush_pending(con: sqlite3.Connection | None) -> None:
+    """Renames a saved markdown session after Muesli's export, or lets it go after MUESLI_WAIT_S."""
+    with PENDING_LOCK:
+        for item in list(PENDING):
             try:
-                write_markdown(item["snap"], meeting_row(con, item["id"]), md)
-            except OSError as ex:
+                md = muesli_export(S.db, item["id"], item["ended"])
+                if md:
+                    new = write_markdown(item["snap"], meeting_row(con, item["id"]), md, replaces=item["path"])
+                    PENDING.remove(item)
+                    if new != item["path"]:
+                        item["path"].unlink(missing_ok=True)
+                elif now() - item["ended"] >= S.muesli_wait_s:
+                    PENDING.remove(item)   # no export: the file keeps the name it got when the meeting ended
+            except Exception as ex:
+                PENDING.remove(item)       # the file from the meeting's end stays on disk
                 error(f"saving the session: {ex}")
 
 
@@ -837,7 +874,7 @@ def _md_list(items: list[dict], render) -> str:
     return "\n".join(f"- {clock(it['ts'])} {render(it)}" for it in items) or "- (none)"
 
 
-def write_markdown(snap: dict, row: dict, muesli_md: Path | None) -> Path:
+def write_markdown(snap: dict, row: dict, muesli_md: Path | None, replaces: Path | None = None) -> Path:
     meeting = snap.get("meeting") or {}
     title = row.get("title") or meeting.get("title") or "Meeting"
     start = row.get("start_time") or meeting.get("start") or ""
@@ -845,13 +882,11 @@ def write_markdown(snap: dict, row: dict, muesli_md: Path | None) -> Path:
     S.sessions_dir.mkdir(parents=True, exist_ok=True)
     path = S.sessions_dir / f"{stem}-copilot.md"
     n = 2
-    while path.exists():
+    while path.exists() and path != replaces:
         path = S.sessions_dir / f"{stem}-copilot-{n}.md"
         n += 1
-    try:
-        when = datetime.fromisoformat(start.replace("Z", "+00:00")).astimezone().strftime("%Y-%m-%d %H:%M")
-    except (ValueError, AttributeError):
-        when = start
+    d = parse_iso(start)
+    when = d.astimezone().strftime("%Y-%m-%d %H:%M") if d else start
     m = snap.get("metrics") or {}
     if muesli_md:
         try:
@@ -860,7 +895,7 @@ def write_markdown(snap: dict, row: dict, muesli_md: Path | None) -> Path:
             rel = str(muesli_md)
         transcript_line = f"- Transcript (Muesli): [{muesli_md.name}](<{rel}>)"
     else:
-        transcript_line = "- Transcript: in Muesli (no auto-export found)"
+        transcript_line = "- Transcript: in Muesli (its export was not found yet)"
     goals = "\n".join(f"- [{'x' if g.get('covered') else ' '}] {g['text']}" for g in snap.get("goals", []))
     out = [
         "---",

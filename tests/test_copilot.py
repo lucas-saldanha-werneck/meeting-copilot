@@ -132,7 +132,19 @@ class Logic(unittest.TestCase):
             self.assertIn("did not answer in 1s", str(cm.exception))
             self.assertIn("overloaded, retrying", str(cm.exception))
 
+    def test_bad_save_format_or_wait_falls_back_with_a_note(self):
+        s = copilot.Settings({"MEETING_COPILOT_SAVE_FORMAT": "md", "MEETING_COPILOT_MUESLI_WAIT_S": "10m"})
+        self.assertEqual(s.save_format, "json")
+        self.assertEqual(s.muesli_wait_s, 600.0)
+        self.assertTrue(any("SAVE_FORMAT" in n for n in s.notices))
+        self.assertTrue(any("MUESLI_WAIT_S" in n for n in s.notices))
+        self.assertEqual(copilot.Settings({"MEETING_COPILOT_SAVE_FORMAT": " Markdown "}).save_format, "markdown")
+
     def test_muesli_file_names_and_export_log(self):
+        import unicodedata
+        self.assertEqual(copilot.muesli_slug(unicodedata.normalize("NFD", "Trajetória")),
+                         unicodedata.normalize("NFD", "trajetória"))   # combining marks stay, like Swift
+        self.assertEqual(copilot.muesli_slug("Q3 O'Brien_sync"), "q3-o-brien-sync")
         self.assertEqual(copilot.muesli_slug("Conversa sobre Trajetória e Empresas Familiares"),
                          "conversa-sobre-trajetória-e-empresas-familiares")
         self.assertEqual(copilot.muesli_slug("Meeting: discussion!"), "meeting-discussion")
@@ -1016,11 +1028,10 @@ class Live(unittest.TestCase):
         self.assertTrue(wait_for(lambda: (self.state() or {}).get("say")), self.log())
         fake_meeting.end(copilot.Path(self.db))
         self.assertTrue(wait_for(lambda: (lambda s: s and not s["live"])(self.state())), self.log())
-        time.sleep(1)
-        self.assertEqual(self.md_files(), [])            # waits for Muesli's export
+        first = f"{copilot.local_date(fake_meeting.now_iso())}-{copilot.muesli_slug(fake_meeting.TITLE)}-copilot.md"
+        self.assertTrue(wait_for(lambda: self.md_files() == [first]), self.log())   # on disk at once
         stem, md = self.muesli_exports(mid, "Renewal: final terms")
-        self.assertTrue(wait_for(lambda: self.md_files()), self.log())
-        self.assertEqual(self.md_files(), [stem + "-copilot.md"])
+        self.assertTrue(wait_for(lambda: self.md_files() == [stem + "-copilot.md"]), self.log())  # renamed
         self.assertTrue(stem.endswith("-renewal-final-terms"))
         with open(os.path.join(self.sessions, stem + "-copilot.md"), encoding="utf-8") as f:
             text = f.read()
