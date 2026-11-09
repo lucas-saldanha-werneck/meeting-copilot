@@ -11,7 +11,7 @@ Reads the live transcript that the Muesli app writes while a meeting is recordin
   - Speaking-habit warnings                  (no AI, every 5 s)
 
 The AI runs through the `claude -p` command line (Claude Code). Nothing else leaves the machine.
-Configuration: environment variables or ~/.config/meeting-copilot/config (see README, "Your settings").
+Configuration: environment variables or ~/.config/meeting-copilot/config (see README, "Settings").
 """
 
 from __future__ import annotations

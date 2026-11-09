@@ -66,7 +66,7 @@ python3 tools/fake_meeting.py speak /tmp/test.db 4     # one invented line every
 python3 tools/fake_meeting.py end /tmp/test.db
 ```
 
-## Your settings
+## Settings
 
 Your settings live in your own file, outside the program folder, so updating meeting-copilot
 (`git pull` or a new download) never touches them:
@@ -194,7 +194,7 @@ meeting-copilot stop
 
 Your config and saved sessions are kept; delete `~/.config/meeting-copilot` and `~/.local/share/meeting-copilot` to remove them.
 
-## Test
+## Tests
 
 ```
 python3 tests/test_copilot.py -v
