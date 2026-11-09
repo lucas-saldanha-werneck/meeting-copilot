@@ -8,11 +8,16 @@ the shape of `claude -p --output-format json`: structured_output when --json-sch
 import json
 import os
 import sys
+import time
 
 argv = sys.argv[1:]
 stdin = sys.stdin.read()
 with open(os.environ["FAKE_CLAUDE_LOG"], "a", encoding="utf-8") as f:
     f.write(json.dumps({"argv": argv, "stdin": stdin, "cwd": os.getcwd()}) + "\n")
+if os.environ.get("FAKE_CLAUDE_STDERR"):
+    sys.stderr.write(os.environ["FAKE_CLAUDE_STDERR"] + "\n")
+    sys.stderr.flush()
+time.sleep(float(os.environ.get("FAKE_CLAUDE_SLEEP", "0")))   # a slow or stuck call
 
 if "--json-schema" in argv:
     out = {
