@@ -80,3 +80,9 @@
 # (default: the sessions folder inside the data folder). 0 turns saving off.
 #MEETING_COPILOT_SESSIONS_DIR=
 #MEETING_COPILOT_SAVE_SESSIONS=1
+
+# json (default): everything, with the transcript. markdown: a readable
+# "<Muesli export name>-copilot.md" with the suggestions only, named after
+# Muesli's own auto-export (waits up to MUESLI_WAIT_S seconds for it).
+#MEETING_COPILOT_SAVE_FORMAT=json
+#MEETING_COPILOT_MUESLI_WAIT_S=600
