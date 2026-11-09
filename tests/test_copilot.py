@@ -132,6 +132,36 @@ class Logic(unittest.TestCase):
             self.assertIn("did not answer in 1s", str(cm.exception))
             self.assertIn("overloaded, retrying", str(cm.exception))
 
+    def test_bad_save_format_or_wait_falls_back_with_a_note(self):
+        s = copilot.Settings({"MEETING_COPILOT_SAVE_FORMAT": "md", "MEETING_COPILOT_MUESLI_WAIT_S": "10m"})
+        self.assertEqual(s.save_format, "json")
+        self.assertEqual(s.muesli_wait_s, 600.0)
+        self.assertTrue(any("SAVE_FORMAT" in n for n in s.notices))
+        self.assertTrue(any("MUESLI_WAIT_S" in n for n in s.notices))
+        self.assertEqual(copilot.Settings({"MEETING_COPILOT_SAVE_FORMAT": " Markdown "}).save_format, "markdown")
+
+    def test_muesli_file_names_and_export_log(self):
+        import unicodedata
+        self.assertEqual(copilot.muesli_slug(unicodedata.normalize("NFD", "Trajetória")),
+                         unicodedata.normalize("NFD", "trajetória"))   # combining marks stay, like Swift
+        self.assertEqual(copilot.muesli_slug("Q3 O'Brien_sync"), "q3-o-brien-sync")
+        self.assertEqual(copilot.muesli_slug("Conversa sobre Trajetória e Empresas Familiares"),
+                         "conversa-sobre-trajetória-e-empresas-familiares")
+        self.assertEqual(copilot.muesli_slug("Meeting: discussion!"), "meeting-discussion")
+        self.assertEqual(copilot.muesli_slug("  "), "meeting")
+        self.assertEqual(len(copilot.muesli_slug("x" * 80)), 50)
+        with tempfile.TemporaryDirectory() as d:
+            db = copilot.Path(d) / "muesli.db"
+            (copilot.Path(d) / "meeting-markdown-export.log").write_text(
+                "[2026-11-09T14:03:36Z] exported: id=5 paths=/v/r/2026-11-09-a, b.md, /v/r/2026-11-09-a, b.pdf\n"
+                "[2026-11-09T14:05:00Z] exported: id=6 paths=/v/r/other.md\n"
+                "garbage line\n", encoding="utf-8")
+            end = copilot.datetime.fromisoformat("2026-11-09T14:02:06+00:00").timestamp()
+            self.assertEqual(copilot.muesli_export(db, 5, end), copilot.Path("/v/r/2026-11-09-a, b.md"))
+            self.assertIsNone(copilot.muesli_export(db, 5, end + 3600))   # an older export does not count
+            self.assertIsNone(copilot.muesli_export(db, 7, end))
+            self.assertIsNone(copilot.muesli_export(copilot.Path(d) / "x" / "muesli.db", 5, end))
+
     def test_empty_reply(self):
         for t in ("EMPTY", "  **EMPTY**", "empty.", ""):
             self.assertTrue(copilot.is_empty(t))
@@ -969,6 +999,69 @@ class Live(unittest.TestCase):
         with open(os.path.join(self.sessions, files[0]), encoding="utf-8") as f:
             saved = json.load(f)
         self.assertEqual(len(saved["lines"]), len(fake_meeting.SCRIPT))
+
+    def muesli_exports(self, meeting_id, title):
+        """Does what Muesli's auto-export does after a meeting: renames it, writes the .md, logs the path."""
+        folder = os.path.join(self.t, "vault", "reunioes")
+        os.makedirs(folder, exist_ok=True)
+        stem = f"{copilot.local_date(fake_meeting.now_iso())}-{copilot.muesli_slug(title)}"
+        md = os.path.join(folder, stem + ".md")
+        with open(md, "w", encoding="utf-8") as f:
+            f.write("# transcript\n")
+        con = sqlite3.connect(self.db)
+        con.execute("UPDATE meetings SET title = ? WHERE id = ?", (title, meeting_id))
+        con.commit()
+        con.close()
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        with open(os.path.join(self.t, "meeting-markdown-export.log"), "a", encoding="utf-8") as f:
+            f.write(f"[{stamp}] exported: id={meeting_id} paths={md}, {md[:-3]}.pdf\n")
+        return stem, md
+
+    def md_files(self):
+        return sorted(x for x in os.listdir(self.sessions) if x.endswith(".md")) if os.path.isdir(self.sessions) else []
+
+    @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
+    def test_markdown_session_waits_for_muesli_export_and_takes_its_name(self):
+        self.start(MEETING_COPILOT_SAVE_FORMAT="markdown")
+        mid = self.state()["meeting"]["id"]
+        self.speak()
+        self.assertTrue(wait_for(lambda: (self.state() or {}).get("say")), self.log())
+        fake_meeting.end(copilot.Path(self.db))
+        self.assertTrue(wait_for(lambda: (lambda s: s and not s["live"])(self.state())), self.log())
+        first = f"{copilot.local_date(fake_meeting.now_iso())}-{copilot.muesli_slug(fake_meeting.TITLE)}-copilot.md"
+        self.assertTrue(wait_for(lambda: self.md_files() == [first]), self.log())   # on disk at once
+        stem, md = self.muesli_exports(mid, "Renewal: final terms")
+        self.assertTrue(wait_for(lambda: self.md_files() == [stem + "-copilot.md"]), self.log())  # renamed
+        self.assertTrue(stem.endswith("-renewal-final-terms"))
+        with open(os.path.join(self.sessions, stem + "-copilot.md"), encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn("kind: ai-suggestions", text)
+        self.assertIn("not facts", text)
+        self.assertIn("# Renewal: final terms (copilot)", text)
+        self.assertIn("fifteen percent", text)           # the suggestion
+        self.assertIn("someone will sort it out", text)  # the correction
+        self.assertIn(os.path.basename(md), text)        # link to the transcript
+        self.assertNotIn("One more thing: is the window cleaning", text)  # no transcript copy
+        self.assertEqual([x for x in os.listdir(self.sessions) if x.endswith(".json")], [])
+
+    def test_markdown_session_without_muesli_export_after_the_wait(self):
+        self.start(MEETING_COPILOT_CLAUDE=os.path.join(self.t, "no-claude"),
+                   MEETING_COPILOT_SAVE_FORMAT="markdown", MEETING_COPILOT_MUESLI_WAIT_S="1")
+        self.speak()
+        self.assertTrue(wait_for(lambda: (self.state() or {}).get("lines")), self.log())
+        fake_meeting.end(copilot.Path(self.db))
+        self.assertTrue(wait_for(lambda: self.md_files()), self.log())
+        self.assertEqual(self.md_files(), [f"{copilot.local_date(fake_meeting.now_iso())}-"
+                                           f"{copilot.muesli_slug(fake_meeting.TITLE)}-copilot.md"])
+
+    @unittest.skipIf(WIN, "SIGTERM cannot be delivered as a signal on Windows")
+    def test_markdown_session_written_at_once_on_stop(self):
+        self.start(MEETING_COPILOT_CLAUDE=os.path.join(self.t, "no-claude"), MEETING_COPILOT_SAVE_FORMAT="markdown")
+        self.speak()
+        self.assertTrue(wait_for(lambda: (self.state() or {}).get("lines")), self.log())
+        self.proc.send_signal(signal.SIGTERM)
+        self.assertEqual(self.proc.wait(10), 0, self.log())
+        self.assertEqual(len(self.md_files()), 1, self.log())
 
     def test_missing_db_exits_with_message(self):
         env = dict(self.env, MEETING_COPILOT_DB=os.path.join(self.t, "missing.db"))
