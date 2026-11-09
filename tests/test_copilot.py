@@ -1054,6 +1054,7 @@ class Live(unittest.TestCase):
         self.assertEqual(self.md_files(), [f"{copilot.local_date(fake_meeting.now_iso())}-"
                                            f"{copilot.muesli_slug(fake_meeting.TITLE)}-copilot.md"])
 
+    @unittest.skipIf(WIN, "SIGTERM cannot be delivered as a signal on Windows")
     def test_markdown_session_written_at_once_on_stop(self):
         self.start(MEETING_COPILOT_CLAUDE=os.path.join(self.t, "no-claude"), MEETING_COPILOT_SAVE_FORMAT="markdown")
         self.speak()
