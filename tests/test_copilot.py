@@ -97,6 +97,41 @@ class Logic(unittest.TestCase):
                              "Third", "Fourth"], shown)
         self.assertEqual(out, ["Confirm the date.", "Third"])
 
+    def test_next_meeting_click_expires(self):
+        old_s = getattr(copilot, "S", None)
+        copilot.S = copilot.Settings({"MEETING_COPILOT_CONFIRM_AI": "1"})
+        try:
+            st = copilot.State()
+            st.ai_for, st.ai_next_at = "next", copilot.now()
+            self.assertTrue(st.ai_armed())
+            st.ai_next_at = copilot.now() - copilot.NEXT_MEETING_ARM_S - 1
+            self.assertFalse(st.ai_armed())
+            st.meeting = {"id": 7}
+            self.assertFalse(st.ai_allowed())
+            st.ai_for = 7
+            self.assertTrue(st.ai_allowed())
+            self.assertFalse(st.ai_allowed(8))
+        finally:
+            copilot.S = old_s
+
+    @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
+    def test_timeout_keeps_claude_stderr(self):
+        with tempfile.TemporaryDirectory() as d:
+            slow = os.path.join(d, "claude")
+            with open(slow, "w") as f:
+                f.write('#!/bin/sh\necho "API Error: overloaded, retrying in 30s" >&2\nexec sleep 10\n')
+            os.chmod(slow, 0o755)
+            old_s, old_t = getattr(copilot, "S", None), copilot.AI_TIMEOUT_S
+            copilot.S = copilot.Settings({"MEETING_COPILOT_CLAUDE": slow, "MEETING_COPILOT_DATA_DIR": d})
+            copilot.AI_TIMEOUT_S = 1
+            try:
+                with self.assertRaises(RuntimeError) as cm:
+                    copilot.run_claude("p", "m", "sonnet")
+            finally:
+                copilot.S, copilot.AI_TIMEOUT_S = old_s, old_t
+            self.assertIn("did not answer in 1s", str(cm.exception))
+            self.assertIn("overloaded, retrying", str(cm.exception))
+
     def test_empty_reply(self):
         for t in ("EMPTY", "  **EMPTY**", "empty.", ""):
             self.assertTrue(copilot.is_empty(t))
@@ -824,6 +859,24 @@ class Live(unittest.TestCase):
         self.assertEqual([g["text"] for g in st["goals"]], ["a", "b"])
         self.assertEqual(st["status"], "live")  # setUp started a recording meeting
 
+    def set_status(self, status, meeting_id=None):
+        con = sqlite3.connect(self.db)
+        if meeting_id is None:
+            con.execute("INSERT INTO meetings (title, start_time, meeting_status) VALUES (?, ?, ?)",
+                        (fake_meeting.TITLE, fake_meeting.now_iso(), status))
+        else:
+            con.execute("UPDATE meetings SET meeting_status = ? WHERE id = ?", (status, meeting_id))
+        con.commit()
+        con.close()
+
+    def calls_settle(self):
+        """Waits until no AI call is still landing, then returns how many there were."""
+        n = -1
+        while n != len(self.claude_calls()):
+            n = len(self.claude_calls())
+            time.sleep(1.5)
+        return n
+
     @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
     def test_confirm_ai_waits_for_the_click_and_each_meeting_asks_again(self):
         self.start(MEETING_COPILOT_CONFIRM_AI="1")
@@ -831,46 +884,68 @@ class Live(unittest.TestCase):
         self.assertTrue(wait_for(lambda: len((self.state() or {}).get("lines", [])) == 8), self.log())
         time.sleep(2)                                    # several rounds would have run by now
         st = self.state()
+        mid = st["meeting"]["id"]
         self.assertTrue(st["confirm_ai"])
         self.assertFalse(st["ai_on"])
         self.assertEqual(self.claude_calls(), [])
         self.assertEqual(st["say"], [])
         self.assertTrue(st["metrics"])                   # transcript and metrics still work
-        self.assertEqual(self.post("/ai", {"on": True}, origin="https://evil.example"), 403)
-        self.assertEqual(self.post("/ai", {"on": "yes"}), 200)   # only a real true turns it on
+        self.assertEqual(self.post("/ai", {"on": True, "meeting": mid}, origin="https://evil.example"), 403)
+        self.assertEqual(self.post("/ai", {"on": "yes", "meeting": mid}), 200)   # only a real true turns it on
         self.assertFalse(self.state()["ai_on"])
-        self.assertEqual(self.post("/ai", {"on": True}), 200)
+        self.assertEqual(self.post("/ai", {"on": True, "meeting": mid + 1}), 409)  # page showed another meeting
+        self.assertEqual(self.post("/ai", {"on": True, "meeting": None}), 409)     # page thought nothing was live
+        self.assertFalse(self.state()["ai_on"])
+        self.assertEqual(self.post("/ai", {"on": True, "meeting": mid}), 200)
         self.assertTrue(self.state()["ai_on"])
         self.assertTrue(wait_for(lambda: (self.state() or {}).get("say")), self.log())
         self.assertTrue(self.claude_calls())
-        # the meeting ends: the next one asks again
-        fake_meeting.end(copilot.Path(self.db))
+        # Muesli leaves 'recording' for a moment and comes back with the same meeting: AI stays on
+        self.set_status("paused", mid)
         self.assertTrue(wait_for(lambda: (lambda s: s and not s["live"])(self.state())), self.log())
         self.assertFalse(self.state()["ai_on"])
-        con = sqlite3.connect(self.db)
-        con.execute("INSERT INTO meetings (title, start_time, meeting_status) VALUES (?, ?, 'recording')",
-                    (fake_meeting.TITLE, fake_meeting.now_iso()))
-        con.commit()
-        con.close()
+        self.set_status("recording", mid)
+        self.assertTrue(wait_for(lambda: (self.state() or {}).get("live")), self.log())
+        self.assertTrue(self.state()["ai_on"])
+        # the meeting ends and a new one starts: it asks again
+        fake_meeting.end(copilot.Path(self.db))
+        self.assertTrue(wait_for(lambda: (lambda s: s and not s["live"])(self.state())), self.log())
+        self.set_status("recording")
         self.assertTrue(wait_for(lambda: (self.state() or {}).get("live")), self.log())
         self.assertFalse(self.state()["ai_on"])
-        n = len(self.claude_calls())
+        n = self.calls_settle()
         self.speak()
+        self.assertTrue(wait_for(lambda: len((self.state() or {}).get("lines", [])) == 8), self.log())
         time.sleep(2)
         self.assertEqual(len(self.claude_calls()), n)
+
+    @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
+    def test_confirm_ai_stop_drops_the_answer_still_running(self):
+        self.start(MEETING_COPILOT_CONFIRM_AI="1", FAKE_CLAUDE_SLEEP="3")
+        mid = self.state()["meeting"]["id"]
+        self.speak()
+        self.assertEqual(self.post("/ai", {"on": True, "meeting": mid}), 200)
+        self.assertTrue(wait_for(lambda: self.claude_calls()), self.log())   # a call is running
+        self.assertEqual(self.post("/ai", {"on": False}), 200)
+        self.assertFalse(self.state()["ai_on"])
+        self.assertTrue(wait_for(lambda: "AI answer dropped" in self.log(), 15), self.log())
+        st = self.state()
+        self.assertEqual(st["say"], [])
+        self.assertEqual(st["data"], [])
 
     @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
     def test_confirm_ai_click_before_the_meeting_counts_for_it(self):
         fake_meeting.end(copilot.Path(self.db))          # no meeting yet
         self.start(MEETING_COPILOT_CONFIRM_AI="1")
-        self.assertEqual(self.post("/ai", {"on": True}), 200)
-        con = sqlite3.connect(self.db)
-        con.execute("INSERT INTO meetings (title, start_time, meeting_status) VALUES (?, ?, 'recording')",
-                    (fake_meeting.TITLE, fake_meeting.now_iso()))
-        con.commit()
-        con.close()
+        self.assertEqual(self.post("/ai", {"on": True, "meeting": None}), 200)
+        st = self.state()
+        self.assertTrue(st["ai_next"])
+        self.assertFalse(st["ai_on"])
+        self.set_status("recording")
         self.assertTrue(wait_for(lambda: (self.state() or {}).get("live")), self.log())
-        self.assertTrue(self.state()["ai_on"])
+        st = self.state()
+        self.assertTrue(st["ai_on"])
+        self.assertFalse(st["ai_next"])
         self.speak()
         self.assertTrue(wait_for(lambda: (self.state() or {}).get("say")), self.log())
 
@@ -879,6 +954,7 @@ class Live(unittest.TestCase):
         st = self.state()
         self.assertFalse(st["confirm_ai"])
         self.assertTrue(st["ai_on"])
+        self.assertFalse(st["ai_next"])
 
     def test_meeting_end_saves_session(self):
         self.start(MEETING_COPILOT_CLAUDE=os.path.join(self.t, "no-claude"))

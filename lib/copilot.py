@@ -45,6 +45,7 @@ COOLDOWN_WARNING_S = 120   # between any two warnings
 REPEAT_WARNING_S = 300     # before the same kind of warning shows again
 WINDOW_S = 180             # how much of the conversation the AI sees
 AI_TIMEOUT_S = 120
+NEXT_MEETING_ARM_S = 30 * 60   # a "Turn on AI for the next meeting" click expires after this
 CONTEXT_MAX_CHARS = 8000   # of your context file that goes into each prompt
 PROMPT_MAX_CHARS = 20000   # of your prompt file (it goes on the claude command line)
 
@@ -395,6 +396,9 @@ def clock(ts: float) -> str:
 class State:
     def __init__(self) -> None:
         self.lock = threading.Lock()
+        # CONFIRM_AI: the meeting id the user turned AI on for, or "next" (armed at ai_next_at)
+        self.ai_for: int | str | None = None
+        self.ai_next_at = 0.0
         self.reset(None)
 
     def reset(self, meeting: dict | None) -> None:
@@ -417,10 +421,16 @@ class State:
         self.data_seen = 0
         self.last_warning = 0.0
         self.muted: set[str] = set()
-        self.ai_on = False                # the "Turn on AI" click (only matters with CONFIRM_AI)
 
-    def ai_allowed(self) -> bool:
-        return self.ai_on or not S.confirm_ai
+    def ai_allowed(self, meeting_id=None) -> bool:
+        """May the AI run for this meeting (default: the current one)? Always yes without CONFIRM_AI."""
+        if not S.confirm_ai:
+            return True
+        mid = meeting_id if meeting_id is not None else (self.meeting or {}).get("id")
+        return mid is not None and self.ai_for == mid
+
+    def ai_armed(self) -> bool:
+        return self.ai_for == "next" and now() - self.ai_next_at <= NEXT_MEETING_ARM_S
 
     def public(self) -> dict:
         with self.lock:
@@ -436,7 +446,8 @@ class State:
                 "data": self.data[-10:],
                 "data_enabled": S.data_enabled,
                 "confirm_ai": S.confirm_ai,
-                "ai_on": self.ai_allowed(),
+                "ai_on": self.meeting is not None and self.ai_allowed(),
+                "ai_next": S.confirm_ai and self.ai_armed(),
                 "warnings": self.warnings[-6:],
                 "metrics": self.metrics,
                 "lines": self.lines[-8:],
@@ -576,8 +587,14 @@ def run_claude(system_prompt: str, message: str, model: str, *, schema: dict | N
     cwd.mkdir(parents=True, exist_ok=True)
     # The message goes through stdin: --allowedTools, --mcp-config and --add-dir take several
     # values and would swallow the message if it were the last argument.
-    p = subprocess.run(cmd, input=message, capture_output=True, text=True, encoding="utf-8",
-                       timeout=AI_TIMEOUT_S, cwd=str(cwd))
+    try:
+        p = subprocess.run(cmd, input=message, capture_output=True, text=True, encoding="utf-8",
+                           timeout=AI_TIMEOUT_S, cwd=str(cwd))
+    except subprocess.TimeoutExpired as ex:
+        err = ex.stderr or b""
+        err = err.decode("utf-8", "replace") if isinstance(err, bytes) else err
+        raise RuntimeError(f"claude did not answer in {AI_TIMEOUT_S}s; its stderr: "
+                           f"{err.strip()[-500:] or '(empty)'}") from None
     if p.returncode != 0 and not p.stdout.strip():
         raise RuntimeError(f"claude exited {p.returncode}: {p.stderr.strip()[:300]}")
     return json.loads(p.stdout)
@@ -628,8 +645,19 @@ def fresh(items: list[str], shown: list[dict]) -> list[str]:
     return out[:2]
 
 
+def still_wanted(mid) -> bool:
+    """Called under E.lock when an AI answer comes back: drop it if AI was stopped or the meeting changed."""
+    if E.ai_allowed(mid) and (E.meeting or {}).get("id") == mid:
+        return True
+    print(f"{clock(now())} AI answer dropped (AI stopped or meeting changed)", flush=True)
+    return False
+
+
 def assist_round() -> None:
     with E.lock:
+        mid = (E.meeting or {}).get("id")
+        if not E.ai_allowed(mid):
+            return
         lines = list(E.lines)
         seen = E.assist_seen
         shown = [d["text"] for d in E.say[-15:] + E.ask[-15:]] + [c["quote"] for c in E.corrections[-10:]]
@@ -645,6 +673,8 @@ def assist_round() -> None:
         raise RuntimeError(f"no structured_output: {str(out.get('result'))[:200]}")
     ts = now()
     with E.lock:
+        if not still_wanted(mid):
+            return
         E.assist_seen = max((f["id"] for f in lines), default=seen)
         for t in fresh(r.get("say", []), E.say):
             E.say.append({"text": t, "ts": ts})
@@ -666,6 +696,9 @@ def is_empty(text: str) -> bool:
 
 def data_round() -> None:
     with E.lock:
+        mid = (E.meeting or {}).get("id")
+        if not E.ai_allowed(mid):
+            return
         lines = list(E.lines)
         seen = E.data_seen
         shown = [d["markdown"][:160] for d in E.data[-8:]]
@@ -682,6 +715,8 @@ def data_round() -> None:
         error("data: the AI used up its searches without answering")
     ts = now()
     with E.lock:
+        if not still_wanted(mid):
+            return
         E.data_seen = max((f["id"] for f in lines), default=seen)
         if not is_empty(text):
             E.data.append({"markdown": text, "ts": ts})
@@ -743,10 +778,10 @@ def loop(db: Path) -> None:
                         save_session()
                     with E.lock:
                         goal, goals = E.goal, [{**m, "covered": False} for m in E.goals]
-                        ai_on = E.ai_on and not current  # a click before the meeting counts for it
                         E.reset(live)
                         E.goal, E.goals = goal, goals  # keep what you typed before the meeting started
-                        E.ai_on = ai_on
+                        if E.ai_for == "next":   # a click before the meeting counts for it, if recent
+                            E.ai_for = live["id"] if E.ai_armed() else None
                         E.status = "live"
                     print(f"meeting {live['id']} '{live['title']}' started", flush=True)
                 elif not live and current:
@@ -754,7 +789,6 @@ def loop(db: Path) -> None:
                     with E.lock:
                         E.status = f"meeting {current['id']} ended · waiting for the next one"
                         E.meeting = None
-                        E.ai_on = False           # the next meeting asks again
                     print(f"meeting {current['id']} ended", flush=True)
                 if live:
                     lines = new_lines(con, live["id"], E.last_id)
@@ -832,7 +866,16 @@ class Page(BaseHTTPRequestHandler):
             elif self.path == "/mute":
                 E.muted.add(str(body.get("kind", "")))
             elif self.path == "/ai":
-                E.ai_on = body.get("on") is True
+                # {"on": true, "meeting": <id shown on the page> | null (= the next meeting)}
+                mid = body.get("meeting")
+                if body.get("on") is not True:
+                    E.ai_for = None
+                elif mid is None and E.meeting is None:
+                    E.ai_for, E.ai_next_at = "next", now()
+                elif isinstance(mid, int) and not isinstance(mid, bool) and E.meeting and mid == E.meeting["id"]:
+                    E.ai_for = mid
+                else:   # the page showed another meeting than the live one: let it refresh first
+                    return self._send(409, b"meeting changed", "text/plain")
             else:
                 return self._send(404, b"", "text/plain")
         self._send(200, b'{"ok":true}', "application/json")

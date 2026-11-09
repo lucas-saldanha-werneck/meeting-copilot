@@ -84,6 +84,7 @@ function list(id, items, render, emptyText = "nothing yet") {
 }
 
 let editing = false;
+let last = {}, aiMsg = "";
 async function refresh() {
   let e;
   try { e = await (await fetch("/state")).json(); }
@@ -91,11 +92,12 @@ async function refresh() {
   const st = document.getElementById("status");
   st.textContent = e.status; st.className = "pill" + (e.live ? " live" : "");
   document.getElementById("title").textContent = e.meeting ? e.meeting.title : "";
+  last = e;
   const ai = document.getElementById("ai");
   ai.style.display = e.confirm_ai ? "inline-block" : "none";
-  ai.className = e.ai_on ? "" : "ask";
-  ai.textContent = e.ai_on ? "AI on · stop" : (e.live ? "Turn on AI for this meeting" : "Turn on AI for the next meeting");
-  ai.dataset.on = e.ai_on ? "1" : "";
+  ai.className = e.ai_on || e.ai_next ? "" : "ask";
+  if (!aiMsg) ai.textContent = e.ai_on ? "AI on · stop" : e.ai_next ? "AI on for the next meeting · cancel"
+    : e.live ? "Turn on AI for this meeting" : "Turn on AI for the next meeting";
   const m = e.metrics || {};
   document.getElementById("metrics").innerHTML = m.minutes == null ? "" :
     `<span><b>${m.minutes}</b> min</span><span>you <b>${m.you_pct}%</b> (5 min: <b>${m.you_pct_5min}%</b>)</span>` +
@@ -125,8 +127,15 @@ async function refresh() {
 const post = (path, body) =>
   fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 
-document.getElementById("ai").onclick = async ev => {
-  await post("/ai", { on: !ev.target.dataset.on });
+document.getElementById("ai").onclick = async () => {
+  const body = { on: !(last.ai_on || last.ai_next), meeting: last.live && last.meeting ? last.meeting.id : null };
+  let ok = false;
+  try { ok = (await post("/ai", body)).ok; } catch {}
+  if (!ok) {
+    aiMsg = "did not work, try again";
+    document.getElementById("ai").textContent = aiMsg;
+    setTimeout(() => aiMsg = "", 2500);
+  }
   refresh();
 };
 document.getElementById("warnings").addEventListener("click", ev => {
