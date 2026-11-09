@@ -98,6 +98,7 @@ Every key:
 | `MEETING_COPILOT_CONTEXT_FILE` | empty | A text file about you that both AI calls read: your name and role, your projects, what your notes folders and MCP tools hold, words the transcript tends to get wrong. The first 8000 characters are used |
 | `MEETING_COPILOT_LANGUAGE` | empty (the meeting's language) | Language for every suggestion and fact, e.g. `Brazilian Portuguese` |
 | `MEETING_COPILOT_PROMPT_FILE` | empty (the built-in prompt) | A text file that replaces the built-in suggestions prompt. See [Your own prompt](#your-own-prompt) |
+| `MEETING_COPILOT_DATA_PROMPT_FILE` | empty (the built-in prompt) | A text file that replaces the built-in fact-search prompt. See [Your own prompt](#your-own-prompt) |
 | `MEETING_COPILOT_OPEN_CMD` | `open` (macOS) or `xdg-open` | Command that opens the page. The URL is passed as one argument wherever `{url}` is (no quotes around it), or at the end, e.g. `open -g -a "Firefox"` |
 | `MEETING_COPILOT_DATA_DIR`, `_LOG`, `_PYTHON` | `~/.local/share/meeting-copilot`, its `meeting-copilot.log`, `python3` | Data folder, log file and Python used by `meeting-copilot` (environment only for `_LOG` and `_PYTHON`) |
 
@@ -125,31 +126,43 @@ Only allow read-only MCP tools: the fact search runs during your meeting without
 
 ### Your own prompt
 
-`MEETING_COPILOT_PROMPT_FILE` names a text file whose text replaces the built-in suggestions prompt
-(`PROMPT_ASSIST` in `lib/copilot.py`, the call behind "Say this", "Ask this", corrections and goals).
-Start from a copy of that prompt. The fact-search prompt is not replaced.
+Two settings each name a text file that replaces one built-in prompt (start from a copy of it):
+
+- `MEETING_COPILOT_PROMPT_FILE`: the suggestions prompt (`PROMPT_ASSIST` in `lib/copilot.py`, the
+  call behind "Say this", "Ask this", corrections and goals).
+- `MEETING_COPILOT_DATA_PROMPT_FILE`: the fact-search prompt (`PROMPT_DATA`, the "Relevant facts"
+  call).
 
 Placeholders (written as is, with the braces):
 
-| Placeholder | Becomes |
-|---|---|
-| `{language}` | The language name from `MEETING_COPILOT_LANGUAGE` (e.g. `answer in {language}`), or `the language the meeting is using` when that is empty |
-| `{context}` | Your `MEETING_COPILOT_CONTEXT_FILE` text under a heading, or nothing when that is empty |
+| Placeholder | Prompt | Becomes |
+|---|---|---|
+| `{language}` | both | The language name from `MEETING_COPILOT_LANGUAGE` (e.g. `answer in {language}`), or `the language the meeting is using` when that is empty |
+| `{context}` | both | Your `MEETING_COPILOT_CONTEXT_FILE` text under a heading, or nothing when that is empty |
+| `{sources}` | fact search | The folders (`MEETING_COPILOT_SEARCH_DIRS`) and tools (`MEETING_COPILOT_MCP_TOOLS`) it may search, one line each |
 
-The built-in prompt has no placeholder in its text: it gets the language line ("Write every item in
-...") and the context block added at its end. Your file gets the same for any part it does not
-place. Other `{words}` stay as written. If the file is cut at the 20000-character limit, the cut
-never splits a placeholder.
+The built-in prompts get the language line ("Write every item in ...") and the context block added
+at their end. Your file gets the same for any part it does not place; a fact-search file that does
+not place `{sources}` gets "You can:" and that list at the end. Placeholders are filled in one pass,
+so a `{word}` inside your context text is never filled. Other `{words}` stay as written, and
+`{sources}` in the suggestions file is not a placeholder. If a file is cut at the 20000-character
+limit, the cut never splits a placeholder.
 
-What must stay: the reply always comes back as JSON with the fields `say`, `ask`, `corrections`
-and `goals_covered` (Claude Code's `--json-schema`), so your text cannot break the parser. But if it
-never asks for `say` and `ask`, those lists may stay empty. Name them in your text; at startup the
-log shows a `note:` line when a file never mentions `say` or `ask`, or uses a `{word}` that is not a
-placeholder. The word `EMPTY` belongs to the fact-search prompt, which this setting does not touch.
+What must stay:
 
-If the file is missing, unreadable, not UTF-8 or empty, the log shows one `note:` line (a separate
-one for a file that is not UTF-8) and the
-built-in prompt is used. Only the first 20000 characters are used (the prompt goes on the `claude`
+- Suggestions: the reply always comes back as JSON with the fields `say`, `ask`, `corrections` and
+  `goals_covered` (Claude Code's `--json-schema`), so your text cannot break the parser. But if it
+  never asks for `say` and `ask`, those lists may stay empty.
+- Fact search: the reply is free text. A reply that starts with `EMPTY` means "nothing found" and
+  shows nothing; anything else shows as a fact. Keep telling the AI to answer exactly `EMPTY` when
+  it has nothing, or every "I found nothing" shows up on the page.
+
+At startup the log shows a `note:` line when a suggestions file never mentions `say` or `ask`, when
+a fact-search file never contains the word `EMPTY` (in capitals), or when a file uses a `{word}` that
+is not one of its placeholders.
+
+If a file is missing, unreadable, not UTF-8 or empty, the log shows one `note:` line (a separate
+one for a file that is not UTF-8) and that call uses its built-in prompt. Only the first 20000 characters are used (the prompt goes on the `claude`
 command line).
 
 ## Optional requirements

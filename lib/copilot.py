@@ -35,7 +35,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 HERE = Path(__file__).resolve().parent
 PAGE = HERE / "page.html"
@@ -176,34 +176,10 @@ class Settings:
                 self.notices.append(f"context file is not UTF-8 text, ignored: {p}")
         self.language = g("LANGUAGE").strip()
 
-        # Optional: your own text in place of the built-in suggestions prompt (PROMPT_ASSIST).
-        # Missing, unreadable or empty: one note, and the built-in prompt.
-        self.prompt = ""
-        pf = g("PROMPT_FILE")
-        if pf:
-            p = Path(_expand(pf))
-            try:
-                text = p.read_text(encoding="utf-8-sig").strip()
-            except OSError as e:
-                self.notices.append(f"prompt file not found or unreadable, using the built-in prompt: {p} "
-                                    f"({e.__class__.__name__})")
-            except UnicodeDecodeError:
-                self.notices.append(f"prompt file is not UTF-8 text, using the built-in prompt: {p} "
-                                    "(save it as UTF-8)")
-            else:
-                if not text:
-                    self.notices.append(f"prompt file is empty, using the built-in prompt: {p}")
-                else:
-                    if len(text) > PROMPT_MAX_CHARS:
-                        self.notices.append(f"prompt file has {len(text)} characters; only the first "
-                                            f"{PROMPT_MAX_CHARS} are used: {p}")
-                        cut = PROMPT_MAX_CHARS
-                        brace = text.rfind("{", 0, cut)  # never cut a {placeholder} in half
-                        if brace != -1 and "}" not in text[brace:cut] and cut - brace <= max(map(len, PROMPT_PLACEHOLDERS)):
-                            cut = brace
-                        text = text[:cut]
-                    self.prompt = text
-                    self.notices.extend(check_prompt(text, p))
+        # Optional: your own text in place of the built-in prompts (PROMPT_ASSIST, PROMPT_DATA).
+        # Missing, unreadable, not UTF-8 or empty: one note, and the built-in prompt.
+        self.prompt = load_prompt_file(g("PROMPT_FILE"), "assist", self.notices)
+        self.data_prompt = load_prompt_file(g("DATA_PROMPT_FILE"), "data", self.notices)
 
         hosts = [h.strip() for h in g("EXTRA_HOSTS").split(",") if h.strip()]
         self.hosts_ok = {f"127.0.0.1:{self.port}", f"localhost:{self.port}", *hosts}
@@ -215,7 +191,6 @@ class Settings:
         return bool(self.search_dirs or self.mcp_config)
 
 
-S: Settings = Settings({})
 
 # ---------------------------------------------------------------- prompts
 
@@ -291,43 +266,92 @@ def context_text() -> str:
     return "## About the user (from their context file)\n" + S.context if S.context else ""
 
 
-# Placeholders a prompt file may use. The built-in prompts have none in their text: the language line and
-# the context block are added at their end. A prompt file may place them instead: {language} becomes the
-# language name (or "the language the meeting is using" when MEETING_COPILOT_LANGUAGE is empty), {context}
-# the context block (or nothing). A part the file does not place is added at the end, as for the built-in.
+# Placeholders a prompt file may use. The built-in prompts have none for language and context in their
+# text: the language line and the context block are added at their end. A prompt file may place them
+# instead: {language} becomes the language name (or "the language the meeting is using" when
+# MEETING_COPILOT_LANGUAGE is empty), {context} the context block (or nothing). The fact-search prompt also
+# has {sources}: the list of folders and tools it may search. A part the file does not place is added at
+# the end, as for the built-in.
 PROMPT_PLACEHOLDERS = ("{language}", "{context}")
+DATA_PROMPT_PLACEHOLDERS = ("{language}", "{context}", "{sources}")
+PLACEHOLDER_RE = re.compile(r"\{(language|context|sources)\}")
 
 
-def personalize(prompt: str) -> str:
-    """Add your language and context file (MEETING_COPILOT_LANGUAGE, MEETING_COPILOT_CONTEXT_FILE): in place
-    of {language} / {context} when the prompt has them, else at the end."""
+def personalize(prompt: str, sources: str | None = None) -> str:
+    """Add your language and context file (MEETING_COPILOT_LANGUAGE, MEETING_COPILOT_CONTEXT_FILE), and for
+    the fact search the sources: in place of {language} / {context} / {sources} when the prompt has them,
+    else at the end. One pass, so a placeholder inside your context text is never filled again."""
+    values = {"language": S.language or "the language the meeting is using", "context": context_text()}
+    if sources is not None:
+        values["sources"] = sources
     tail = []
-    if "{language}" in prompt:
-        prompt = prompt.replace("{language}", S.language or "the language the meeting is using")
-    elif S.language:
+    if sources and "{sources}" not in prompt:
+        tail.append("You can:\n" + sources)
+    if S.language and "{language}" not in prompt:
         tail.append(language_text())
-    if "{context}" in prompt:
-        prompt = prompt.replace("{context}", context_text())
-    elif S.context:
+    if S.context and "{context}" not in prompt:
         tail.append(context_text())
+    prompt = PLACEHOLDER_RE.sub(lambda m: values.get(m.group(1), m.group(0)), prompt)
     return prompt + "".join(f"\n{t}\n" for t in tail)
-# The suggestions call returns JSON in a fixed shape (--json-schema, SCHEMA_ASSIST), so a prompt file can't
-# break the parser. It can leave the lists empty if it never asks for them: these words must stay in it.
-PROMPT_REQUIRED_WORDS = ("say", "ask")
 
 
-def check_prompt(text: str, path) -> list[str]:
-    """Startup notes about a prompt file: output fields it never names, and {words} that are no placeholder."""
+# What each call's reply must keep so its parser works, per prompt kind:
+#  assist: JSON in a fixed shape (--json-schema, SCHEMA_ASSIST), so a prompt file can't break the parser. It
+#          can leave the lists empty if it never asks for them: say and ask must stay in it.
+#  data:   free text. A reply that starts with EMPTY means "nothing found" (is_empty); a prompt that never
+#          names that word makes the AI write "nothing found" in prose, and that prose shows as a fact.
+PROMPT_KINDS = {
+    "assist": {"name": "prompt file", "placeholders": PROMPT_PLACEHOLDERS, "words": ("say", "ask"), "case": re.I},
+    "data": {"name": "data prompt file", "placeholders": DATA_PROMPT_PLACEHOLDERS, "words": ("EMPTY",), "case": 0},
+}
+PROMPT_REQUIRED_WORDS = PROMPT_KINDS["assist"]["words"]
+
+
+def load_prompt_file(value: str, kind: str, notices: list[str]) -> str:
+    """Text of a prompt file setting, or "" (= the built-in prompt) with one note when it can't be used."""
+    if not value:
+        return ""
+    name, holders = PROMPT_KINDS[kind]["name"], PROMPT_KINDS[kind]["placeholders"]
+    p = Path(_expand(value))
+    try:
+        text = p.read_text(encoding="utf-8-sig").strip()
+    except OSError as e:
+        notices.append(f"{name} not found or unreadable, using the built-in prompt: {p} ({e.__class__.__name__})")
+        return ""
+    except UnicodeDecodeError:
+        notices.append(f"{name} is not UTF-8 text, using the built-in prompt: {p} (save it as UTF-8)")
+        return ""
+    if not text:
+        notices.append(f"{name} is empty, using the built-in prompt: {p}")
+        return ""
+    if len(text) > PROMPT_MAX_CHARS:
+        notices.append(f"{name} has {len(text)} characters; only the first {PROMPT_MAX_CHARS} are used: {p}")
+        cut = PROMPT_MAX_CHARS
+        brace = text.rfind("{", 0, cut)  # never cut a {placeholder} in half
+        if brace != -1 and "}" not in text[brace:cut] and cut - brace <= max(map(len, holders)):
+            cut = brace
+        text = text[:cut]
+    notices.extend(check_prompt(text, p, kind))
+    return text
+
+
+def check_prompt(text: str, path, kind: str = "assist") -> list[str]:
+    """Startup notes about a prompt file: words its reply's parser needs that it never names, and {words}
+    that are no placeholder."""
+    k = PROMPT_KINDS[kind]
     notes = []
-    missing = [w for w in PROMPT_REQUIRED_WORDS if not re.search(r"\b" + w + r"\b", text, re.I)]
-    if missing:
+    missing = [w for w in k["words"] if not re.search(r"\b" + w + r"\b", text, k["case"])]
+    if missing and kind == "assist":
         notes.append(f"prompt file {path} never names the output field(s) {', '.join(missing)}: the suggestions "
                      "come back in the fields say, ask, corrections, goals_covered; without asking for "
                      f"{' and '.join(missing)} that list may stay empty")
-    unknown = sorted(set(re.findall(r"\{[A-Za-z_]+\}", text)) - set(PROMPT_PLACEHOLDERS))
+    elif missing:
+        notes.append(f"data prompt file {path} never names the word EMPTY: a reply that starts with EMPTY is how "
+                     "the fact search says \"nothing found\"; without it, a no-result answer shows up as a fact")
+    unknown = sorted(set(re.findall(r"\{[A-Za-z_]+\}", text)) - set(k["placeholders"]))
     if unknown:
-        notes.append(f"prompt file {path}: {', '.join(unknown)} is not a placeholder and stays as written "
-                     f"(placeholders: {', '.join(PROMPT_PLACEHOLDERS)})")
+        notes.append(f"{k['name']} {path}: {', '.join(unknown)} is not a placeholder and stays as written "
+                     f"(placeholders: {', '.join(k['placeholders'])})")
     return notes
 
 
@@ -336,6 +360,8 @@ def assist_prompt() -> str:
 
 
 def data_prompt() -> str:
+    if S.data_prompt:
+        return personalize(S.data_prompt, sources=data_sources_text())
     return personalize(PROMPT_DATA.format(sources=data_sources_text()))
 
 
@@ -347,6 +373,8 @@ def data_sources_text() -> str:
     if S.mcp_tools:
         lines.append("- use these read-only tools: " + ", ".join(S.mcp_tools) + ".")
     return "\n".join(lines)
+
+S: Settings = Settings({})
 
 # ---------------------------------------------------------------- state
 

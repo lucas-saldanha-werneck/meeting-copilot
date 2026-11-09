@@ -48,6 +48,12 @@
 # Empty: the built-in prompt.
 #MEETING_COPILOT_PROMPT_FILE=
 
+# The same for the fact-search prompt (the "Relevant facts" call). Also takes
+# {sources}: the folders and tools it may search (added at the end if the file
+# does not place it). Keep the word EMPTY: a reply that starts with it means
+# "nothing found". Empty: the built-in prompt.
+#MEETING_COPILOT_DATA_PROMPT_FILE=
+
 # Command that opens the page. The URL goes in as one argument where {url} is,
 # or at the end, e.g. open -g -a "Firefox"; leave {url} without quotes around it.
 # Empty: open (macOS) or xdg-open.
