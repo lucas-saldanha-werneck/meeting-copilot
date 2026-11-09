@@ -824,6 +824,62 @@ class Live(unittest.TestCase):
         self.assertEqual([g["text"] for g in st["goals"]], ["a", "b"])
         self.assertEqual(st["status"], "live")  # setUp started a recording meeting
 
+    @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
+    def test_confirm_ai_waits_for_the_click_and_each_meeting_asks_again(self):
+        self.start(MEETING_COPILOT_CONFIRM_AI="1")
+        self.speak()
+        self.assertTrue(wait_for(lambda: len((self.state() or {}).get("lines", [])) == 8), self.log())
+        time.sleep(2)                                    # several rounds would have run by now
+        st = self.state()
+        self.assertTrue(st["confirm_ai"])
+        self.assertFalse(st["ai_on"])
+        self.assertEqual(self.claude_calls(), [])
+        self.assertEqual(st["say"], [])
+        self.assertTrue(st["metrics"])                   # transcript and metrics still work
+        self.assertEqual(self.post("/ai", {"on": True}, origin="https://evil.example"), 403)
+        self.assertEqual(self.post("/ai", {"on": "yes"}), 200)   # only a real true turns it on
+        self.assertFalse(self.state()["ai_on"])
+        self.assertEqual(self.post("/ai", {"on": True}), 200)
+        self.assertTrue(self.state()["ai_on"])
+        self.assertTrue(wait_for(lambda: (self.state() or {}).get("say")), self.log())
+        self.assertTrue(self.claude_calls())
+        # the meeting ends: the next one asks again
+        fake_meeting.end(copilot.Path(self.db))
+        self.assertTrue(wait_for(lambda: (lambda s: s and not s["live"])(self.state())), self.log())
+        self.assertFalse(self.state()["ai_on"])
+        con = sqlite3.connect(self.db)
+        con.execute("INSERT INTO meetings (title, start_time, meeting_status) VALUES (?, ?, 'recording')",
+                    (fake_meeting.TITLE, fake_meeting.now_iso()))
+        con.commit()
+        con.close()
+        self.assertTrue(wait_for(lambda: (self.state() or {}).get("live")), self.log())
+        self.assertFalse(self.state()["ai_on"])
+        n = len(self.claude_calls())
+        self.speak()
+        time.sleep(2)
+        self.assertEqual(len(self.claude_calls()), n)
+
+    @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
+    def test_confirm_ai_click_before_the_meeting_counts_for_it(self):
+        fake_meeting.end(copilot.Path(self.db))          # no meeting yet
+        self.start(MEETING_COPILOT_CONFIRM_AI="1")
+        self.assertEqual(self.post("/ai", {"on": True}), 200)
+        con = sqlite3.connect(self.db)
+        con.execute("INSERT INTO meetings (title, start_time, meeting_status) VALUES (?, ?, 'recording')",
+                    (fake_meeting.TITLE, fake_meeting.now_iso()))
+        con.commit()
+        con.close()
+        self.assertTrue(wait_for(lambda: (self.state() or {}).get("live")), self.log())
+        self.assertTrue(self.state()["ai_on"])
+        self.speak()
+        self.assertTrue(wait_for(lambda: (self.state() or {}).get("say")), self.log())
+
+    def test_without_confirm_ai_the_ai_is_on(self):
+        self.start(MEETING_COPILOT_CLAUDE=os.path.join(self.t, "no-claude"))
+        st = self.state()
+        self.assertFalse(st["confirm_ai"])
+        self.assertTrue(st["ai_on"])
+
     def test_meeting_end_saves_session(self):
         self.start(MEETING_COPILOT_CLAUDE=os.path.join(self.t, "no-claude"))
         self.speak()

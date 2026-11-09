@@ -35,7 +35,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 HERE = Path(__file__).resolve().parent
 PAGE = HERE / "page.html"
@@ -203,6 +203,9 @@ class Settings:
         self.data_dir = Path(_expand(g("DATA_DIR"))) if g("DATA_DIR") else default_data_dir()
         self.sessions_dir = Path(_expand(g("SESSIONS_DIR"))) if g("SESSIONS_DIR") else self.data_dir / "sessions"
         self.save_sessions = g("SAVE_SESSIONS", "1").strip().lower() not in ("0", "no", "false", "off")
+        # CONFIRM_AI=1: no AI call in a meeting until you click "Turn on AI" on the page
+        # (for a copilot that starts at login and should not spend AI on every recording).
+        self.confirm_ai = g("CONFIRM_AI", "0").strip().lower() in ("1", "yes", "true", "on")
         self.notices: list[str] = []
         claude = _expand(g("CLAUDE") or "claude")
         self.claude = claude if os.path.isfile(claude) else shutil.which(claude)
@@ -414,6 +417,10 @@ class State:
         self.data_seen = 0
         self.last_warning = 0.0
         self.muted: set[str] = set()
+        self.ai_on = False                # the "Turn on AI" click (only matters with CONFIRM_AI)
+
+    def ai_allowed(self) -> bool:
+        return self.ai_on or not S.confirm_ai
 
     def public(self) -> dict:
         with self.lock:
@@ -428,6 +435,8 @@ class State:
                 "corrections": self.corrections[-10:],
                 "data": self.data[-10:],
                 "data_enabled": S.data_enabled,
+                "confirm_ai": S.confirm_ai,
+                "ai_on": self.ai_allowed(),
                 "warnings": self.warnings[-6:],
                 "metrics": self.metrics,
                 "lines": self.lines[-8:],
@@ -734,8 +743,10 @@ def loop(db: Path) -> None:
                         save_session()
                     with E.lock:
                         goal, goals = E.goal, [{**m, "covered": False} for m in E.goals]
+                        ai_on = E.ai_on and not current  # a click before the meeting counts for it
                         E.reset(live)
                         E.goal, E.goals = goal, goals  # keep what you typed before the meeting started
+                        E.ai_on = ai_on
                         E.status = "live"
                     print(f"meeting {live['id']} '{live['title']}' started", flush=True)
                 elif not live and current:
@@ -743,6 +754,7 @@ def loop(db: Path) -> None:
                     with E.lock:
                         E.status = f"meeting {current['id']} ended · waiting for the next one"
                         E.meeting = None
+                        E.ai_on = False           # the next meeting asks again
                     print(f"meeting {current['id']} ended", flush=True)
                 if live:
                     lines = new_lines(con, live["id"], E.last_id)
@@ -763,7 +775,7 @@ def loop(db: Path) -> None:
                     E.warnings.append({**w, "ts": now()})
                     E.last_warning = now()
 
-            if S.claude and not q.busy:
+            if S.claude and E.ai_allowed() and not q.busy:
                 if E.last_id > E.assist_seen and now() - E.last_assist >= S.assist_s:
                     E.last_assist = now()
                     q.try_run(assist_round)
@@ -819,6 +831,8 @@ class Page(BaseHTTPRequestHandler):
                            for t in (str(x).strip() for x in body.get("goals", []) or []) if t][:12]
             elif self.path == "/mute":
                 E.muted.add(str(body.get("kind", "")))
+            elif self.path == "/ai":
+                E.ai_on = body.get("on") is True
             else:
                 return self._send(404, b"", "text/plain")
         self._send(200, b'{"ok":true}', "application/json")

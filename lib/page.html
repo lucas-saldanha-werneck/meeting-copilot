@@ -37,6 +37,8 @@
   .goal.ok { color: var(--data); text-decoration: line-through; }
   #lines { color: var(--dim); font-size: 12px; padding: 0 16px 8px; }
   .x { float: right; background: none; color: var(--dim); padding: 0 4px; }
+  #ai { display: none; }
+  #ai.ask { background: var(--say); color: var(--bg); font-weight: 600; }
 </style>
 </head>
 <body>
@@ -45,6 +47,7 @@
   <span id="status" class="pill">…</span>
   <span id="title" class="pill"></span>
   <div id="metrics"></div>
+  <button id="ai"></button>
 </header>
 
 <details id="ctx">
@@ -88,6 +91,11 @@ async function refresh() {
   const st = document.getElementById("status");
   st.textContent = e.status; st.className = "pill" + (e.live ? " live" : "");
   document.getElementById("title").textContent = e.meeting ? e.meeting.title : "";
+  const ai = document.getElementById("ai");
+  ai.style.display = e.confirm_ai ? "inline-block" : "none";
+  ai.className = e.ai_on ? "" : "ask";
+  ai.textContent = e.ai_on ? "AI on · stop" : (e.live ? "Turn on AI for this meeting" : "Turn on AI for the next meeting");
+  ai.dataset.on = e.ai_on ? "1" : "";
   const m = e.metrics || {};
   document.getElementById("metrics").innerHTML = m.minutes == null ? "" :
     `<span><b>${m.minutes}</b> min</span><span>you <b>${m.you_pct}%</b> (5 min: <b>${m.you_pct_5min}%</b>)</span>` +
@@ -117,6 +125,10 @@ async function refresh() {
 const post = (path, body) =>
   fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 
+document.getElementById("ai").onclick = async ev => {
+  await post("/ai", { on: !ev.target.dataset.on });
+  refresh();
+};
 document.getElementById("warnings").addEventListener("click", ev => {
   const b = ev.target.closest("button.x");
   if (b) post("/mute", { kind: b.dataset.kind });
