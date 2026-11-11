@@ -36,7 +36,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote
 
-__version__ = "0.7.0"
+__version__ = "0.7.1"
 
 HERE = Path(__file__).resolve().parent
 PAGE = HERE / "page.html"
@@ -992,6 +992,13 @@ def loop(db: Path) -> None:
                         E.status = "live"
                     print(f"meeting {live['id']} '{live['title']}' started", flush=True)
                 elif not live and current:
+                    # the last lines and the end can land in the same interval: read them before saving
+                    lines = new_lines(con, current["id"], E.last_id)
+                    if lines:
+                        with E.lock:
+                            E.lines.extend(lines)
+                            E.last_id = lines[-1]["id"]
+                            E.metrics = compute_metrics(E.lines)
                     save_session()
                     with E.lock:
                         E.status = f"meeting {current['id']} ended · waiting for the next one"
