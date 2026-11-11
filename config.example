@@ -17,6 +17,10 @@
 # Path to the Claude Code CLI. Default: `claude` on your PATH.
 #MEETING_COPILOT_CLAUDE=claude
 
+# Optional wrapper for the AI calls (monthly API credit first, subscription when the API refuses).
+# Used only when this command is installed (on PATH or in ~/.local/bin). `off` never uses it.
+#MEETING_COPILOT_API_CREDIT=claude-credito
+
 # Model for suggestions, and for the fact search. DATA_MODEL left commented out
 # follows MODEL; do not set it to an empty value.
 #MEETING_COPILOT_MODEL=sonnet

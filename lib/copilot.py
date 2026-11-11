@@ -36,7 +36,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 HERE = Path(__file__).resolve().parent
 PAGE = HERE / "page.html"
@@ -222,6 +222,19 @@ class Settings:
             self.muesli_wait_s = 600.0
         claude = _expand(g("CLAUDE") or "claude")
         self.claude = claude if os.path.isfile(claude) else shutil.which(claude)
+        # Optional: the claude-credito wrapper. When it is installed, AI calls go through it: the plan's
+        # monthly API credit first, and the same call again on the subscription when the API refuses.
+        # Not installed (the usual case): calls go straight to `claude`, on the subscription.
+        self.credit = None
+        credit = g("API_CREDIT", "claude-credito").strip()
+        if self.claude and credit.lower() not in ("0", "no", "false", "off"):
+            credit = _expand(credit)
+            local = os.path.join(os.path.expanduser("~"), ".local", "bin", credit)
+            if os.path.isfile(credit):
+                self.credit = credit
+            else:
+                self.credit = shutil.which(credit) or (
+                    local if os.sep not in credit and os.access(local, os.X_OK) else None)
 
         # Optional: folders the AI may search for facts (your notes, a wiki, a docs folder).
         self.search_dirs: list[Path] = []
@@ -580,8 +593,10 @@ def run_claude(system_prompt: str, message: str, model: str, *, schema: dict | N
                dirs: list[Path] | None = None, max_turns: int = 2) -> dict:
     if not S.claude:
         raise RuntimeError("claude command not found (install Claude Code or set MEETING_COPILOT_CLAUDE)")
+    # With the wrapper, it runs the same `claude` this tool would have run (CLAUDE_CREDITO_REAL).
+    env = {**os.environ, "CLAUDE_CREDITO_REAL": S.claude} if S.credit else None
     cmd = [
-        S.claude, "-p", "--model", model,
+        S.credit or S.claude, "-p", "--model", model,
         "--no-session-persistence", "--setting-sources", "project",
         "--output-format", "json", "--max-turns", str(max_turns),
         "--append-system-prompt", system_prompt,
@@ -604,7 +619,7 @@ def run_claude(system_prompt: str, message: str, model: str, *, schema: dict | N
     # values and would swallow the message if it were the last argument.
     try:
         p = subprocess.run(cmd, input=message, capture_output=True, text=True, encoding="utf-8",
-                           timeout=AI_TIMEOUT_S, cwd=str(cwd))
+                           timeout=AI_TIMEOUT_S, cwd=str(cwd), env=env)
     except subprocess.TimeoutExpired as ex:
         err = ex.stderr or b""
         err = err.decode("utf-8", "replace") if isinstance(err, bytes) else err

@@ -122,7 +122,8 @@ class Logic(unittest.TestCase):
                 f.write('#!/bin/sh\necho "API Error: overloaded, retrying in 30s" >&2\nexec sleep 10\n')
             os.chmod(slow, 0o755)
             old_s, old_t = getattr(copilot, "S", None), copilot.AI_TIMEOUT_S
-            copilot.S = copilot.Settings({"MEETING_COPILOT_CLAUDE": slow, "MEETING_COPILOT_DATA_DIR": d})
+            copilot.S = copilot.Settings({"MEETING_COPILOT_CLAUDE": slow, "MEETING_COPILOT_DATA_DIR": d,
+                                          "MEETING_COPILOT_API_CREDIT": "off"})
             copilot.AI_TIMEOUT_S = 1
             try:
                 with self.assertRaises(RuntimeError) as cm:
@@ -191,6 +192,51 @@ class Config(unittest.TestCase):
         self.assertEqual(s.search_dirs, [copilot.Path(notes).resolve()])
         self.assertTrue(s.data_enabled)
         self.assertNotIn("OTHER", cfg)
+
+    def test_api_credit_wrapper_is_optional(self):
+        claude = os.path.join(self.t, "claude")
+        wrapper = os.path.join(self.t, "my-wrapper")
+        for f in (claude, wrapper):
+            with open(f, "w") as fh:
+                fh.write("#!/bin/sh\n")
+            os.chmod(f, 0o755)
+        base = {"MEETING_COPILOT_CLAUDE": claude}
+        on = copilot.Settings(dict(base, MEETING_COPILOT_API_CREDIT=wrapper))
+        self.assertEqual((on.claude, on.credit), (claude, wrapper))
+        for value in ("off", "0", "no", os.path.join(self.t, "not-installed"), "no-such-wrapper-on-path"):
+            with self.subTest(value=value):
+                self.assertIsNone(copilot.Settings(dict(base, MEETING_COPILOT_API_CREDIT=value)).credit)
+        # no claude: nothing for the wrapper to run
+        none = copilot.Settings({"MEETING_COPILOT_CLAUDE": os.path.join(self.t, "no-claude"),
+                                 "MEETING_COPILOT_API_CREDIT": wrapper})
+        self.assertIsNone(none.credit)
+
+    @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
+    def test_api_credit_wrapper_runs_the_configured_claude(self):
+        claude = os.path.join(self.t, "claude")
+        wrapper = os.path.join(self.t, "my-wrapper")
+        seen = os.path.join(self.t, "seen")
+        with open(claude, "w") as f:
+            f.write('#!/bin/sh\ncat > /dev/null\necho \'{"result": "from claude"}\'\n')
+        with open(wrapper, "w") as f:   # like claude-credito: same arguments, runs $CLAUDE_CREDITO_REAL
+            f.write(f'#!/bin/sh\necho "$CLAUDE_CREDITO_REAL $1" > "{seen}"\nexec "$CLAUDE_CREDITO_REAL" "$@"\n')
+        for f in (claude, wrapper):
+            os.chmod(f, 0o755)
+        old = getattr(copilot, "S", None)
+        try:
+            for credit, expect_seen in ((wrapper, True), ("off", False)):
+                with self.subTest(credit=credit):
+                    if os.path.exists(seen):
+                        os.remove(seen)
+                    copilot.S = copilot.Settings({"MEETING_COPILOT_CLAUDE": claude, "MEETING_COPILOT_DATA_DIR": self.t,
+                                                  "MEETING_COPILOT_API_CREDIT": credit})
+                    self.assertEqual(copilot.run_claude("p", "m", "sonnet"), {"result": "from claude"})
+                    self.assertEqual(os.path.exists(seen), expect_seen)
+                    if expect_seen:
+                        with open(seen) as fh:
+                            self.assertEqual(fh.read().strip(), f"{claude} -p")
+        finally:
+            copilot.S = old
 
     def test_optional_sources_missing_or_incomplete(self):
         mcp = os.path.join(self.t, "mcp.json")
@@ -649,6 +695,7 @@ class Live(unittest.TestCase):
                         PATH=self.fakebin + os.pathsep + self.env.get("PATH", ""),
                         FAKE_CLAUDE_LOG=self.claude_log,
                         MEETING_COPILOT_CONFIG=os.path.join(t, "no-config"),
+                        MEETING_COPILOT_API_CREDIT="off",   # never an API-credit wrapper installed on this machine
                         MEETING_COPILOT_DB=self.db, MEETING_COPILOT_PORT=str(self.port),
                         MEETING_COPILOT_SESSIONS_DIR=self.sessions,
                         MEETING_COPILOT_POLL_S="0.2", MEETING_COPILOT_ASSIST_S="0.5",
