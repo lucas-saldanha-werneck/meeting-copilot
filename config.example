@@ -18,6 +18,7 @@
 #MEETING_COPILOT_CLAUDE=claude
 
 # Optional wrapper for the AI calls (monthly API credit first, subscription when the API refuses).
+# It comes from https://github.com/lucas-saldanha-werneck/api-credit
 # Used only when this command is installed (on PATH or in ~/.local/bin). `off` never uses it.
 #MEETING_COPILOT_API_CREDIT=claude-credito
 

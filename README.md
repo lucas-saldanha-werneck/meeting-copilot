@@ -88,7 +88,7 @@ Every key:
 | `MEETING_COPILOT_DB` | `~/Library/Application Support/Muesli/muesli.db` | Muesli database (opened read-only) |
 | `MEETING_COPILOT_PORT` | `4390` | Local port; the server listens on 127.0.0.1 only |
 | `MEETING_COPILOT_CLAUDE` | `claude` on PATH | Path to the Claude Code CLI |
-| `MEETING_COPILOT_API_CREDIT` | `claude-credito` | Optional wrapper for the AI calls. When this command is installed (on PATH or in `~/.local/bin`), calls go through it: your plan's monthly API credit first, and the same call again on the subscription when the API refuses. Not installed: nothing changes. `off` never uses it |
+| `MEETING_COPILOT_API_CREDIT` | `claude-credito` | Optional wrapper for the AI calls ([api-credit](https://github.com/lucas-saldanha-werneck/api-credit)). When this command is installed (on PATH or in `~/.local/bin`), calls go through it: your plan's monthly API credit first, and the same call again on the subscription when the API refuses. Not installed: nothing changes. `off` never uses it |
 | `MEETING_COPILOT_MODEL` | `sonnet` | Model for suggestions (`MEETING_COPILOT_DATA_MODEL` for fact search) |
 | `MEETING_COPILOT_SEARCH_DIRS` | empty | Folders the AI may search for facts, separated by `:` |
 | `MEETING_COPILOT_MCP_CONFIG` | empty | An MCP config file (`{"mcpServers": {...}}`) for fact search |
