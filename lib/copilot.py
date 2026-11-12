@@ -150,6 +150,7 @@ DEVICES_FILE = "devices.json"
 # the middle of a meeting (`meeting-copilot stop`, a config change, launchd) gives them back.
 CONTEXT_FILE = "context.json"
 CONTEXT_KEEP_S = 6 * 3600   # an older file is from another day: ignored
+CONTEXT_ON = False          # set by main(): code imported by the tests never writes the real file
 DEVICE_MAX_AGE_S = 365 * 24 * 3600
 DEVICES_MAX = 50            # the oldest paired device is dropped beyond this
 _CODE_OK = re.compile(r"^[0-9]{6}$")
@@ -824,8 +825,7 @@ E = State()
 
 def save_context() -> None:
     """Writes the objective, the goals and the AI click to <data_dir>/context.json. Call with E.lock held."""
-    path = getattr(S, "data_dir", None)
-    if path is None:
+    if not CONTEXT_ON:
         return
     mid = (E.meeting or {}).get("id")
     if mid is not None:
@@ -833,9 +833,11 @@ def save_context() -> None:
     data = {"saved": now(), "meeting": E.ctx_meeting, "goal": E.goal, "goals": E.goals,
             "ai_for": E.ai_for, "ai_next_at": E.ai_next_at}
     try:
-        _write_private(Path(path) / CONTEXT_FILE, json.dumps(data, ensure_ascii=False))
-    except Exception as ex:   # never lose a click over a full disk
-        error(f"saving the page context: {ex}")
+        _write_private(Path(S.data_dir) / CONTEXT_FILE, json.dumps(data, ensure_ascii=False))
+    except Exception as ex:   # never lose a click over a full disk; not error(): E.lock is already held
+        line = f"{clock(now())} saving the page context: {ex}"
+        print(line, flush=True)
+        E.errors.append(line)
 
 
 def load_context() -> None:
@@ -1989,7 +1991,9 @@ def main(argv=None) -> None:
     S = Settings(cfg)
     S.token = load_token(S.data_dir)
     DEVICES.path = S.data_dir / DEVICES_FILE
+    global CONTEXT_ON
     load_context()
+    CONTEXT_ON = True
     if not S.db.exists():
         raise SystemExit(f"Muesli database not found: {S.db}\n"
                          "Install and run Muesli, or point MEETING_COPILOT_DB / --db at its muesli.db.")

@@ -1940,6 +1940,25 @@ class Live(unittest.TestCase):
         self.assertTrue(wait_for(lambda: (self.state() or {}).get("live")), self.log())
         self.assertFalse(self.state()["ai_on"])
 
+    def test_context_save_that_fails_does_not_lock_up(self):
+        # save_context runs with E.lock held: a failed write must not take the lock again (it hung CI)
+        old = (copilot.CONTEXT_ON, copilot.S, copilot.E)
+        try:
+            copilot.S = copilot.Settings({"MEETING_COPILOT_DATA_DIR": os.path.join(self.t, "missing", "dir")})
+            copilot.E = copilot.State()
+            copilot.CONTEXT_ON = True
+            done = threading.Event()
+
+            def go():
+                with copilot.E.lock:
+                    copilot.save_context()
+                done.set()
+            threading.Thread(target=go, daemon=True).start()
+            self.assertTrue(done.wait(5), "save_context locked up")
+            self.assertTrue(any("saving the page context" in e for e in copilot.E.errors))
+        finally:
+            copilot.CONTEXT_ON, copilot.S, copilot.E = old
+
     def test_old_or_broken_context_file_is_ignored(self):
         d = os.path.join(self.t, "data", "meeting-copilot")
         os.makedirs(d, exist_ok=True)
