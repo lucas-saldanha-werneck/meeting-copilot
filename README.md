@@ -20,7 +20,7 @@ The AI runs through `claude -p` (Claude Code), so it uses your Claude Code login
 
 ```
 $ meeting-copilot
-meeting-copilot on http://127.0.0.1:4390/?token=3q2-…  - start a meeting in Muesli
+meeting-copilot on http://127.0.0.1:4390/ - start a meeting in Muesli
 ```
 
 Output from a simulated meeting (invented conversation about renewing a cleaning contract, with a notes file that says the increase is 12%):
@@ -50,12 +50,25 @@ cd meeting-copilot
 ```
 meeting-copilot             start (if needed) and open the page in your default browser
 meeting-copilot --no-open   start and only print the URL
-meeting-copilot status      say whether it runs, with every page URL (local, LAN, extra hosts)
+meeting-copilot status      say whether it runs, with every page URL (local, LAN, extra hosts) and the pairing code
+meeting-copilot code        show a pairing code to log in another browser or device
+meeting-copilot devices     list the browsers logged in with a code (`devices forget` logs them all out)
 meeting-copilot log
 meeting-copilot stop        stop it (the session is saved)
 ```
 
-The page needs a token. `meeting-copilot` opens and prints the URL with it (`…/?token=…`), and `meeting-copilot status` prints it again at any time; the first visit stores it in a cookie and drops it from the address bar, so later visits to `http://127.0.0.1:4390` just work. On another browser or device (for example through `MEETING_COPILOT_EXTRA_HOSTS`), open the printed URL once, with the host swapped. The token is made on first start in your data folder (`~/.local/share/meeting-copilot/token`, or under `$XDG_DATA_HOME` or `MEETING_COPILOT_DATA_DIR` when set; readable only by you) and stays the same across restarts; `python3 lib/copilot.py --token` prints it, and deleting the file makes a new one at the next start. A script can send it as `Authorization: Bearer <token>`:
+### Logging in
+
+The page is private. `meeting-copilot` logs the Mac's own browser in by itself when it opens the page. Any other browser (another browser on the Mac, your phone, a tablet) shows a login page the first time:
+
+1. Open the page on that device (for example `http://copilot.local`, or your tunnel's address).
+2. It asks: "Type the 6-digit code shown on the Mac".
+3. The code shows on the Mac as a notification. It is also in `meeting-copilot status` and `meeting-copilot code`, and behind the "Pair a device" button on a page that is already logged in.
+4. Type it. That browser stays logged in for a year.
+
+A code is valid for 5 minutes and works once. There is one code at a time: every login page opened in those 5 minutes gets the same code, and the Mac shows the notification once (the login page has a button to show it again). After 5 wrong tries the code is thrown away; after 10 wrong tries in a minute, from anywhere, every try waits until the minute is over. Each logged-in browser gets its own cookie (`HttpOnly`, `SameSite=Strict`, `Secure` behind https), kept on the Mac only as a hash in `devices.json` in your data folder. `meeting-copilot devices` lists them and `meeting-copilot devices forget` logs them all out at once.
+
+The URLs that `meeting-copilot` and `meeting-copilot status` print have no password in them. Under the code there is still a random token, made on first start in your data folder (`~/.local/share/meeting-copilot/token`, or under `$XDG_DATA_HOME` or `MEETING_COPILOT_DATA_DIR` when set; readable only by you). It stays the same across restarts; `python3 lib/copilot.py --token` prints it, and deleting the file makes a new one at the next start. The launcher uses it to open the Mac's browser with a one-time link (valid 60 seconds, once). An old `…/?token=…` link still works, and a script can send the token as `Authorization: Bearer <token>`:
 
 ```
 curl -s -H "Authorization: Bearer $(cat ~/.local/share/meeting-copilot/token)" http://127.0.0.1:4390/state
@@ -65,8 +78,8 @@ curl -s -H "Authorization: Bearer $(cat ~/.local/share/meeting-copilot/token)" h
 
 Two optional ways, both off by default:
 
-- **Home network** (`MEETING_COPILOT_LAN=1`): a second listener on `0.0.0.0` port 80, published as `http://copilot.local` with macOS `dns-sd` (the name follows the Mac's address when it changes). It answers only private addresses (`10/8`, `172.16/12`, `192.168/16`, `169.254/16`, `fc00::/7`, `fe80::/10` and loopback); anything else gets `403` before the token is even looked at. The token rules are the same: open the `LAN:` URL that `meeting-copilot status` prints once on each device. Devices that do not resolve `.local` names can use the `LAN IP:` URL. This is plain http: anyone on the same Wi-Fi who can watch its traffic can see the token, so use it only on a network you trust.
-- **Internet, through a tunnel** (`MEETING_COPILOT_EXTRA_HOSTS=<your host>`): point a tunnel (e.g. Cloudflare Tunnel, with Cloudflare Access in front) at `http://127.0.0.1:4390` and add its host name. The page then accepts that `Host` and the `https://<host>` origin; when the tunnel says the visit came over https (`X-Forwarded-Proto` or `Cf-Visitor`), the token cookie is also marked `Secure`. `meeting-copilot status` prints it as `public: https://<host>/?token=…`.
+- **Home network** (`MEETING_COPILOT_LAN=1`): a second listener on `0.0.0.0` port 80, published as `http://copilot.local` with macOS `dns-sd` (the name follows the Mac's address when it changes). It answers only private addresses (`10/8`, `172.16/12`, `192.168/16`, `169.254/16`, `fc00::/7`, `fe80::/10` and loopback); anything else gets `403` before the login is even looked at. Open the `LAN:` URL that `meeting-copilot status` prints on each device and type the code once. Devices that do not resolve `.local` names can use the `LAN IP:` URL. This is plain http: anyone on the same Wi-Fi who can watch its traffic can see the code and the cookie, so use it only on a network you trust.
+- **Internet, through a tunnel** (`MEETING_COPILOT_EXTRA_HOSTS=<your host>`): point a tunnel (e.g. Cloudflare Tunnel, with Cloudflare Access in front) at `http://127.0.0.1:4390` and add its host name. The page then accepts that `Host` and the `https://<host>` origin; when the tunnel says the visit came over https (`X-Forwarded-Proto` or `Cf-Visitor`), the cookies are also marked `Secure`. `meeting-copilot status` prints it as `public: https://<host>/`; the first visit from each device asks for the code.
 
 For example, in your settings file:
 
@@ -126,6 +139,7 @@ Every key:
 | `MEETING_COPILOT_LAN_NAME` | `copilot` | Published as `<name>.local` (macOS `dns-sd`); `off`: not published |
 | `MEETING_COPILOT_LAN_IP` | empty (found by itself, checked every 30 s) | A fixed LAN address to publish instead |
 | `MEETING_COPILOT_DNS_SD` | `dns-sd` on macOS | The `dns-sd` command; elsewhere no name is published |
+| `MEETING_COPILOT_OSASCRIPT` | `osascript` on macOS | The command that shows the pairing code as a notification; `off`: no notification (the code is still in `meeting-copilot status`) |
 | `MEETING_COPILOT_CONFIRM_AI` | `0` | `1`: no AI call in a meeting until you click "Turn on AI" on the page; each meeting asks again. Useful when the copilot starts at login and should not spend AI on every recording |
 | `MEETING_COPILOT_ASSIST_S`, `_DATA_S`, `_POLL_S` | `25`, `45`, `5` | Intervals in seconds |
 | `MEETING_COPILOT_CONTEXT_FILE` | empty | A text file about you that both AI calls read: your name and role, your projects, what your notes folders and MCP tools hold, words the transcript tends to get wrong. The first 8000 characters are used |
@@ -215,7 +229,7 @@ With neither search folders nor MCP, the "Relevant facts" panel says fact search
 - The transcript of the last 3 minutes, your goals and the items already shown are sent to Claude through `claude -p` on each call. Nothing else leaves the machine.
 - Sessions (full transcript plus suggestions) are saved as JSON files readable only by your user. A meeting saved again (the copilot restarted, or the meeting stopped and recorded again) gets a new file with `-2`, `-3`, and so on, so nothing earlier is overwritten.
 - The fact search may read files only inside the search folders: Read, Grep and Glob are allowed with a path rule for each folder, so a request in the meeting to open any other file is refused. The AI runs in an empty folder of its own and loads no Claude Code settings files, so no hook planted in a search folder runs with it.
-- The page answers only on 127.0.0.1 / localhost (plus any `MEETING_COPILOT_EXTRA_HOSTS`, and, with `MEETING_COPILOT_LAN=1`, private addresses on the home network, where POSTs must come from the page's own `http://<host>` origin), checks the `Host` header against DNS rebinding, and accepts POSTs only from its own origin. Every request (the page, `/state` and each POST) needs the token: a `?token=` in the URL, the `HttpOnly`, `SameSite=Strict` cookie it sets, or an `Authorization: Bearer` header; anything else gets `401`. The token file is readable only by your user, so other users' programs and web pages cannot read the meeting; a program running as you can still read the file.
+- The page answers only on 127.0.0.1 / localhost (plus any `MEETING_COPILOT_EXTRA_HOSTS`, and, with `MEETING_COPILOT_LAN=1`, private addresses on the home network, where POSTs must come from the page's own `http://<host>` origin), checks the `Host` header against DNS rebinding, and accepts POSTs only from its own origin. Every request (the page, `/state` and each POST) needs a login: the cookie of a browser that typed a pairing code, the token cookie (set by the launcher's one-time link or a `?token=` URL), or the token as an `Authorization: Bearer` header; anything else gets `401` (a browser gets the login page). The code is never shown to a browser that is not logged in, not even on the Mac itself: only the notification, `meeting-copilot status`/`code` and a logged-in page show it. The login POST passes the same `Host` and origin checks as every POST, and the code is compared in constant time. The token file and `devices.json` are readable only by your user, so other users' programs and web pages cannot read the meeting; a program running as you can still read the files.
 
 ## Uninstall
 

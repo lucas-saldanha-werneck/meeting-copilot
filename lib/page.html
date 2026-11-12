@@ -48,6 +48,7 @@
   <span id="title" class="pill"></span>
   <div id="metrics"></div>
   <button id="ai"></button>
+  <button id="pair" title="Show a code to log in another browser or device">Pair a device</button>
 </header>
 
 <details id="ctx">
@@ -89,10 +90,7 @@ async function refresh() {
   let e;
   try {
     const r = await fetch("/state");
-    if (r.status === 401) {
-      document.getElementById("status").textContent = "token needed: open the URL that meeting-copilot prints";
-      return;
-    }
+    if (r.status === 401) { location.reload(); return; }   // logged out: the login page asks for a code
     e = await r.json();
   }
   catch { document.getElementById("status").textContent = "copilot stopped"; return; }
@@ -144,6 +142,14 @@ document.getElementById("ai").onclick = async () => {
     setTimeout(() => aiMsg = "", 2500);
   }
   refresh();
+};
+document.getElementById("pair").onclick = async () => {
+  const b = document.getElementById("pair");
+  try {
+    const e = await (await post("/pair", {})).json();
+    b.textContent = `Code: ${e.code} (valid ${Math.ceil(e.expires_in / 60)} min)`;
+  } catch { b.textContent = "did not work, try again"; }
+  setTimeout(() => b.textContent = "Pair a device", 60000);
 };
 document.getElementById("warnings").addEventListener("click", ev => {
   const b = ev.target.closest("button.x");

@@ -983,6 +983,353 @@ class Lan(unittest.TestCase):
         self.assertEqual(s.dns_sd, "/x/dns-sd")
 
 
+def fake_osascript(folder) -> tuple[str, str]:
+    """A fake osascript: appends its arguments, joined by |, to a file."""
+    log = os.path.join(folder, "osascript.log")
+    path = os.path.join(folder, "osascript")
+    with open(path, "w") as f:
+        f.write(f'#!/bin/sh\nIFS="|"; echo "$*" >> "{log}"\n')
+    os.chmod(path, 0o755)
+    return path, log
+
+
+def read_lines(path) -> list[str]:
+    try:
+        with open(path, encoding="utf-8") as f:
+            return [x.rstrip("\n") for x in f if x.strip()]
+    except OSError:
+        return []
+
+
+class Clock:
+    def __init__(self):
+        self.t = 1_000_000.0
+
+    def __call__(self):
+        return self.t
+
+
+class PairingCode(unittest.TestCase):
+    """The 6-digit pairing code login: login page, code rules, device cookies, the one-time launcher link."""
+
+    TOK = "t" * 40
+    HOST = "127.0.0.1:4390"
+    ORIGIN = "http://127.0.0.1:4390"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.t = os.path.realpath(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        for name in ("S", "PAIR", "DEVICES", "notify"):
+            self.addCleanup(setattr, copilot, name, getattr(copilot, name))
+        self.use({})
+        self.clock = Clock()
+        copilot.PAIR = copilot.Pairing(clock=self.clock)
+        copilot.DEVICES = copilot.Devices(copilot.Path(self.t) / "devices.json")
+        self.notified = []
+        copilot.notify = self.notified.append          # the macOS notification, mocked
+
+    def use(self, cfg):
+        copilot.S = copilot.Settings(cfg)
+        copilot.S.token = self.TOK
+
+    def serve(self, lan=False, client_ip=None):
+        return Lan.serve(self, lan, client_ip)
+
+    def req(self, port, path, headers=None, method="GET", body=None, host=None):
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+        try:
+            c.request(method, path, body=body, headers={"Host": host or self.HOST, **(headers or {})})
+            r = c.getresponse()
+            return r.status, r.headers, r.read()
+        finally:
+            c.close()
+
+    def login(self, port, code, origin=None, host=None, extra=None):
+        h = {"Content-Type": "application/json", "Origin": origin or self.ORIGIN, **(extra or {})}
+        code_, hdrs, body = self.req(port, "/login", h, "POST", json.dumps({"code": code}).encode(), host)
+        try:
+            return code_, hdrs, json.loads(body)
+        except ValueError:
+            return code_, hdrs, body
+
+    def browse(self, port, path="/", host=None):
+        return self.req(port, path, {"Accept": "text/html,application/xhtml+xml", "Sec-Fetch-Mode": "navigate"},
+                        host=host)
+
+    @staticmethod
+    def device_cookie(hdrs):
+        m = re.match(r"meeting_copilot_device=([^;]+)", hdrs["Set-Cookie"] or "")
+        return m.group(1) if m else None
+
+    def test_browser_without_cookie_gets_the_login_page_and_the_mac_the_code(self):
+        port = self.serve()
+        code, hdrs, body = self.browse(port)
+        self.assertEqual(code, 401)
+        self.assertTrue(hdrs["Content-Type"].startswith("text/html"))
+        self.assertIn(b"Type the 6-digit code shown on the Mac", body)
+        self.assertIn("frame-ancestors 'none'", hdrs["Content-Security-Policy"])
+        self.assertNotIn(self.TOK.encode(), body)
+        self.assertEqual(len(self.notified), 1)
+        self.assertRegex(self.notified[0], r"^[0-9]{6}$")
+        self.assertNotIn(self.notified[0].encode(), body)       # the code is never on the login page
+        # another view (another tab, another device) gets the same code and no second notification
+        self.browse(port, "/state")
+        self.assertEqual(len(self.notified), 1)
+        self.assertEqual(copilot.PAIR.current()[0], self.notified[0])
+        # API calls and scripts keep the short 401 text, never the login page
+        for path in ("/", "/state"):
+            code, hdrs, body = self.req(port, path)
+            self.assertEqual(code, 401)
+            self.assertTrue(hdrs["Content-Type"].startswith("text/plain"))
+            self.assertIn(b"token", body)
+        o = {"Content-Type": "application/json", "Origin": self.ORIGIN}
+        self.assertEqual(self.req(port, "/mute", o, "POST", b'{"kind":"x"}')[0], 401)
+        self.assertEqual(self.req(port, "/pair", o, "POST", b"{}")[0], 401)
+        self.assertEqual(self.req(port, "/pair")[0], 401)
+
+    def test_right_code_gives_a_device_cookie_once(self):
+        port = self.serve()
+        self.browse(port)
+        right = self.notified[0]
+        code, hdrs, body = self.login(port, right)
+        self.assertEqual((code, body), (200, {"ok": True}))
+        cookie = hdrs["Set-Cookie"]
+        for part in ("HttpOnly", "SameSite=Strict", "Path=/", "Max-Age=31536000"):
+            self.assertIn(part, cookie)
+        self.assertNotIn("Secure", cookie)                      # plain http on 127.0.0.1
+        self.assertNotIn(self.TOK, cookie)                      # its own secret, not the page token
+        dev = self.device_cookie(hdrs)
+        self.assertGreaterEqual(len(dev), 40)
+        # the device cookie opens the page and the API
+        c = {"Cookie": f"meeting_copilot_device={dev}"}
+        self.assertEqual(self.req(port, "/", c)[0], 200)
+        self.assertEqual(self.req(port, "/state", c)[0], 200)
+        self.assertEqual(self.req(port, "/mute", {**c, "Content-Type": "application/json", "Origin": self.ORIGIN},
+                                  "POST", b'{"kind":"x"}')[0], 200)
+        self.assertEqual(self.req(port, "/state", {"Cookie": "meeting_copilot_device=wrong"})[0], 401)
+        self.assertEqual(self.req(port, "/state", {"Authorization": f"Bearer {dev}"})[0], 401)  # not a token
+        # single use: the same code again is refused
+        self.assertEqual(self.login(port, right)[0], 410)
+        # the file has only a hash of the cookie, readable only by you
+        path = os.path.join(self.t, "devices.json")
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        self.assertNotIn(dev, text)
+        self.assertIn(hashlib.sha256(dev.encode()).hexdigest(), text)
+        if not WIN:
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        # `devices forget` logs every device out of the running copilot
+        self.assertEqual(copilot.Devices(copilot.Path(path)).forget_all(), 1)
+        self.assertEqual(self.req(port, "/state", c)[0], 401)
+
+    def test_expired_code_is_refused(self):
+        port = self.serve()
+        self.browse(port)
+        right = self.notified[0]
+        self.clock.t += copilot.CODE_TTL_S + 1
+        code, _, body = self.login(port, right)
+        self.assertEqual(code, 410)
+        self.assertIn("expired", body["error"])
+        self.assertIsNone(copilot.PAIR.current())
+        self.browse(port)                                        # a new view: a new code, a new notification
+        self.assertEqual(len(self.notified), 2)
+
+    def test_wrong_codes_use_up_the_code(self):
+        port = self.serve()
+        self.browse(port)
+        right = self.notified[0]
+        wrong = f"{(int(right) + 1) % 10 ** 6:06d}"
+        for left in (4, 3, 2, 1):
+            code, _, body = self.login(port, wrong)
+            self.assertEqual((code, body["left"]), (401, left))
+        code, _, body = self.login(port, "12ab")                 # the 5th wrong try ends the code
+        self.assertEqual(code, 429)
+        self.assertIn("new code", body["error"])
+        self.assertEqual(self.login(port, right)[0], 410)        # even the right one, now
+        self.assertIsNone(copilot.PAIR.current())
+
+    def test_global_limit_per_minute(self):
+        port = self.serve()
+        for _ in range(2):                                       # two codes, 5 wrong tries each
+            self.browse(port)
+            right = self.notified[-1]
+            for _ in range(5):
+                self.login(port, f"{(int(right) + 1) % 10 ** 6:06d}")
+        self.browse(port)
+        right = self.notified[-1]
+        self.assertEqual(len(self.notified), 3)
+        code, hdrs, body = self.login(port, right)               # 10 wrong in a minute: even the right code waits
+        self.assertEqual(code, 429)
+        self.assertGreaterEqual(int(hdrs["Retry-After"]), 1)
+        self.assertEqual(copilot.PAIR.current()[0], right)       # the limit does not burn the code
+        self.clock.t += 61
+        self.assertEqual(self.login(port, right)[0], 200)
+
+    def test_code_compare_is_constant_time(self):
+        calls = []
+        real = copilot.hmac.compare_digest
+
+        def spy(a, b):
+            calls.append((a, b))
+            return real(a, b)
+
+        p = copilot.Pairing(clock=self.clock)
+        code, _, _ = p.get_or_create()
+        copilot.hmac.compare_digest = spy
+        try:
+            self.assertEqual(p.try_code("000000" if code != "000000" else "111111")[0], "wrong")
+            self.assertEqual(p.try_code(code)[0], "ok")
+        finally:
+            copilot.hmac.compare_digest = real
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1], (code.encode(), code.encode()))
+
+    def test_one_active_code_and_codes_are_random(self):
+        p = copilot.Pairing(clock=self.clock)
+        a, left, made = p.get_or_create()
+        self.assertEqual((left, made), (300, True))
+        self.clock.t += 100
+        self.assertEqual(p.get_or_create(), (a, 200, False))      # reused while valid
+        self.assertEqual(p.current(), (a, 200))
+        codes = {copilot.Pairing().get_or_create()[0] for _ in range(200)}
+        self.assertGreater(len(codes), 150)
+        self.assertTrue(all(re.match(r"^[0-9]{6}$", c) for c in codes))
+
+    def test_login_post_passes_the_origin_and_host_checks(self):
+        port = self.serve()
+        self.browse(port)
+        right = self.notified[0]
+        self.assertEqual(self.login(port, right, origin="https://evil.example")[0], 403)
+        self.assertEqual(self.login(port, right, host="evil.example:4390")[0], 403)
+        code, _, body = self.req(port, "/login", {"Origin": self.ORIGIN, "Content-Type": "text/plain"}, "POST",
+                                 json.dumps({"code": right}).encode())
+        self.assertEqual((code, body), (403, b"origin"))
+        self.assertEqual(self.req(port, "/login/code", {"Origin": "https://evil.example",
+                                                        "Content-Type": "application/json"}, "POST", b"{}")[0], 403)
+        self.assertEqual(copilot.PAIR.current()[0], right)       # refused tries never touch the code
+        self.assertEqual(self.login(port, right)[0], 200)
+
+    def test_lan_and_tunnel_logins(self):
+        # the LAN listener: Origin must be the page itself; a public client never reaches the code
+        self.use({"MEETING_COPILOT_LAN": "1", "MEETING_COPILOT_LAN_PORT": "8080"})
+        port = self.serve(lan=True, client_ip="192.168.1.20")
+        self.browse(port, host="copilot.local:8080")
+        right = self.notified[-1]
+        self.assertEqual(self.login(port, right, origin="http://evil.example", host="copilot.local:8080")[0], 403)
+        code, hdrs, _ = self.login(port, right, origin="http://copilot.local:8080", host="copilot.local:8080")
+        self.assertEqual(code, 200)
+        self.assertNotIn("Secure", hdrs["Set-Cookie"])
+        pub = self.serve(lan=True, client_ip="203.0.113.5")
+        self.assertEqual(self.browse(pub, host="copilot.local:8080")[:3:2], (403, b"network"))
+        # behind an https tunnel: the device cookie is Secure
+        self.use({"MEETING_COPILOT_EXTRA_HOSTS": "copilot.example.com"})
+        port = self.serve()
+        self.browse(port, host="copilot.example.com")
+        right = self.notified[-1]
+        code, hdrs, _ = self.login(port, right, origin="https://copilot.example.com", host="copilot.example.com",
+                                   extra={"X-Forwarded-Proto": "https"})
+        self.assertEqual(code, 200)
+        self.assertIn("; Secure", hdrs["Set-Cookie"])
+
+    def test_send_the_code_again_never_returns_it(self):
+        port = self.serve()
+        o = {"Content-Type": "application/json", "Origin": self.ORIGIN}
+        code, _, body = self.req(port, "/login/code", o, "POST", b"{}")
+        self.assertEqual((code, json.loads(body)), (200, {"ok": True}))
+        self.assertEqual(len(self.notified), 1)                  # no code yet: one made and shown
+        self.req(port, "/login/code", o, "POST", b"{}")
+        self.assertEqual(len(self.notified), 1)                  # again at once: not shown again (spam)
+        self.clock.t += copilot.NOTIFY_EVERY_S
+        self.req(port, "/login/code", o, "POST", b"{}")
+        self.assertEqual(self.notified, [self.notified[0]] * 2)  # later: the same code shown again
+
+    def test_bearer_token_and_token_url_still_work(self):
+        port = self.serve()
+        self.assertEqual(self.req(port, "/state", {"Authorization": f"Bearer {self.TOK}"})[0], 200)
+        code, hdrs, _ = self.req(port, f"/?token={self.TOK}")
+        self.assertEqual((code, hdrs["Location"]), (303, "/"))
+        self.assertIn(f"meeting_copilot_token={self.TOK}", hdrs["Set-Cookie"])
+        # a browser with a wrong ?token= gets the login page, not a dead end
+        code, hdrs, body = self.browse(port, "/?token=wrong")
+        self.assertEqual(code, 401)
+        self.assertIn(b"6-digit code", body)
+
+    def test_pair_endpoint_for_logged_in_pages(self):
+        port = self.serve()
+        auth = {"Authorization": f"Bearer {self.TOK}"}
+        self.assertEqual(json.loads(self.req(port, "/pair", auth)[2]), {"code": None, "expires_in": 0})
+        o = {**auth, "Content-Type": "application/json", "Origin": self.ORIGIN}
+        got = json.loads(self.req(port, "/pair", o, "POST", b"{}")[2])
+        self.assertRegex(got["code"], r"^[0-9]{6}$")
+        self.assertEqual(got["expires_in"], 300)
+        self.assertEqual(self.notified, [])                      # the person asking already sees it
+        self.assertEqual(json.loads(self.req(port, "/pair", auth)[2])["code"], got["code"])
+        self.assertEqual(self.login(port, got["code"])[0], 200)
+
+    def test_one_time_login_link_for_the_mac_browser(self):
+        port = self.serve()
+        auth = {"Authorization": f"Bearer {self.TOK}"}
+        link = json.loads(self.req(port, "/login-link", auth)[2])["path"]
+        self.assertRegex(link, r"^/\?once=[\w-]{20,}$")
+        self.assertNotIn(self.TOK, link)
+        code, hdrs, _ = self.req(port, link)
+        self.assertEqual((code, hdrs["Location"]), (303, "/"))
+        self.assertIn(f"meeting_copilot_token={self.TOK}", hdrs["Set-Cookie"])
+        self.assertEqual(self.req(port, link)[0], 401)           # single use
+        link = json.loads(self.req(port, "/login-link", auth)[2])["path"]
+        self.clock.t += copilot.LOGIN_LINK_TTL_S + 1
+        self.assertEqual(self.req(port, link)[0], 401)           # expired
+        # only the token itself may make one: not a paired device, not a browser with no login
+        dev = copilot.DEVICES.add("test")
+        self.assertEqual(self.req(port, "/login-link", {"Cookie": f"meeting_copilot_device={dev}"})[0], 403)
+        self.assertEqual(self.req(port, "/login-link")[0], 401)
+
+    def test_devices_file_rules(self):
+        path = copilot.Path(self.t) / "d.json"
+        d = copilot.Devices(path)
+        self.assertFalse(d.ok("x"))
+        self.assertFalse(d.ok(""))
+        secrets_ = [d.add(f"dev {i}") for i in range(copilot.DEVICES_MAX + 3)]
+        self.assertEqual(len(d.list()), copilot.DEVICES_MAX)     # the oldest are dropped
+        self.assertFalse(d.ok(secrets_[0]))
+        self.assertTrue(d.ok(secrets_[-1]))
+        path.write_text("not json")                              # a broken file logs everyone out, no crash
+        self.assertFalse(d.ok(secrets_[-1]))
+        s = d.add("new")
+        with open(path, encoding="utf-8") as f:
+            items = json.load(f)["devices"]
+        items[0]["created"] -= copilot.DEVICE_MAX_AGE_S + 10     # a year old: expired
+        copilot._write_private(path, json.dumps({"devices": items}))
+        self.assertFalse(d.ok(s))
+        self.assertFalse(copilot.Devices(None).ok(s))
+        # a label from a User-Agent never carries terminal escapes; a bad id in the file is skipped
+        d.add("evil \x1b]0;title\x07 \u00e9")
+        copilot._write_private(path, json.dumps({"devices": d.list() + [{"id": "\u00e9" * 64, "created": 1e12}]}))
+        self.assertEqual([x["label"] for x in d.list()], ["evil ?]0;title? ?"])
+        self.assertFalse(d.ok("x"))
+
+    @unittest.skipIf(WIN, NO_BASH_WHY)
+    def test_notification_runs_osascript_with_the_code_as_an_argument(self):
+        exe, log = fake_osascript(self.t)
+        copilot.notify = PairingCode.real_notify
+        self.use({"MEETING_COPILOT_OSASCRIPT": exe})
+        copilot.notify("123456")
+        lines = wait_for(lambda: read_lines(log), 10)
+        self.assertEqual(lines, ["-e|on run argv|-e|display notification (item 2 of argv) with title (item 1 of argv)"
+                                 "|-e|end run|Meeting Copilot|Code to open the page: 123456 (valid 5 minutes)"])
+        self.use({"MEETING_COPILOT_OSASCRIPT": "off"})
+        self.assertIsNone(copilot.S.osascript)
+        copilot.notify("654321")                                 # off: nothing runs
+        time.sleep(0.5)
+        self.assertEqual(len(read_lines(log)), 1)
+        if sys.platform != "darwin":
+            self.assertIsNone(copilot.Settings({}).osascript)    # a no-op off macOS
+
+
+PairingCode.real_notify = staticmethod(copilot.notify)
+
+
 class Seed(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1136,7 +1483,8 @@ class Live(unittest.TestCase):
                         MEETING_COPILOT_DB=self.db, MEETING_COPILOT_PORT=str(self.port),
                         MEETING_COPILOT_SESSIONS_DIR=self.sessions,
                         MEETING_COPILOT_POLL_S="0.2", MEETING_COPILOT_ASSIST_S="0.5",
-                        MEETING_COPILOT_DATA_S="0.5", PYTHONIOENCODING="utf-8")
+                        MEETING_COPILOT_DATA_S="0.5", PYTHONIOENCODING="utf-8",
+                        MEETING_COPILOT_OSASCRIPT="off")   # never a real notification on the test machine
         self.proc = None
         self.out = os.path.join(t, "copilot.log")
         fake_meeting.prepare(copilot.Path(self.db))
@@ -1675,7 +2023,8 @@ class Tools(unittest.TestCase):
         self.home = os.path.join(self.t, "home")
         os.makedirs(self.home)
         self.env = {k: v for k, v in os.environ.items() if not k.startswith(("MEETING_COPILOT", "CLAUDE"))}
-        self.env.update(HOME=self.home, USERPROFILE=self.home, XDG_DATA_HOME=os.path.join(self.t, "data"))
+        self.env.update(HOME=self.home, USERPROFILE=self.home, XDG_DATA_HOME=os.path.join(self.t, "data"),
+                        MEETING_COPILOT_OSASCRIPT="off")   # never a real notification on the test machine
 
     def tearDown(self):
         for _ in range(50):
@@ -1817,10 +2166,13 @@ class Tools(unittest.TestCase):
             p = subprocess.run(["bash", link, "--no-open"], env=env, capture_output=True, text=True, timeout=30)
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
             tok = self.token()
-            self.assertIn(f"http://127.0.0.1:{port}/?token={tok}", p.stdout)   # printed with the token
+            self.assertIn(f"meeting-copilot on http://127.0.0.1:{port}/ - ", p.stdout)   # a clean URL
+            self.assertNotIn(tok, p.stdout + p.stderr)
+            self.assertNotIn("token", p.stdout)
             p = subprocess.run(["bash", link, "status"], env=env, capture_output=True, text=True)
             self.assertEqual(p.returncode, 0, p.stdout)
-            self.assertIn(f"http://127.0.0.1:{port}/?token={tok}", p.stdout)
+            self.assertIn(f"on http://127.0.0.1:{port}/\n", p.stdout)
+            self.assertNotIn(tok, p.stdout + p.stderr)
             req = urllib.request.Request(f"http://127.0.0.1:{port}/state",
                                          headers={"Authorization": f"Bearer {tok}"})
             with urllib.request.urlopen(req, timeout=3) as r:
@@ -1847,13 +2199,16 @@ class Tools(unittest.TestCase):
             p = subprocess.run(["bash", launcher, "--no-open"], env=env, capture_output=True, text=True, timeout=30)
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
             tok = self.token()
-            self.assertIn(f"http://copilot.local:{lan}/?token={tok}", p.stdout)
+            self.assertIn(f"  LAN:    http://copilot.local:{lan}/\n", p.stdout)
+            self.assertNotIn(tok, p.stdout + p.stderr)
             p = subprocess.run(["bash", launcher, "status"], env=env, capture_output=True, text=True)
             self.assertEqual(p.returncode, 0, p.stdout)
-            self.assertIn(f"http://127.0.0.1:{port}/?token={tok}", p.stdout)
-            self.assertIn(f"http://copilot.local:{lan}/?token={tok}", p.stdout)
-            self.assertIn(f"http://192.168.50.7:{lan}/?token={tok}", p.stdout)
-            self.assertIn(f"https://copilot.example.com/?token={tok}", p.stdout)
+            self.assertIn(f"on http://127.0.0.1:{port}/\n", p.stdout)
+            self.assertIn(f"  LAN:    http://copilot.local:{lan}/\n", p.stdout)
+            self.assertIn(f"  LAN IP: http://192.168.50.7:{lan}/\n", p.stdout)
+            self.assertIn("  public: https://copilot.example.com/\n", p.stdout)
+            self.assertNotIn(tok, p.stdout + p.stderr)
+            self.assertNotIn("token", p.stdout)
             calls = wait_for(lambda: dns_sd_calls(log), 10)
             self.assertEqual(calls[0][1], f"-P copilot _http._tcp local {lan} copilot.local 192.168.50.7")
             child = calls[0][0]
@@ -1886,9 +2241,84 @@ class Tools(unittest.TestCase):
             p = subprocess.run(["bash", launcher, "status"], env=env, capture_output=True, text=True)
             self.assertEqual(p.stdout.strip().splitlines(),
                              [f"running (pid {p.stdout.split('pid ')[1].split(')')[0]}) on "
-                              f"http://127.0.0.1:{port}/?token={self.token()}"])
+                              f"http://127.0.0.1:{port}/",
+                              "  code:   none now (open the page on the other device, or run `meeting-copilot code`)",
+                              "  paired devices: 0"])
         finally:
             subprocess.run(["bash", launcher, "stop"], env=env, capture_output=True, text=True, timeout=30)
+
+    @unittest.skipIf(WIN, NO_BASH_WHY)
+    def test_launcher_pairing_code_status_devices_and_one_time_link(self):
+        launcher = os.path.join(ROOT, "bin", "meeting-copilot")
+        port = free_port()
+        exe, notes = fake_osascript(self.t)
+        opened = os.path.join(self.t, "opened.txt")
+        opener = os.path.join(self.t, "my-browser")
+        with open(opener, "w") as f:
+            f.write('#!/bin/sh\nprintf "%s" "$1" > "$OPENED"\n')
+        os.chmod(opener, 0o755)
+        env = dict(self.launcher_env(port), MEETING_COPILOT_OSASCRIPT=exe, MEETING_COPILOT_OPEN_CMD=opener,
+                   OPENED=opened)
+
+        def run(*args):
+            return subprocess.run(["bash", launcher, *args], env=env, capture_output=True, text=True, timeout=30)
+
+        def get(path, headers=None, method="GET", body=None):
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+            try:
+                c.request(method, path, body=body, headers=headers or {})
+                r = c.getresponse()
+                return r.status, r.headers, r.read()
+            finally:
+                c.close()
+
+        try:
+            p = run()
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            tok = self.token()
+            self.assertNotIn(tok, p.stdout + p.stderr)
+            # the launcher opened a one-time link: it logs this browser in once, then is dead
+            with open(opened) as f:
+                link = f.read()
+            self.assertRegex(link, rf"^http://127\.0\.0\.1:{port}/\?once=[\w-]{{20,}}$")
+            code, hdrs, _ = get(link.split(str(port), 1)[1])
+            self.assertEqual((code, hdrs["Location"]), (303, "/"))
+            self.assertIn(f"meeting_copilot_token={tok}", hdrs["Set-Cookie"])
+            self.assertEqual(get(link.split(str(port), 1)[1])[0], 401)
+            # a phone opens the page: login page, and the code shows on the Mac and in `status`
+            code, _, body = get("/", {"Accept": "text/html"})
+            self.assertEqual(code, 401)
+            self.assertIn(b"6-digit code", body)
+            got = wait_for(lambda: read_lines(notes), 10)
+            pair = re.search(r"Code to open the page: ([0-9]{6})", got[0]).group(1)
+            p = run("status")
+            self.assertIn(f"  code:   {pair}  (pairing code, valid 5 min more)", p.stdout)
+            self.assertIn("  paired devices: 0", p.stdout)
+            self.assertNotIn(tok, p.stdout + p.stderr)
+            # `code` prints the same active code
+            p = run("code")
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertIn(f"pairing code: {pair}", p.stdout)
+            # the phone types it
+            o = {"Content-Type": "application/json", "Origin": f"http://127.0.0.1:{port}"}
+            code, hdrs, _ = get("/login", o, "POST", json.dumps({"code": pair}).encode())
+            self.assertEqual(code, 200)
+            dev = re.match(r"meeting_copilot_device=([^;]+)", hdrs["Set-Cookie"]).group(1)
+            self.assertEqual(get("/state", {"Cookie": f"meeting_copilot_device={dev}"})[0], 200)
+            p = run("status")
+            self.assertIn("  code:   none now", p.stdout)
+            self.assertIn("  paired devices: 1", p.stdout)
+            p = run("devices")
+            self.assertIn("1 paired device(s)", p.stdout)
+            self.assertIn("via 127.0.0.1", p.stdout)
+            p = run("devices", "forget")
+            self.assertIn("1 paired device(s) logged out", p.stdout)
+            self.assertEqual(get("/state", {"Cookie": f"meeting_copilot_device={dev}"})[0], 401)
+            self.assertEqual(get("/state", {"Authorization": f"Bearer {tok}"})[0], 200)   # scripts unchanged
+        finally:
+            run("stop")
+        p = run("code")
+        self.assertEqual(p.returncode, 1)
 
     @unittest.skipIf(WIN, NO_BASH_WHY)
     def test_launcher_port_from_config_file_and_open_cmd(self):
@@ -1913,14 +2343,14 @@ class Tools(unittest.TestCase):
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
             self.assertIn(f"http://127.0.0.1:{port}", p.stdout)        # the port came from the file
             with open(opened) as f:
-                self.assertEqual(f.read(), f"--new-tab|http://127.0.0.1:{port}/?token={self.token()}|--bg|")
+                self.assertRegex(f.read(), rf"^--new-tab\|http://127\.0\.0\.1:{port}/\?once=[\w-]{{20,}}\|--bg\|$")
             # without {url}, the URL goes at the end (a later line wins)
             with open(cfg_file, "a") as f:
                 f.write(f"MEETING_COPILOT_OPEN_CMD={opener} -x\n")
             p = subprocess.run(["bash", launcher], env=env, capture_output=True, text=True, timeout=30)
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
             with open(opened) as f:
-                self.assertEqual(f.read(), f"-x|http://127.0.0.1:{port}/?token={self.token()}|")
+                self.assertRegex(f.read(), rf"^-x\|http://127\.0\.0\.1:{port}/\?once=[\w-]{{20,}}\|$")
         finally:
             subprocess.run(["bash", launcher, "stop"], env=env, capture_output=True, text=True, timeout=30)
 
@@ -1945,10 +2375,12 @@ class Tools(unittest.TestCase):
             p = subprocess.run(["bash", launcher], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                stdin=subprocess.DEVNULL, text=True, timeout=20)
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-            url = f"http://127.0.0.1:{port}/?token={self.token()}"
             wait_for(lambda: os.path.exists(opened) and os.path.getsize(opened) > 0, timeout=5)
             with open(opened) as f:
-                self.assertEqual(f.read(), f"{url}|--again|{url}|")      # every {url} is the URL
+                got = f.read()
+            url = got.split("|")[0]
+            self.assertRegex(url, rf"^http://127\.0\.0\.1:{port}/\?once=[\w-]{{20,}}$")
+            self.assertEqual(got, f"{url}|--again|{url}|")      # every {url} is the URL
         finally:
             subprocess.run(["bash", launcher, "stop"], env=env, capture_output=True, text=True, timeout=30)
             subprocess.run(["pkill", "-f", opener], capture_output=True)
@@ -1968,7 +2400,8 @@ class Tools(unittest.TestCase):
             p = subprocess.run(["bash", launcher], env=env, capture_output=True, text=True, timeout=30)
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
             self.assertIn("MEETING_COPILOT_OPEN_CMD failed", p.stderr)
-            self.assertIn(f"open http://127.0.0.1:{port}/?token={self.token()} in your browser", p.stdout)
+            self.assertIn(f"open http://127.0.0.1:{port}/ in your browser", p.stdout)
+            self.assertNotIn(self.token(), p.stdout + p.stderr)
         finally:
             subprocess.run(["bash", launcher, "stop"], env=env, capture_output=True, text=True, timeout=30)
 
