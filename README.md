@@ -140,7 +140,7 @@ Every key:
 | `MEETING_COPILOT_LAN_IP` | empty (found by itself, checked every 30 s) | A fixed LAN address to publish instead |
 | `MEETING_COPILOT_DNS_SD` | `dns-sd` on macOS | The `dns-sd` command; elsewhere no name is published |
 | `MEETING_COPILOT_OSASCRIPT` | `osascript` on macOS | The command that shows the pairing code as a notification; `off`: no notification (the code is still in `meeting-copilot status`) |
-| `MEETING_COPILOT_CONFIRM_AI` | `0` | `1`: no AI call in a meeting until you click "Turn on AI" on the page; each meeting asks again. Useful when the copilot starts at login and should not spend AI on every recording |
+| `MEETING_COPILOT_CONFIRM_AI` | `0` | `1`: no AI call in a meeting until you click "Turn on AI" on the page; each meeting asks again. Useful when the copilot starts at login and should not spend AI on every recording. The click, the objective and the goals are kept in `context.json` in your data folder (only your user can read it), so a restart during a meeting gives them back; a file older than 6 hours is ignored |
 | `MEETING_COPILOT_ASSIST_S`, `_DATA_S`, `_POLL_S` | `25`, `45`, `5` | Intervals in seconds |
 | `MEETING_COPILOT_CONTEXT_FILE` | empty | A text file about you that both AI calls read: your name and role, your projects, what your notes folders and MCP tools hold, words the transcript tends to get wrong. The first 8000 characters are used |
 | `MEETING_COPILOT_LANGUAGE` | empty (the meeting's language) | Language for every suggestion and fact, e.g. `Brazilian Portuguese` |

@@ -44,7 +44,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
-__version__ = "0.9.0"
+__version__ = "0.9.1"
 
 HERE = Path(__file__).resolve().parent
 PAGE = HERE / "page.html"
@@ -146,6 +146,11 @@ LOGIN_LINK_TTL_S = 60       # the launcher's one-time link for the Mac's own bro
 NOTIFY_EVERY_S = 20         # "send the code again" shows the notification at most this often
 DEVICE_COOKIE = "meeting_copilot_device"
 DEVICES_FILE = "devices.json"
+# What you typed in the page (objective, goals) and the "Turn on AI" click, kept on disk so a restart in
+# the middle of a meeting (`meeting-copilot stop`, a config change, launchd) gives them back.
+CONTEXT_FILE = "context.json"
+CONTEXT_KEEP_S = 6 * 3600   # an older file is from another day: ignored
+CONTEXT_ON = False          # set by main(): code imported by the tests never writes the real file
 DEVICE_MAX_AGE_S = 365 * 24 * 3600
 DEVICES_MAX = 50            # the oldest paired device is dropped beyond this
 _CODE_OK = re.compile(r"^[0-9]{6}$")
@@ -754,6 +759,7 @@ class State:
         # CONFIRM_AI: the meeting id the user turned AI on for, or "next" (armed at ai_next_at)
         self.ai_for: int | str | None = None
         self.ai_next_at = 0.0
+        self.ctx_meeting: int | None = None   # the meeting the goals were last saved for
         self.reset(None)
 
     def reset(self, meeting: dict | None) -> None:
@@ -815,6 +821,46 @@ class State:
 
 
 E = State()
+
+
+def save_context() -> None:
+    """Writes the objective, the goals and the AI click to <data_dir>/context.json. Call with E.lock held."""
+    if not CONTEXT_ON:
+        return
+    mid = (E.meeting or {}).get("id")
+    if mid is not None:
+        E.ctx_meeting = mid
+    data = {"saved": now(), "meeting": E.ctx_meeting, "goal": E.goal, "goals": E.goals,
+            "ai_for": E.ai_for, "ai_next_at": E.ai_next_at}
+    try:
+        _write_private(Path(S.data_dir) / CONTEXT_FILE, json.dumps(data, ensure_ascii=False))
+    except Exception as ex:   # never lose a click over a full disk; not error(): E.lock is already held
+        line = f"{clock(now())} saving the page context: {ex}"
+        print(line, flush=True)
+        E.errors.append(line)
+
+
+def load_context() -> None:
+    """Gives back what save_context wrote, if it is recent. A bad or old file is ignored."""
+    try:
+        d = json.loads((Path(S.data_dir) / CONTEXT_FILE).read_text(encoding="utf-8"))
+        if not isinstance(d, dict) or not now() - float(d.get("saved", 0)) <= CONTEXT_KEEP_S:
+            return
+        mid = d.get("meeting")
+        mid = mid if isinstance(mid, int) and not isinstance(mid, bool) else None
+        goals = [{"text": str(g["text"])[:500], "covered": g.get("covered") is True}
+                 for g in d.get("goals") or [] if isinstance(g, dict) and str(g.get("text", "")).strip()][:12]
+        ai_for = d.get("ai_for")
+        if not (ai_for == "next" or (isinstance(ai_for, int) and not isinstance(ai_for, bool))):
+            ai_for = None
+        with E.lock:
+            E.goal = str(d.get("goal") or "")[:2000]
+            E.goals = goals
+            E.ctx_meeting = mid
+            E.ai_for = ai_for
+            E.ai_next_at = float(d.get("ai_next_at") or 0)
+    except (OSError, ValueError, TypeError, KeyError):
+        return
 STARTUP_ERRORS: list[str] = []   # setup problems: shown on the page for the whole run
 
 
@@ -1056,6 +1102,8 @@ def assist_round() -> None:
         for m in E.goals:
             if m["text"] in covered:
                 m["covered"] = True
+        if covered:
+            save_context()
     print(f"{clock(ts)} assist ok in {ts - t0:.1f}s", flush=True)
 
 
@@ -1361,12 +1409,14 @@ def loop(db: Path) -> None:
                     if current:
                         save_session()
                     with E.lock:
-                        goal, goals = E.goal, [{**m, "covered": False} for m in E.goals]
+                        same = E.ctx_meeting == live["id"]   # the same meeting again (a restart, a pause)
+                        goal, goals = E.goal, [{**m, "covered": same and m["covered"]} for m in E.goals]
                         E.reset(live)
                         E.goal, E.goals = goal, goals  # keep what you typed before the meeting started
                         if E.ai_for == "next":   # a click before the meeting counts for it, if recent
                             E.ai_for = live["id"] if E.ai_armed() else None
                         E.status = "live"
+                        save_context()
                     print(f"meeting {live['id']} '{live['title']}' started", flush=True)
                 elif not live and current:
                     save_session()
@@ -1740,6 +1790,7 @@ class Page(BaseHTTPRequestHandler):
                 old = {m["text"]: m["covered"] for m in E.goals}
                 E.goals = [{"text": t, "covered": old.get(t, False)}
                            for t in (str(x).strip() for x in body.get("goals", []) or []) if t][:12]
+                save_context()
             elif path == "/mute":
                 E.muted.add(str(body.get("kind", "")))
             elif path == "/ai":
@@ -1753,6 +1804,7 @@ class Page(BaseHTTPRequestHandler):
                     E.ai_for = mid
                 else:   # the page showed another meeting than the live one: let it refresh first
                     return self._send(409, b"meeting changed", "text/plain")
+                save_context()
             else:
                 return self._send(404, b"", "text/plain")
         self._send(200, b'{"ok":true}', "application/json")
@@ -1939,6 +1991,9 @@ def main(argv=None) -> None:
     S = Settings(cfg)
     S.token = load_token(S.data_dir)
     DEVICES.path = S.data_dir / DEVICES_FILE
+    global CONTEXT_ON
+    load_context()
+    CONTEXT_ON = True
     if not S.db.exists():
         raise SystemExit(f"Muesli database not found: {S.db}\n"
                          "Install and run Muesli, or point MEETING_COPILOT_DB / --db at its muesli.db.")
