@@ -24,6 +24,7 @@ import http.client
 import ipaddress
 import json
 import os
+import queue
 import re
 import secrets
 import shutil
@@ -44,7 +45,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
-__version__ = "0.9.1"
+__version__ = "0.9.2"
 
 HERE = Path(__file__).resolve().parent
 PAGE = HERE / "page.html"
@@ -54,7 +55,11 @@ STARTER = HERE.parent / "config.example"   # copied to your config path on first
 COOLDOWN_WARNING_S = 120   # between any two warnings
 REPEAT_WARNING_S = 300     # before the same kind of warning shows again
 WINDOW_S = 180             # how much of the conversation the AI sees
-AI_TIMEOUT_S = 120
+AI_TIMEOUT_S = 30          # one spawned `claude -p` suggestions call (start-up under load took up to 12 s)
+DATA_TIMEOUT_S = 40        # one fact search with tools (usually 10-15 s); it has its own queue
+ROTATE_TOKENS = 40000      # the kept-open suggestions process starts fresh past this context size
+ROTATE_TURNS = 150         # ... or after this many rounds
+SEED_KEEP_S = WINDOW_S     # a fresh process is seeded with this much of the transcript
 NEXT_MEETING_ARM_S = 30 * 60   # a "Turn on AI for the next meeting" click expires after this
 CONTEXT_MAX_CHARS = 8000   # of your context file that goes into each prompt
 PROMPT_MAX_CHARS = 20000   # of your prompt file (it goes on the claude command line)
@@ -514,6 +519,14 @@ class Settings:
         # (for a copilot that starts at login and should not spend AI on every recording).
         self.confirm_ai = g("CONFIRM_AI", "0").strip().lower() in ("1", "yes", "true", "on")
         self.notices: list[str] = []
+        # PERSISTENT_AI=1: one `claude` process stays open per meeting for the suggestions (no start-up
+        # cost per round). 0: a new `claude -p` per round, as before 0.9.2.
+        self.persistent = g("PERSISTENT_AI", "1").strip().lower() not in ("0", "no", "false", "off")
+        # watchdog of a suggestions round on the kept-open process: no first byte from the API after
+        # AI_FIRST_BYTE_S, or no answer after AI_ROUND_S -> the process is killed, a fresh one is seeded and
+        # the round is tried once more
+        self.first_byte_s = self._num(g, "AI_FIRST_BYTE_S", 6.0)
+        self.round_s = self._num(g, "AI_ROUND_S", 10.0)
         # SAVE_FORMAT=markdown: a readable "<Muesli export name>-copilot.md" instead of the JSON
         self.save_format = g("SAVE_FORMAT", "json").strip().lower()
         if self.save_format not in ("json", "markdown"):
@@ -533,6 +546,8 @@ class Settings:
         # Not installed (the usual case): calls go straight to `claude`, on the subscription.
         self.credit = None
         credit = g("API_CREDIT", "claude-credito").strip()
+        if credit.lower() in ("1", "yes", "true", "on"):
+            credit = "claude-credito"
         if self.claude and credit.lower() not in ("0", "no", "false", "off"):
             credit = _expand(credit)
             local = os.path.join(os.path.expanduser("~"), ".local", "bin", credit)
@@ -620,9 +635,25 @@ class Settings:
         else:
             self.osascript = _expand(osa) if osa else (shutil.which("osascript") if sys.platform == "darwin" else None)
 
+    def _num(self, g, key: str, default: float) -> float:
+        try:
+            v = float(g(key, str(default)))
+            if v > 0:
+                return v
+        except ValueError:
+            pass
+        self.notices.append(f"MEETING_COPILOT_{key} must be a number above 0, using {default:g}: {g(key)}")
+        return default
+
     @property
     def data_enabled(self) -> bool:
         return bool(self.search_dirs or self.mcp_config)
+
+    @property
+    def use_session(self) -> bool:
+        """Suggestions through the kept-open process (with the API-credit wrapper installed, the process
+        follows the wrapper's policy itself: see Credit)."""
+        return bool(self.persistent and self.claude)
 
 
 S: Settings = Settings({})
@@ -760,6 +791,9 @@ class State:
         self.ai_for: int | str | None = None
         self.ai_next_at = 0.0
         self.ctx_meeting: int | None = None   # the meeting the goals were last saved for
+        # timings of the last suggestions rounds, seconds from the request: {kind, queued, sent, first_byte,
+        # result, total, attempts, turn, seeded, ok}; shown in /state as ai_rounds
+        self.rounds: list[dict] = []
         self.reset(None)
 
     def reset(self, meeting: dict | None) -> None:
@@ -816,6 +850,7 @@ class State:
                 "metrics": self.metrics,
                 "lines": last(self.lines, 8),
                 "errors": STARTUP_ERRORS + last(self.errors, 3),
+                "ai_rounds": self.rounds[-5:],
                 "now": clock(now()),
             }
 
@@ -966,7 +1001,8 @@ def check_warnings(m: dict, recent_kinds: set[str] | None = None, muted: set[str
 
 def run_claude(system_prompt: str, message: str, model: str, *, schema: dict | None = None,
                tools: list[str] | None = None, mcp_tools: list[str] | None = None,
-               dirs: list[Path] | None = None, max_turns: int = 2) -> dict:
+               dirs: list[Path] | None = None, max_turns: int = 2, timeout: float | None = None) -> dict:
+    timeout = AI_TIMEOUT_S if timeout is None else timeout
     if not S.claude:
         raise RuntimeError("claude command not found (install Claude Code or set MEETING_COPILOT_CLAUDE)")
     # With the wrapper, it runs the same `claude` this tool would have run (CLAUDE_CREDITO_REAL).
@@ -1000,28 +1036,35 @@ def run_claude(system_prompt: str, message: str, model: str, *, schema: dict | N
     # values and would swallow the message if it were the last argument.
     try:
         p = subprocess.run(cmd, input=message, capture_output=True, text=True, encoding="utf-8",
-                           timeout=AI_TIMEOUT_S, cwd=str(cwd), env=env)
+                           timeout=timeout, cwd=str(cwd), env=env)
     except subprocess.TimeoutExpired as ex:
         err = ex.stderr or b""
         err = err.decode("utf-8", "replace") if isinstance(err, bytes) else err
-        raise RuntimeError(f"claude did not answer in {AI_TIMEOUT_S}s; its stderr: "
+        raise RuntimeError(f"claude did not answer in {timeout:g}s; its stderr: "
                            f"{err.strip()[-500:] or '(empty)'}") from None
     if p.returncode != 0 and not p.stdout.strip():
         raise RuntimeError(f"claude exited {p.returncode}: {p.stderr.strip()[:300]}")
     return json.loads(p.stdout)
 
 
+def fmt(fs: list[dict]) -> str:
+    return "\n".join(f"[{int(f['start'] // 60):02d}:{int(f['start'] % 60):02d}] {f['who']}: {f['text']}" for f in fs)
+
+
+def recent(lines: list[dict], keep_s: float = WINDOW_S) -> list[dict]:
+    """The lines of the last keep_s seconds of the conversation."""
+    if not lines:
+        return []
+    end = max(f["end"] for f in lines)
+    return [f for f in lines if f["end"] >= end - keep_s]
+
+
 def transcript(lines: list[dict], seen_until: int) -> str:
     if not lines:
         return ""
-    end = max(f["end"] for f in lines)
-    window = [f for f in lines if f["end"] >= end - WINDOW_S]
+    window = recent(lines)
     before = [f for f in window if f["id"] <= seen_until]
     new = [f for f in window if f["id"] > seen_until]
-
-    def fmt(fs):
-        return "\n".join(f"[{int(f['start'] // 60):02d}:{int(f['start'] % 60):02d}] {f['who']}: {f['text']}"
-                         for f in fs)
 
     parts = []
     if before:
@@ -1030,16 +1073,27 @@ def transcript(lines: list[dict], seen_until: int) -> str:
     return "\n\n".join(parts)
 
 
-def meeting_context() -> str:
-    lines = [f"Now: {datetime.now().strftime('%Y-%m-%d %H:%M')}"]  # every round, so the time never freezes
-    if E.meeting:
-        lines.append(f"Meeting: {E.meeting['title']}")
+def now_line() -> str:
+    return f"Now: {datetime.now().strftime('%Y-%m-%d %H:%M')}"   # every round, so the time never freezes
+
+
+def goals_text() -> str:
+    """The objective and the numbered goals. Call with E.lock held."""
+    lines = []
     if E.goal.strip():
         lines.append(f"User's objective: {E.goal.strip()}")
     if E.goals:
         lines.append("Goals:\n" + "\n".join(
             f"{i}. {m['text']}{' (already covered)' if m['covered'] else ''}" for i, m in enumerate(E.goals)))
     return "\n".join(lines)
+
+
+def meeting_context() -> str:
+    lines = [now_line()]
+    if E.meeting:
+        lines.append(f"Meeting: {E.meeting['title']}")
+    g = goals_text()
+    return "\n".join(lines + ([g] if g else []))
 
 
 def similar(a: str, b: str) -> bool:
@@ -1064,7 +1118,435 @@ def still_wanted(mid) -> bool:
     return False
 
 
-def assist_round() -> None:
+# ---------------------------------------------------------------- API credit for the kept-open process
+# The claude-credito wrapper (MEETING_COPILOT_API_CREDIT) runs one call on the plan's monthly API credit and
+# repeats it on the subscription when the API refuses. It keeps the whole output until claude exits, so it
+# cannot carry a kept-open stream-json process. That process follows the same policy here, with the
+# wrapper's own settings and files: its stored key (macOS Keychain or key file), its per-key pause file, its
+# log. The key only ever goes into the child's environment; it is never printed or logged.
+
+CREDIT_REFUSED_RE = re.compile(r"Credit balance is too low|Invalid API key|invalid x-api-key|billing_error|"
+                               r"authentication_error|permission_error|API key (is|has been) (expired|revoked|disabled)")
+
+
+class Credit:
+    def __init__(self, environ=None) -> None:
+        self.environ = os.environ if environ is None else environ
+
+    def cfg(self) -> dict:
+        """CLAUDE_CREDITO* from the wrapper's config file; a non-empty environment variable wins."""
+        env = self.environ
+        base = env.get("XDG_CONFIG_HOME") or "~/.config"
+        path = Path(_expand(env.get("CLAUDE_CREDITO_CONFIG") or os.path.join(base, "claude-credito", "config")))
+        cfg: dict[str, str] = {}
+        try:
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                m = re.match(r"^\s*(CLAUDE_CREDITO[A-Z_]*)=(.*)$", line.rstrip("\r"))
+                if m:
+                    v = m.group(2)
+                    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                        v = v[1:-1]
+                    cfg[m.group(1)] = str(Path.home() / v[2:]) if v.startswith("~/") else v
+        except OSError:
+            pass
+        cfg.update({k: v for k, v in env.items() if k.startswith("CLAUDE_CREDITO") and v})
+        return cfg
+
+    def key(self, cfg: dict) -> str:
+        k = cfg.get("CLAUDE_CREDITO_KEY", "")
+        if k.startswith("sk-ant-"):
+            return k
+        if cfg.get("CLAUDE_CREDITO_KEYCHAIN", "on") != "off" and os.access("/usr/bin/security", os.X_OK):
+            try:
+                k = subprocess.run(["/usr/bin/security", "find-generic-password", "-s", "claude-credito",
+                                    "-a", "console-key", "-w"], capture_output=True, text=True,
+                                   timeout=5).stdout.strip()
+            except (OSError, subprocess.SubprocessError):
+                k = ""
+        if not k.startswith("sk-ant-"):
+            base = self.environ.get("XDG_CONFIG_HOME") or "~/.config"
+            try:
+                k = Path(_expand(os.path.join(base, "claude-credito", "key"))).read_text(
+                    encoding="utf-8").splitlines()[0].strip()
+            except (OSError, IndexError):
+                k = ""
+        return k if k.startswith("sk-ant-") else ""
+
+    def state_dir(self, cfg: dict) -> Path:
+        v = cfg.get("CLAUDE_CREDITO_STATE")
+        if v:
+            return Path(_expand(v))
+        return Path(_expand(self.environ.get("XDG_STATE_HOME") or "~/.local/state")) / "claude-credito"
+
+    def pause_s(self, cfg: dict) -> int:
+        v = cfg.get("CLAUDE_CREDITO_PAUSE_S", "")
+        return int(v) if v.isdigit() else 21600
+
+    def pause_file(self, cfg: dict, key: str) -> Path:
+        return self.state_dir(cfg) / ("paused-" + hashlib.sha256(key.encode()).hexdigest()[:16])
+
+    def choose(self) -> tuple[dict | None, str, Path | None]:
+        """(environment for the child or None = ours, mode, pause file to write on a refusal)."""
+        if self.environ.get("ANTHROPIC_API_KEY"):
+            return None, "api (your ANTHROPIC_API_KEY)", None
+        cfg = self.cfg()
+        if cfg.get("CLAUDE_CREDITO", "on") == "off":
+            return None, "subscription (CLAUDE_CREDITO=off)", None
+        key = self.key(cfg)
+        if not key:
+            return None, "subscription (no API key stored)", None
+        pause = self.pause_file(cfg, key)
+        try:
+            if now() - pause.stat().st_mtime < self.pause_s(cfg):
+                return None, "subscription (API credit paused)", None
+        except OSError:
+            pass
+        return {**self.environ, "ANTHROPIC_API_KEY": key}, "api credit", pause
+
+    def refused(self, pause: Path, why: str) -> None:
+        """Starts the wrapper's pause for this key (its pause file) and writes one line in its log."""
+        cfg = self.cfg()
+        try:
+            pause.parent.mkdir(parents=True, exist_ok=True)
+            pause.touch()
+            os.utime(pause)
+        except OSError as ex:
+            print(f"note: could not write the API credit pause file: {ex}", flush=True)
+        log = cfg.get("CLAUDE_CREDITO_LOG")
+        if log:
+            log = Path(_expand(log))
+        elif (Path.home() / "Library" / "Logs").is_dir():
+            log = Path.home() / "Library" / "Logs" / "claude-credito.log"
+        else:
+            log = self.state_dir(cfg) / "claude-credito.log"
+        try:
+            log.parent.mkdir(parents=True, exist_ok=True)
+            with open(log, "a", encoding="utf-8") as f:
+                f.write(f"{datetime.now().astimezone().strftime('%Y-%m-%dT%H:%M:%S%z')} meeting-copilot: API REFUSED "
+                        f"({why}); the kept-open suggestions process goes on the subscription; API paused "
+                        f"{self.pause_s(cfg)}s (meeting-copilot)\n")
+        except OSError:
+            pass
+
+
+CREDIT = Credit()
+
+
+# ---------------------------------------------------------------- kept-open suggestions process
+
+# Added to the suggestions prompt on the kept-open process: plain JSON in the text is one model turn, where
+# --json-schema costs a second one (measured 2.2 s against 2.6 s per round, 12 of 12 parsed in both).
+ASSIST_FORMAT = (
+    "\nAnswer with ONE JSON object and nothing else (no prose, no code fence), with exactly these keys: "
+    '{"say": [string], "ask": [string], "corrections": [{"quote": string, "problem": string, '
+    '"suggestion": string}], "goals_covered": [integer]}. Keep every item short: about 20 words at most.\n'
+    "Each new user message brings only what was said since the previous one; the earlier messages are the "
+    "meeting so far. Never repeat an item you already gave.\n")
+
+
+def parse_reply(text) -> dict | None:
+    """The JSON object of a suggestions reply (a code fence or a stray word around it is fine), or None."""
+    text = str(text or "").strip()
+    a, b = text.find("{"), text.rfind("}")
+    if a == -1 or b < a:
+        return None
+    try:
+        r = json.loads(text[a:b + 1])
+    except ValueError:
+        return None
+    return r if isinstance(r, dict) else None
+
+
+class RoundFailed(Exception):
+    """The kept-open process did not answer in time, or ended."""
+
+
+def _mono() -> float:
+    return time.monotonic()
+
+
+class AssistSession:
+    """One `claude -p` process kept open for the live meeting's suggestions.
+
+    stream-json in and out: a round writes one user message with only what is new since the last round
+    (new transcript lines, changed goals) and reads events until the result line. The process starts once,
+    ahead of the first round (warm), not once per round. A watchdog kills a process that sends no first byte
+    in S.first_byte_s or no answer in S.round_s, seeds a fresh one with the goals and the recent transcript,
+    and tries the round once more. Past ROTATE_TOKENS of context or ROTATE_TURNS rounds the process is
+    replaced by a fresh, seeded one, so a long meeting's context stays bounded."""
+
+    def __init__(self) -> None:
+        self.round_lock = threading.Lock()   # one round at a time
+        self.lock = threading.Lock()         # the fields below; never held while waiting for the AI
+        self.proc: subprocess.Popen | None = None
+        self.events: queue.Queue | None = None   # this process's stdout events; None at its end
+        self.stderr: list[str] = []
+        self.owner = None                    # the meeting id it serves, or "next" (armed before the meeting)
+        self.started = 0.0
+        self.seeded = False                  # has had its first message (goals + recent transcript)
+        self.sent_upto = 0                   # last transcript line id it has seen
+        self.goals_sent = None               # (objective, goal texts) as it last saw them
+        self.turns = 0
+        self.tokens = 0                      # context size at its last answer
+        self.spawns = 0
+        self.mode = ""                       # "api credit" or "subscription (...)"
+        self.pause: Path | None = None       # the API credit pause file to write if the API refuses
+
+    def cmd(self) -> list[str]:
+        return [S.claude, "-p", "--model", S.model,
+                # no settings file from anywhere, as in run_claude; no tools at all
+                "--no-session-persistence", "--setting-sources", "",
+                "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+                "--include-partial-messages",   # message_start = the API's first byte, for the watchdog
+                "--max-turns", "2", "--append-system-prompt", assist_prompt() + ASSIST_FORMAT,
+                "--strict-mcp-config", "--tools", ""]
+
+    def alive(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def _spawn(self, owner) -> None:
+        """Starts a process for `owner`. Call with self.lock held. Never waits for it."""
+        cwd = S.data_dir / "ai-cwd"
+        cwd.mkdir(parents=True, exist_ok=True)
+        # with the API-credit wrapper installed: the plan's API credit first (its key in the child's
+        # environment only), the subscription while that key is paused
+        env, mode, pause = CREDIT.choose() if S.credit else (None, "subscription", None)
+        p = subprocess.Popen(self.cmd(), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, encoding="utf-8", errors="replace", bufsize=1, cwd=str(cwd), env=env)
+        self.mode, self.pause = mode, pause
+        q: queue.Queue = queue.Queue()
+        err: list[str] = []
+        threading.Thread(target=self._read, args=(p, q), daemon=True).start()
+        threading.Thread(target=self._read_err, args=(p, err), daemon=True).start()
+        self.proc, self.events, self.stderr, self.owner, self.started = p, q, err, owner, _mono()
+        self.seeded, self.sent_upto, self.goals_sent, self.turns, self.tokens = False, 0, None, 0, 0
+        self.spawns += 1
+
+    @staticmethod
+    def _read(p, q) -> None:
+        try:
+            for raw in p.stdout:
+                raw = raw.strip()
+                if raw:
+                    try:
+                        q.put(json.loads(raw))
+                    except ValueError:
+                        pass
+        except (OSError, ValueError):
+            pass
+        q.put(None)
+
+    @staticmethod
+    def _read_err(p, err) -> None:
+        try:
+            for raw in p.stderr:
+                err.append(raw.rstrip())
+                del err[:-20]
+        except (OSError, ValueError):
+            pass
+
+    @staticmethod
+    def _end(p, wait: bool = False) -> None:
+        """Stops a process: in the background, or before returning with wait=True (the copilot's exit)."""
+        def run():
+            try:
+                p.stdin.close()   # claude -p ends by itself at the end of its input
+            except (OSError, ValueError):
+                pass
+            try:
+                p.terminate()
+                p.wait(3)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait()
+            except OSError:
+                pass
+        if wait:
+            run()
+        else:
+            threading.Thread(target=run, daemon=True).start()
+
+    def warm(self, owner, why: str = "") -> None:
+        """Starts the process ahead of the first round, so that round has no start-up cost. A process armed
+        for the "next" meeting goes on with that meeting when it starts."""
+        if not S.use_session:
+            return
+        with self.lock:
+            if self.alive() and (self.owner == owner or (self.owner == "next" and owner != "next")):
+                self.owner = owner
+                return
+            if self.proc:
+                self._end(self.proc)
+            try:
+                self._spawn(owner)
+            except OSError as ex:
+                self.proc = self.events = self.owner = None
+                print(f"{clock(now())} could not start the AI process: {ex}", flush=True)
+                return
+        print(f"{clock(now())} AI process started for {'the next meeting' if owner == 'next' else f'meeting {owner}'}"
+              f" on {self.mode}" + (f" ({why})" if why else ""), flush=True)
+
+    def close(self, why: str, wait: bool = False) -> None:
+        with self.lock:
+            p, self.proc, self.events, self.owner, self.seeded = self.proc, None, None, None, False
+        if p:
+            self._end(p, wait)
+            print(f"{clock(now())} AI process closed ({why})", flush=True)
+
+    def _message(self, snap: dict, seed: bool) -> tuple[str, int]:
+        """(message, last line id in it): the whole recent context when seeding, else only what is new."""
+        lines = snap["lines"]
+        upto = max((f["id"] for f in lines), default=self.sent_upto)
+        if seed:
+            return (f"{snap['ctx']}\n\n## ALREADY SHOWN\n" + ("\n".join(f"- {j}" for j in snap["shown"]) or "(nothing)")
+                    + "\n\n" + transcript(lines, snap["seen"])), upto
+        parts = [now_line()]
+        if snap["gsig"] != self.goals_sent:
+            parts.append("The user changed the objective or the goals; goal numbers now refer to this list:\n"
+                         + (snap["goals"] or "(no goals)"))
+        new = recent([f for f in lines if f["id"] > self.sent_upto])
+        parts.append("## NEW\n" + (fmt(new) or "(nothing new)"))
+        return "\n\n".join(parts), upto
+
+    def _wait(self, q: queue.Queue, timing: dict, sent: float, first_s: float, total_s: float) -> dict:
+        first = None
+        while True:
+            limit = sent + total_s if first is not None else sent + min(first_s, total_s)
+            try:
+                ev = q.get(timeout=max(0.0, limit - _mono()))
+            except queue.Empty:
+                raise RoundFailed(f"no first byte from the AI in {first_s:g}s" if first is None
+                                  else f"no answer from the AI in {total_s:g}s") from None
+            if ev is None:
+                raise RoundFailed("the AI process ended; its stderr: " + (" | ".join(self.stderr[-3:]) or "(empty)"))
+            typ = ev.get("type")
+            if first is None and (typ == "assistant" or (
+                    typ == "stream_event" and (ev.get("event") or {}).get("type") == "message_start")):
+                first = _mono()
+                timing["first_byte"] = round(first - timing["q"], 2)
+            if typ == "result":
+                return ev
+
+    def _refusal(self, p, text: str) -> bool:
+        """The API refused the plan's credit key: pause it (as the wrapper does) and replace the process by
+        one on the subscription. Call with self.lock held. False when this process was not on the API key."""
+        m = CREDIT_REFUSED_RE.search(text or "")
+        if not (m and self.pause is not None and self.proc is p):
+            return False
+        CREDIT.refused(self.pause, m.group(0))
+        self._end(p)
+        self._spawn(self.owner)
+        print(f"{clock(now())} API credit refused ({m.group(0)}): the suggestions go on the {self.mode}; "
+              f"the round is sent again", flush=True)
+        return True
+
+    def round(self, mid, snap: dict, timing: dict):
+        """One suggestions round for meeting `mid`. snap (taken under E.lock): lines, seen, shown, ctx, goals,
+        gsig. Returns {"reply": dict or None when it was not JSON, "text"}, or None when the process was closed
+        meanwhile (AI turned off, meeting ended). Raises RuntimeError when both tries failed.
+
+        A refusal of the API credit key is not a try: the round goes again, seeded, on the subscription."""
+        with self.round_lock:
+            attempt, refusals = 0, 0
+            while True:
+                attempt += 1
+                with self.lock:
+                    if not (self.alive() and self.owner in (mid, "next")):
+                        if self.proc:
+                            self._end(self.proc)
+                        self._spawn(mid)
+                    self.owner = mid
+                    p, q = self.proc, self.events
+                    seed = not self.seeded
+                    msg, upto = self._message(snap, seed)
+                    gsig, turn = snap["gsig"], self.turns + 1
+                    # a process that has not answered yet may still be starting up: a little more time
+                    extra = 4.0 if not self.seeded and _mono() - self.started < 15 else 0.0
+                timing.update(attempts=attempt, seeded=seed, turn=turn, mode=self.mode)
+                sent = _mono()
+                timing["sent"] = round(sent - timing["q"], 2)
+                try:
+                    try:
+                        p.stdin.write(json.dumps({"type": "user", "message": {"role": "user", "content": msg}}) + "\n")
+                        p.stdin.flush()
+                    except (OSError, ValueError):
+                        raise RoundFailed("the AI process ended") from None
+                    res = self._wait(q, timing, sent, S.first_byte_s + extra, S.round_s + extra)
+                except RoundFailed as ex:
+                    with self.lock:
+                        if self.proc is not p:
+                            return None              # closed meanwhile: nobody wants this answer
+                        if refusals == 0 and self._refusal(p, " ".join(self.stderr[-5:])):
+                            refusals, attempt = 1, attempt - 1
+                            continue
+                        self._end(p)
+                        self.proc = self.events = None
+                        if attempt >= 2:
+                            try:
+                                self._spawn(mid)     # warm again for the next round
+                            except OSError:
+                                pass
+                    if attempt >= 2:
+                        raise RuntimeError(f"{ex} (twice; a fresh AI process is ready for the next round)") from None
+                    print(f"{clock(now())} assist: {ex}; trying once more on a fresh AI process", flush=True)
+                    continue
+                if res.get("is_error") or res.get("subtype") not in (None, "success"):
+                    with self.lock:
+                        if self.proc is not p:
+                            return None
+                        if refusals == 0 and self._refusal(p, str(res.get("result") or "") + " "
+                                                           + " ".join(self.stderr[-5:])):
+                            refusals, attempt = 1, attempt - 1
+                            continue
+                    raise RuntimeError(f"claude: {res.get('subtype')} {str(res.get('result'))[:200]}")
+                with self.lock:
+                    if self.proc is not p:
+                        return None
+                    self.seeded, self.sent_upto, self.goals_sent = True, max(upto, self.sent_upto), gsig
+                    self.turns = turn
+                    u = res.get("usage") or {}
+                    self.tokens = sum(int(u.get(k) or 0) for k in (
+                        "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens"))
+                    tokens = self.tokens
+                    rotate = tokens >= ROTATE_TOKENS or self.turns >= ROTATE_TURNS
+                    if rotate:
+                        self._end(p)
+                        self._spawn(mid)
+                if rotate:
+                    print(f"{clock(now())} AI process replaced by a fresh one after {turn} rounds and "
+                          f"{tokens} tokens of context", flush=True)
+                timing["tokens"] = tokens
+                return {"reply": parse_reply(res.get("result")), "text": str(res.get("result") or "")}
+
+
+SESSION = AssistSession()
+
+
+def wanted_owner():
+    """Who the kept-open process should serve now: the live meeting when AI is allowed for it, "next" when
+    the "Turn on AI for the next meeting" click is armed and no meeting is live, else nobody."""
+    with E.lock:
+        if E.meeting is not None:
+            return E.meeting["id"] if E.ai_allowed() else None
+        return "next" if S.confirm_ai and E.ai_armed() else None
+
+
+def ai_reconcile(why: str = "") -> None:
+    """Starts, hands over or closes the kept-open process to match wanted_owner(). Never call with E.lock."""
+    if not S.use_session:
+        return
+    want = wanted_owner()
+    if want == SESSION.owner and (SESSION.alive() or _mono() - SESSION.started < 10):
+        return   # running, or died young: not restarted more than once per 10 s
+    if want is None:
+        if SESSION.owner is not None:
+            SESSION.close(why or "AI not allowed now")
+    else:
+        SESSION.warm(want, why)
+
+
+def assist_round(queued: float | None = None) -> None:
+    timing = {"kind": "assist", "q": queued or _mono(), "ok": False}
     with E.lock:
         mid = (E.meeting or {}).get("id")
         if not E.ai_allowed(mid):
@@ -1074,44 +1556,67 @@ def assist_round() -> None:
         shown = [d["text"] for d in E.say[-15:] + E.ask[-15:]] + [c["quote"] for c in E.corrections[-10:]]
         ctx = meeting_context()
         goals_sent = [m["text"] for m in E.goals]   # the numbers in the answer refer to this list
-    msg = (f"{ctx}\n\n## ALREADY SHOWN\n" + ("\n".join(f"- {j}" for j in shown) or "(nothing)")
-           + "\n\n" + transcript(lines, seen))
+        snap = {"lines": lines, "seen": seen, "shown": shown, "ctx": ctx, "goals": goals_text(),
+                "gsig": (E.goal.strip(), goals_sent)}
     t0 = now()
-    out = run_claude(assist_prompt(), msg, S.model, schema=SCHEMA_ASSIST)
-    r = out.get("structured_output")
-    if isinstance(r, str):
-        r = json.loads(r)
-    if not isinstance(r, dict):
-        raise RuntimeError(f"no structured_output: {str(out.get('result'))[:200]}")
+    try:
+        if S.use_session:
+            got = SESSION.round(mid, snap, timing)
+            if got is None:
+                print(f"{clock(now())} AI answer dropped (AI stopped or meeting changed)", flush=True)
+                return
+            r = got["reply"]
+            if r is None:   # never breaks the round: that answer is dropped, the lines count as seen
+                print(f"{clock(now())} assist: the AI answer was not JSON, dropped: {got['text'][:200]!r}", flush=True)
+                r = {}
+        else:
+            msg = (f"{ctx}\n\n## ALREADY SHOWN\n" + ("\n".join(f"- {j}" for j in shown) or "(nothing)")
+                   + "\n\n" + transcript(lines, seen))
+            timing["sent"] = round(_mono() - timing["q"], 2)
+            out = run_claude(assist_prompt(), msg, S.model, schema=SCHEMA_ASSIST)
+            r = out.get("structured_output")
+            if isinstance(r, str):
+                r = json.loads(r)
+            if not isinstance(r, dict):
+                raise RuntimeError(f"no structured_output: {str(out.get('result'))[:200]}")
+        timing["ok"] = True
+    finally:
+        timing["result"] = round(_mono() - timing["q"], 2)
+        with E.lock:
+            E.rounds.append({k: v for k, v in timing.items() if k != "q"})
+            del E.rounds[:-20]
     ts = now()
     with E.lock:
         if not still_wanted(mid):
             return
         E.assist_seen = max((f["id"] for f in lines), default=seen)
-        for t in fresh(r.get("say", []), E.say):
+        for t in fresh(r.get("say", []) or [], E.say):
             E.say.append({"text": t, "ts": ts})
-        for t in fresh(r.get("ask", []), E.ask):
+        for t in fresh(r.get("ask", []) or [], E.ask):
             E.ask.append({"text": t, "ts": ts})
-        for c in r.get("corrections", [])[:2]:
+        for c in (r.get("corrections", []) or [])[:2]:
             if isinstance(c, dict) and c.get("quote") and not any(similar(c["quote"], x["quote"]) for x in E.corrections):
                 E.corrections.append({"quote": c["quote"], "problem": c.get("problem", ""),
                                       "suggestion": c.get("suggestion", ""), "ts": ts})
         # the goals may have changed during the call: mark a goal by the text that was sent, not its number
-        covered = {goals_sent[i] for i in r.get("goals_covered", [])
+        covered = {goals_sent[i] for i in (r.get("goals_covered", []) or [])
                    if isinstance(i, int) and not isinstance(i, bool) and 0 <= i < len(goals_sent)}
         for m in E.goals:
             if m["text"] in covered:
                 m["covered"] = True
         if covered:
             save_context()
-    print(f"{clock(ts)} assist ok in {ts - t0:.1f}s", flush=True)
+    parts = [f"{k} +{timing[k]:.1f}s" for k in ("sent", "first_byte") if k in timing]
+    extra = f" ({', '.join(parts)}, turn {timing['turn']}{', seeded' if timing.get('seeded') else ''}" \
+            f"{', retried' if timing.get('attempts', 1) > 1 else ''})" if "turn" in timing else ""
+    print(f"{clock(ts)} assist ok in {ts - t0:.1f}s{extra}", flush=True)
 
 
 def is_empty(text: str) -> bool:
     return not text or text.strip(" .*`\n").upper().startswith("EMPTY")
 
 
-def data_round() -> None:
+def data_round(queued: float | None = None) -> None:
     with E.lock:
         mid = (E.meeting or {}).get("id")
         if not E.ai_allowed(mid):
@@ -1126,7 +1631,7 @@ def data_round() -> None:
     tools = ["Read", "Grep", "Glob"] if S.search_dirs else []
     out = run_claude(data_prompt(), msg, S.data_model,
                      tools=tools, mcp_tools=S.mcp_tools if S.mcp_config else [],
-                     dirs=S.search_dirs, max_turns=8)
+                     dirs=S.search_dirs, max_turns=8, timeout=DATA_TIMEOUT_S)
     text = (out.get("result") or "").strip()
     if out.get("subtype") == "error_max_turns" and not text:
         error("data: the AI used up its searches without answering")
@@ -1352,26 +1857,50 @@ def write_markdown(snap: dict, row: dict, muesli_md: Path | None, replaces: Path
 
 
 class Queue:
-    """One AI call at a time, to keep memory and CPU use low during the call."""
+    """One AI call at a time on this queue, to keep memory and CPU use low during the call.
+
+    try_run(task, coalesce=True) while a call runs asks for one more run as soon as it ends (requests in
+    between are merged: that run sends everything new). The task gets the time of its request (monotonic)."""
 
     def __init__(self) -> None:
         self.busy = False
+        self.again: float | None = None
+        self.lock = threading.Lock()
 
-    def try_run(self, task) -> None:
-        if self.busy:
-            return
-        self.busy = True
+    def try_run(self, task, coalesce: bool = False) -> bool:
+        t = _mono()
+        with self.lock:
+            if self.busy:
+                if coalesce and self.again is None:
+                    self.again = t
+                return False
+            self.busy = True
 
-        def run():
-            try:
-                task()
-            except Exception as ex:
-                error(f"{task.__name__}: {ex}")
-                traceback.print_exc()
-            finally:
-                self.busy = False
+        def run(queued):
+            while True:
+                try:
+                    task(queued)
+                except Exception as ex:
+                    error(f"{task.__name__}: {ex}")
+                    traceback.print_exc()
+                with self.lock:
+                    queued, self.again = self.again, None
+                    if queued is None:
+                        self.busy = False
+                        return
 
-        threading.Thread(target=run, daemon=True).start()
+        threading.Thread(target=run, args=(t,), daemon=True).start()
+        return True
+
+
+QA = Queue()   # suggestions
+QD = Queue()   # fact search; with the kept-open process it runs beside the suggestions, else it shares QA
+
+
+def request_assist() -> bool:
+    """A suggestions round now, or right after the one running (merged with any other request meanwhile)."""
+    E.last_assist = now()
+    return QA.try_run(assist_round, coalesce=True)
 
 
 def read_new_lines(con: sqlite3.Connection, meeting_id: int) -> None:
@@ -1394,7 +1923,6 @@ def next_round(t: float) -> str | None:
 
 
 def loop(db: Path) -> None:
-    q = Queue()
     while True:
         try:
             con = open_db(db)
@@ -1418,12 +1946,14 @@ def loop(db: Path) -> None:
                         E.status = "live"
                         save_context()
                     print(f"meeting {live['id']} '{live['title']}' started", flush=True)
+                    ai_reconcile("meeting started")
                 elif not live and current:
                     save_session()
                     with E.lock:
                         E.status = f"meeting {current['id']} ended · waiting for the next one"
                         E.meeting = None
                     print(f"meeting {current['id']} ended", flush=True)
+                    ai_reconcile("meeting ended")
                 if PENDING:
                     flush_pending(con)
                 if live:
@@ -1440,14 +1970,26 @@ def loop(db: Path) -> None:
                     E.warnings.append({**w, "ts": now()})
                     E.last_warning = now()
 
-            if S.claude and E.ai_allowed() and not q.busy:
-                kind = next_round(now())
-                if kind == "assist":
-                    E.last_assist = now()
-                    q.try_run(assist_round)
-                elif kind == "data":
-                    E.last_data = now()
-                    q.try_run(data_round)
+            if S.claude and E.ai_allowed():
+                t = now()
+                if not S.use_session:   # one queue: one AI call at a time, as before 0.9.2
+                    kind = next_round(t) if not QA.busy else None
+                    if kind == "assist":
+                        E.last_assist = t
+                        QA.try_run(assist_round)
+                    elif kind == "data":
+                        E.last_data = t
+                        QA.try_run(data_round)
+                else:   # the suggestions never wait behind a fact search
+                    if not QA.busy and E.last_id > E.assist_seen and t - E.last_assist >= S.assist_s:
+                        request_assist()
+                    if not QD.busy and S.data_enabled and E.last_id > E.data_seen and t - E.last_data >= S.data_s:
+                        E.last_data = t
+                        QD.try_run(data_round)
+        try:
+            ai_reconcile()   # AI turned off, the next-meeting click expired, a process that died: catch up
+        except Exception as ex:
+            error(f"AI process: {ex}")
         time.sleep(S.poll_s)
 
 # ---------------------------------------------------------------- local server
@@ -1807,6 +2349,9 @@ class Page(BaseHTTPRequestHandler):
                 save_context()
             else:
                 return self._send(404, b"", "text/plain")
+        if path == "/ai":   # start (warm up) or close the kept-open AI process now, not at the next poll
+            threading.Thread(target=ai_reconcile, args=("Turn on AI clicked" if body.get("on") is True
+                                                         else "AI turned off",), daemon=True).start()
         self._send(200, b'{"ok":true}', "application/json")
 
 
@@ -2015,9 +2560,11 @@ def main(argv=None) -> None:
     lan_up = start_lan()
     write_port_file(S.port, S.lan_port if lan_up else None)
     print(f"meeting-copilot on http://127.0.0.1:{S.port}  (database: {S.db})", flush=True)
+    atexit.register(SESSION.close, "copilot exit", True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
+        SESSION.close("copilot exit", wait=True)
         save_session(final=True)
         sys.exit(0)
 

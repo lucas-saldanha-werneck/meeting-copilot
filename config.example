@@ -92,6 +92,19 @@
 # meeting asks again. Useful when the copilot starts at login. Default: 0.
 #MEETING_COPILOT_CONFIRM_AI=0
 
+# 1: one `claude` process stays open per meeting for the suggestions, so a round
+# has no start-up cost; it starts when the AI is allowed (the "Turn on AI" click,
+# also for the next meeting, or the meeting start) and closes when it is not.
+# 0: a new `claude -p` per round. With the API_CREDIT wrapper installed the
+# kept-open process follows its policy (API credit first, subscription when the
+# API refuses). Default: 1.
+#MEETING_COPILOT_PERSISTENT_AI=1
+# Watchdog of a suggestions round on that process, in seconds: no first byte from
+# the API after AI_FIRST_BYTE_S, or no answer after AI_ROUND_S, and the process is
+# replaced by a fresh one and the round tried once more.
+#MEETING_COPILOT_AI_FIRST_BYTE_S=6
+#MEETING_COPILOT_AI_ROUND_S=10
+
 # Intervals in seconds: suggestions, fact search, reading the transcript.
 #MEETING_COPILOT_ASSIST_S=25
 #MEETING_COPILOT_DATA_S=45
