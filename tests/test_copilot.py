@@ -1175,6 +1175,16 @@ class Live(unittest.TestCase):
         self.assertEqual(self.post("/context", {"goal": "Agree on the date", "goals": ["a", " ", "b"]}), 200)
         self.assertEqual(self.post("/mute", {"kind": "fast"}), 200)
         self.assertEqual(self.post("/nope", {}), 404)
+        # a refused POST still reads the body first: closing with unread bytes resets the connection
+        # and the client never gets the answer (seen on macOS CI)
+        big = json.dumps({"goal": "x" * 60_000}).encode()
+        for h, code, msg in (({"Origin": "https://evil.example"}, 403, b"origin"),
+                             ({"Origin": f"http://127.0.0.1:{self.port}", "Cookie": "meeting_copilot_token=no"},
+                              401, b"token")):
+            for _ in range(100):
+                r = self.raw("/context", dict(h, **{"Content-Type": "application/json"}), "POST", big)
+                self.assertEqual(r[0], code)
+                self.assertIn(msg, r[2])
         st = self.state()
         self.assertEqual(st["goal"], "Agree on the date")
         self.assertEqual([g["text"] for g in st["goals"]], ["a", "b"])

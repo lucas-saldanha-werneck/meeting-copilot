@@ -40,7 +40,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
-__version__ = "0.7.3"
+__version__ = "0.7.4"
 
 HERE = Path(__file__).resolve().parent
 PAGE = HERE / "page.html"
@@ -1202,6 +1202,15 @@ class Page(BaseHTTPRequestHandler):
         self._send(404, b"", "text/plain")
 
     def do_POST(self):
+        # The body is read before any answer, refusals included: closing a connection with unread
+        # bytes resets it, and the client may never see the 403/401.
+        try:
+            n = max(0, int(self.headers.get("Content-Length", "0") or 0))
+        except ValueError:
+            n = 0
+        if n > 100_000:
+            self.close_connection = True
+        raw = self.rfile.read(min(n, 100_000)) if n else b""
         # no CORS headers: another site can neither read this nor send JSON here
         if not self._host_ok() or self.headers.get("Origin") not in S.origins_ok \
                 or not self.headers.get("Content-Type", "").startswith("application/json"):
@@ -1209,9 +1218,8 @@ class Page(BaseHTTPRequestHandler):
         path, given = self._route()
         if not self._token_ok(given if given is not None else self._sent_token()):
             return self._deny()
-        n = int(self.headers.get("Content-Length", "0") or 0)
         try:
-            body = json.loads(self.rfile.read(min(n, 100_000)) or b"{}")
+            body = json.loads(raw or b"{}")
         except json.JSONDecodeError:
             return self._send(400, b"json", "text/plain")
         if not isinstance(body, dict):
