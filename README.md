@@ -8,7 +8,42 @@ A live meeting copilot for macOS. While a meeting is recording in the [Muesli](h
 - **Relevant facts** (optional): looked up in folders of notes you choose and/or MCP tools you allow.
 - **Warnings** (no AI): long monologue, talking most of the last 5 minutes, few questions, speaking too fast.
 
-The AI runs through `claude -p` (Claude Code), so it uses your Claude Code login. One AI call runs at a time: suggestions about every 25 s, fact search about every 45 s.
+The AI runs through `claude -p` (Claude Code), so it uses your Claude Code login. Suggestions about every 25 s, fact search about every 45 s.
+
+### The kept-open AI process (suggestions)
+
+Starting `claude -p` costs several seconds (4-12 s on a busy Mac) while the answer itself takes 1-3 s. So the
+suggestions use one `claude` process per meeting that stays open (`--input-format stream-json`):
+
+- **When it starts:** as soon as the AI is allowed, before the first round: the "Turn on AI" click (for the
+  live meeting or for the next one), the start of a meeting when the AI is allowed (always, without
+  `CONFIRM_AI`), and a restart of the copilot that gives back the click. Starting it costs no AI call.
+- **When it closes:** AI turned off, the meeting ends, a "next meeting" click that expires (30 min), and the
+  copilot's exit. If the copilot is killed, the process ends by itself at the end of its input.
+- **Each round** sends only what is new since the previous round (new transcript lines, changed goals). The
+  first message, and the first after any restart of the process, has the goals, the items already shown and
+  the last 3 minutes of the transcript, as a one-shot call has.
+- **Watchdog:** no first byte from the API after 6 s, or no answer after 10 s (4 s more for a process still
+  starting), and the process is killed, a fresh one is seeded and the round is tried once more. A second
+  failure drops that round (the next one runs on a fresh process). So a stuck call costs at most about 20 s
+  instead of the old 2-minute timeout.
+- **Bounded context:** after 40,000 tokens of context or 150 rounds the process is replaced by a fresh,
+  seeded one, so a long meeting does not grow without limit.
+- **Reply format:** plain JSON in the text (one model turn); `--json-schema` costs a second turn. An answer
+  that is not JSON is dropped and logged; the round still counts.
+- The fact search keeps one `claude -p` per call (it uses tools), with a 40 s limit, and runs beside the
+  suggestions so they never wait behind it. With `MEETING_COPILOT_PERSISTENT_AI=0` every suggestions round is
+  one `claude -p` call (30 s limit) and one AI call runs at a time.
+- **API credit:** with the claude-credito wrapper installed (`MEETING_COPILOT_API_CREDIT`), the kept-open
+  process follows its policy itself (the wrapper keeps a call's whole output until it ends, so it cannot carry
+  a kept-open process): the plan's monthly API credit first, with the wrapper's stored key (macOS Keychain
+  or its key file) put only into the process's environment; while that key is paused, the subscription.
+  When the API refuses the key ("Credit balance is too low", "Invalid API key" and the like), the copilot
+  writes the wrapper's own pause file for that key (so the wrapper and other tools also move to the
+  subscription), adds a line to the wrapper's log, restarts the process on the subscription and sends the
+  same round again. The wrapper's settings (`CLAUDE_CREDITO*`, its config file) are honored.
+- `/state` has `ai_rounds`: the last rounds' timings in seconds from the request (`sent`, `first_byte`,
+  `result`), with `turn`, `seeded`, `attempts` and `tokens`. `tools/bench_live.py` measures rounds.
 
 ## Status: read this first
 
@@ -126,7 +161,7 @@ Every key:
 | `MEETING_COPILOT_DB` | `~/Library/Application Support/Muesli/muesli.db` | Muesli database (opened read-only) |
 | `MEETING_COPILOT_PORT` | `4390` | Local port; the server listens on 127.0.0.1 (plus the optional LAN listener) |
 | `MEETING_COPILOT_CLAUDE` | `claude` on PATH | Path to the Claude Code CLI |
-| `MEETING_COPILOT_API_CREDIT` | `claude-credito` | Optional wrapper for the AI calls ([api-credit](https://github.com/lucas-saldanha-werneck/api-credit)). When this command is installed (on PATH or in `~/.local/bin`), calls go through it: your plan's monthly API credit first, and the same call again on the subscription when the API refuses. Not installed: nothing changes. `off` never uses it |
+| `MEETING_COPILOT_API_CREDIT` | `claude-credito` | Optional wrapper for the AI calls (`on` = this default name) ([api-credit](https://github.com/lucas-saldanha-werneck/api-credit)). When this command is installed (on PATH or in `~/.local/bin`), calls go through it: your plan's monthly API credit first, and the same call again on the subscription when the API refuses. Not installed: nothing changes. `off` never uses it |
 | `MEETING_COPILOT_MODEL` | `sonnet` | Model for suggestions (`MEETING_COPILOT_DATA_MODEL` for fact search) |
 | `MEETING_COPILOT_SEARCH_DIRS` | empty | Folders the AI may search for facts, separated by `:` |
 | `MEETING_COPILOT_MCP_CONFIG` | empty | An MCP config file (`{"mcpServers": {...}}`) for fact search |
@@ -142,6 +177,8 @@ Every key:
 | `MEETING_COPILOT_OSASCRIPT` | `osascript` on macOS | The command that shows the pairing code as a notification; `off`: no notification (the code is still in `meeting-copilot status`) |
 | `MEETING_COPILOT_CONFIRM_AI` | `0` | `1`: no AI call in a meeting until you click "Turn on AI" on the page; each meeting asks again. Useful when the copilot starts at login and should not spend AI on every recording. The click, the objective and the goals are kept in `context.json` in your data folder (only your user can read it), so a restart during a meeting gives them back; a file older than 6 hours is ignored |
 | `MEETING_COPILOT_ASSIST_S`, `_DATA_S`, `_POLL_S` | `25`, `45`, `5` | Intervals in seconds |
+| `MEETING_COPILOT_PERSISTENT_AI` | `1` | `1`: one kept-open `claude` process per meeting for the suggestions (see "The kept-open AI process"). `0`: a new `claude -p` per round |
+| `MEETING_COPILOT_AI_FIRST_BYTE_S`, `_AI_ROUND_S` | `6`, `10` | Watchdog of a suggestions round on the kept-open process: seconds to the API's first byte, and to the answer |
 | `MEETING_COPILOT_CONTEXT_FILE` | empty | A text file about you that both AI calls read: your name and role, your projects, what your notes folders and MCP tools hold, words the transcript tends to get wrong. The first 8000 characters are used |
 | `MEETING_COPILOT_LANGUAGE` | empty (the meeting's language) | Language for every suggestion and fact, e.g. `Brazilian Portuguese` |
 | `MEETING_COPILOT_PROMPT_FILE` | empty (the built-in prompt) | A text file that replaces the built-in suggestions prompt. See [Your own prompt](#your-own-prompt) |
@@ -226,7 +263,7 @@ With neither search folders nor MCP, the "Relevant facts" panel says fact search
 ## Privacy
 
 - The Muesli database is opened read-only and never written.
-- The transcript of the last 3 minutes, your goals and the items already shown are sent to Claude through `claude -p` on each call. Nothing else leaves the machine.
+- The transcript of the last 3 minutes, your goals and the items already shown are sent to Claude through `claude -p` (on the kept-open process: once, then only the new lines each round). Nothing else leaves the machine.
 - Sessions (full transcript plus suggestions) are saved as JSON files readable only by your user. A meeting saved again (the copilot restarted, or the meeting stopped and recorded again) gets a new file with `-2`, `-3`, and so on, so nothing earlier is overwritten.
 - The fact search may read files only inside the search folders: Read, Grep and Glob are allowed with a path rule for each folder, so a request in the meeting to open any other file is refused. The AI runs in an empty folder of its own and loads no Claude Code settings files, so no hook planted in a search folder runs with it.
 - The page answers only on 127.0.0.1 / localhost (plus any `MEETING_COPILOT_EXTRA_HOSTS`, and, with `MEETING_COPILOT_LAN=1`, private addresses on the home network, where POSTs must come from the page's own `http://<host>` origin), checks the `Host` header against DNS rebinding, and accepts POSTs only from its own origin. Every request (the page, `/state` and each POST) needs a login: the cookie of a browser that typed a pairing code, the token cookie (set by the launcher's one-time link or a `?token=` URL), or the token as an `Authorization: Bearer` header; anything else gets `401` (a browser gets the login page). The code is never shown to a browser that is not logged in, not even on the Mac itself: only the notification, `meeting-copilot status`/`code` and a logged-in page show it. The login POST passes the same `Host` and origin checks as every POST, and the code is compared in constant time. The token file and `devices.json` are readable only by your user, so other users' programs and web pages cannot read the meeting; a program running as you can still read the files.

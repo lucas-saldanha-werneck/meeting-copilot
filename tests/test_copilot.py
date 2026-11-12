@@ -53,6 +53,12 @@ def sha(path) -> str:
         return hashlib.sha256(f.read()).hexdigest()
 
 
+def is_assist(call) -> bool:
+    """A suggestions call: one-shot with --json-schema, or a message to the kept-open process."""
+    a = call["argv"]
+    return "--json-schema" in a or ("--input-format" in a and a[a.index("--input-format") + 1] == "stream-json")
+
+
 def wait_for(fn, timeout=20.0, step=0.2):
     end = time.time() + timeout
     last = None
@@ -230,7 +236,8 @@ class Logic(unittest.TestCase):
             self.assertEqual(os.stat(link).st_mode & 0o777, 0o600)
 
     def test_late_answer_marks_only_the_goal_it_was_asked_about(self):
-        self._with_state({}, {"id": 3, "title": "t", "start": ""})
+        # the one-shot path (PERSISTENT_AI=0); never the real claude from this test
+        self._with_state({"MEETING_COPILOT_PERSISTENT_AI": "0"}, {"id": 3, "title": "t", "start": ""})
         copilot.E.goals = [{"text": "Price", "covered": False}, {"text": "End date", "covered": False}]
 
         def answer(*a, **k):   # while the AI thinks, the user replaces the goals
@@ -246,6 +253,79 @@ class Logic(unittest.TestCase):
             copilot.run_claude = old
         # goal 0 sent was "Price", goal 1 "End date" (gone): only "Price" is marked, wherever it is now
         self.assertEqual([(g["text"], g["covered"]) for g in copilot.E.goals], [("Budget", False), ("Price", True)])
+
+    def test_parse_reply_takes_the_json_object_or_none(self):
+        self.assertEqual(copilot.parse_reply('```json\n{"say": ["x"]}\n```'), {"say": ["x"]})
+        self.assertEqual(copilot.parse_reply('Sure: {"say": [], "ask": ["y"]} done'), {"say": [], "ask": ["y"]})
+        for bad in ("", None, "no json here", "{broken", "[1, 2]", '{"a": 1'):
+            self.assertIsNone(copilot.parse_reply(bad), bad)
+
+    def test_queue_merges_requests_made_while_a_call_runs(self):
+        q = copilot.Queue()
+        gate, runs = threading.Event(), []
+
+        def task(queued):
+            runs.append(queued)
+            gate.wait(5)
+        task.__name__ = "task"
+        self.assertTrue(q.try_run(task, coalesce=True))
+        self.assertTrue(wait_for(lambda: runs, 5))
+        for _ in range(3):                       # three requests while busy: one more run, not three
+            self.assertFalse(q.try_run(task, coalesce=True))
+        self.assertFalse(q.try_run(task))        # without coalesce: dropped, as before
+        gate.set()
+        self.assertTrue(wait_for(lambda: not q.busy, 5))
+        self.assertEqual(len(runs), 2)
+        self.assertLessEqual(runs[0], runs[1])
+
+    def test_credit_uses_the_wrappers_key_and_pause_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = {"CLAUDE_CREDITO_KEYCHAIN": "off", "CLAUDE_CREDITO_STATE": os.path.join(d, "state"),
+                    "CLAUDE_CREDITO_LOG": os.path.join(d, "log"), "CLAUDE_CREDITO_CONFIG": os.path.join(d, "none"),
+                    "XDG_CONFIG_HOME": os.path.join(d, "cfg"), "HOME": d}
+            env, mode, pause = copilot.Credit(base).choose()
+            self.assertEqual((env, mode), (None, "subscription (no API key stored)"))
+            os.makedirs(os.path.join(d, "cfg", "claude-credito"))
+            with open(os.path.join(d, "cfg", "claude-credito", "key"), "w") as f:
+                f.write("sk-ant-file-1111\n")     # the wrapper's key file, when not in the Keychain
+            env, mode, pause = copilot.Credit(base).choose()
+            self.assertEqual((env["ANTHROPIC_API_KEY"], mode), ("sk-ant-file-1111", "api credit"))
+            # the same pause file name as the wrapper: sha256 of the key, first 16 hex digits
+            self.assertEqual(pause.name, "paused-" + hashlib.sha256(b"sk-ant-file-1111").hexdigest()[:16])
+            copilot.Credit(base).refused(pause, "Invalid API key")
+            self.assertTrue(pause.exists())
+            with open(os.path.join(d, "log"), encoding="utf-8") as f:
+                logged = f.read()
+            self.assertIn("API REFUSED (Invalid API key)", logged)
+            self.assertNotIn("sk-ant-file-1111", logged)
+            env, mode, _ = copilot.Credit(base).choose()
+            self.assertEqual((env, mode), (None, "subscription (API credit paused)"))
+            env, mode, _ = copilot.Credit({**base, "CLAUDE_CREDITO_PAUSE_S": "0"}).choose()
+            self.assertEqual(mode, "api credit")   # the pause is over
+            env, mode, _ = copilot.Credit({**base, "CLAUDE_CREDITO": "off"}).choose()
+            self.assertEqual((env, mode), (None, "subscription (CLAUDE_CREDITO=off)"))
+            with open(os.path.join(d, "conf"), "w") as f:   # the wrapper's config file is read too
+                f.write('CLAUDE_CREDITO_KEY="sk-ant-conf-2222"\n')
+            env, _, _ = copilot.Credit({**base, "CLAUDE_CREDITO_CONFIG": os.path.join(d, "conf"),
+                                        "CLAUDE_CREDITO_PAUSE_S": "0"}).choose()
+            self.assertEqual(env["ANTHROPIC_API_KEY"], "sk-ant-conf-2222")
+
+    def test_api_credit_on_means_the_default_wrapper_name(self):
+        with tempfile.TemporaryDirectory() as d:
+            w = os.path.join(d, "claude-credito")
+            c = os.path.join(d, "claude")
+            for p in (w, c):
+                with open(p, "w") as f:
+                    f.write("#!/bin/sh\n")
+                os.chmod(p, 0o755)
+            old_path = os.environ.get("PATH", "")
+            os.environ["PATH"] = d
+            try:
+                s = copilot.Settings({"MEETING_COPILOT_API_CREDIT": "on", "MEETING_COPILOT_CLAUDE": c})
+            finally:
+                os.environ["PATH"] = old_path
+            self.assertEqual(s.credit, w)
+            self.assertTrue(s.use_session)   # the kept-open process also with the wrapper
 
     def test_slow_suggestions_never_starve_the_fact_search(self):
         self._with_state({"MEETING_COPILOT_ASSIST_S": "25", "MEETING_COPILOT_DATA_S": "45"})
@@ -1516,7 +1596,8 @@ class Live(unittest.TestCase):
         with open(os.path.join(self.fakebin, "claude"), "w") as f:
             f.write(f'#!/bin/sh\nexec "{PY}" "{ROOT}/tests/fake_claude.py" "$@"\n')
         os.chmod(os.path.join(self.fakebin, "claude"), 0o755)
-        self.env = {k: v for k, v in os.environ.items() if not k.startswith(("MEETING_COPILOT", "CLAUDE"))}
+        self.env = {k: v for k, v in os.environ.items()
+                    if not k.startswith(("MEETING_COPILOT", "CLAUDE", "ANTHROPIC_API_KEY"))}
         self.env.update(HOME=self.home, USERPROFILE=self.home, XDG_DATA_HOME=os.path.join(t, "data"),
                         PATH=self.fakebin + os.pathsep + self.env.get("PATH", ""),
                         FAKE_CLAUDE_LOG=self.claude_log,
@@ -1599,11 +1680,19 @@ class Live(unittest.TestCase):
         h["Origin"] = origin or f"http://127.0.0.1:{self.port}"
         return self.request(path, json.dumps(body).encode(), h)[0]
 
-    def claude_calls(self):
+    def claude_log_entries(self):
         if not os.path.exists(self.claude_log):
             return []
         with open(self.claude_log, encoding="utf-8") as f:
             return [json.loads(x) for x in f if x.strip()]
+
+    def claude_calls(self):
+        """AI calls: one-shot calls and messages to the kept-open process (not its start)."""
+        return [c for c in self.claude_log_entries() if not c.get("spawn")]
+
+    def spawns(self):
+        """Starts of the kept-open suggestions process."""
+        return [c for c in self.claude_log_entries() if c.get("spawn")]
 
     def speak(self):
         fake_meeting.speak(copilot.Path(self.db), 0)
@@ -1636,8 +1725,8 @@ class Live(unittest.TestCase):
         self.assertEqual(st["metrics"]["questions"], 0)
 
         calls = self.claude_calls()
-        assist = [c for c in calls if "--json-schema" in c["argv"]]
-        data = [c for c in calls if "--json-schema" not in c["argv"]]
+        assist = [c for c in calls if is_assist(c)]
+        data = [c for c in calls if not is_assist(c)]
         self.assertTrue(assist and data)
         a = assist[0]["argv"]
         self.assertEqual(a[a.index("--tools") + 1], "")                 # suggestions: no tools at all
@@ -1672,7 +1761,7 @@ class Live(unittest.TestCase):
         self.assertEqual(st["data"], [])
         calls = self.claude_calls()
         self.assertTrue(calls)
-        self.assertTrue(all("--json-schema" in c["argv"] for c in calls))
+        self.assertTrue(all(is_assist(c) for c in calls))
         self.assertIn("fact search is off", self.log())
 
     @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
@@ -1682,7 +1771,7 @@ class Live(unittest.TestCase):
             f.write("The user is Ana; WhatsApp sessions: ana, shop.\n")
         self.start(MEETING_COPILOT_CONTEXT_FILE=ctx, MEETING_COPILOT_LANGUAGE="Spanish")
         self.speak()
-        assist = lambda: [c for c in self.claude_calls() if "--json-schema" in c["argv"]]  # noqa: E731
+        assist = lambda: [c for c in self.claude_calls() if is_assist(c)]  # noqa: E731
         self.assertTrue(wait_for(assist), self.log())
         a = assist()[0]["argv"]
         prompt = a[a.index("--append-system-prompt") + 1]
@@ -1697,9 +1786,9 @@ class Live(unittest.TestCase):
         self.start(MEETING_COPILOT_PROMPT_FILE=pf, MEETING_COPILOT_LANGUAGE="Spanish")
         self.speak()
         self.assertTrue(wait_for(lambda: (self.state() or {}).get("say")), self.log())
-        a = [c for c in self.claude_calls() if "--json-schema" in c["argv"]][0]["argv"]
+        a = [c for c in self.claude_calls() if is_assist(c)][0]["argv"]
         prompt = a[a.index("--append-system-prompt") + 1]
-        self.assertEqual(prompt, "MY PROMPT: give say and ask in Spanish.")
+        self.assertEqual(prompt, "MY PROMPT: give say and ask in Spanish." + copilot.ASSIST_FORMAT)
         self.assertNotIn("live meeting copilot", prompt)
         self.assertNotIn("note: prompt file", self.log())
 
@@ -1709,8 +1798,8 @@ class Live(unittest.TestCase):
         self.speak()
         self.assertTrue(wait_for(lambda: (self.state() or {}).get("say")), self.log())
         self.assertEqual(self.log().count("note: prompt file not found or unreadable"), 1, self.log())
-        a = [c for c in self.claude_calls() if "--json-schema" in c["argv"]][0]["argv"]
-        self.assertEqual(a[a.index("--append-system-prompt") + 1], copilot.PROMPT_ASSIST)
+        a = [c for c in self.claude_calls() if is_assist(c)][0]["argv"]
+        self.assertEqual(a[a.index("--append-system-prompt") + 1], copilot.PROMPT_ASSIST + copilot.ASSIST_FORMAT)
 
     @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
     def test_data_prompt_file_goes_to_claude_and_facts_still_show(self):
@@ -1722,12 +1811,13 @@ class Live(unittest.TestCase):
         self.start(MEETING_COPILOT_DATA_PROMPT_FILE=pf, MEETING_COPILOT_SEARCH_DIRS=notes)
         self.speak()
         self.assertTrue(wait_for(lambda: (self.state() or {}).get("data")), self.log())
-        a = [c for c in self.claude_calls() if "--json-schema" not in c["argv"]][0]["argv"]
+        a = [c for c in self.claude_calls() if not is_assist(c)][0]["argv"]
         prompt = a[a.index("--append-system-prompt") + 1]
         self.assertTrue(prompt.startswith("MY DATA PROMPT. Search - search the user's notes in these folders"))
         self.assertIn("2027-03-31", self.state()["data"][0]["markdown"])
-        s = [c for c in self.claude_calls() if "--json-schema" in c["argv"]][0]["argv"]
-        self.assertEqual(s[s.index("--append-system-prompt") + 1], copilot.PROMPT_ASSIST, "suggestions untouched")
+        s = [c for c in self.claude_calls() if is_assist(c)][0]["argv"]
+        self.assertEqual(s[s.index("--append-system-prompt") + 1], copilot.PROMPT_ASSIST + copilot.ASSIST_FORMAT,
+                         "suggestions untouched")
         self.assertNotIn("note: data prompt file", self.log())
 
     @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
@@ -1738,7 +1828,7 @@ class Live(unittest.TestCase):
         self.speak()
         self.assertTrue(wait_for(lambda: (self.state() or {}).get("data")), self.log())
         self.assertEqual(self.log().count("note: data prompt file not found or unreadable"), 1, self.log())
-        a = [c for c in self.claude_calls() if "--json-schema" not in c["argv"]][0]["argv"]
+        a = [c for c in self.claude_calls() if not is_assist(c)][0]["argv"]
         self.assertIn("You are a silent fact assistant", a[a.index("--append-system-prompt") + 1])
 
     @unittest.skipIf(WIN, "SIGTERM cannot be delivered as a signal on Windows")
@@ -1918,8 +2008,11 @@ class Live(unittest.TestCase):
         mid = self.state()["meeting"]["id"]
         self.assertEqual(self.post("/context", {"goal": "Learn the pay range", "goals": ["Pay range", "Next step"]}), 200)
         self.assertEqual(self.post("/ai", {"on": True, "meeting": mid}), 200)
+        self.assertTrue(wait_for(lambda: len(self.spawns()) == 1, 5), self.log())   # warmed up by the click
+        pid = self.spawns()[0]["pid"]
         self.proc.send_signal(signal.SIGTERM)
         self.proc.wait(10)
+        self.assertTrue(wait_for(lambda: not alive(pid), 5), "the AI process outlived the copilot")
         ctx = os.path.join(self.t, "data", "meeting-copilot", "context.json")
         if not WIN:
             self.assertEqual(os.stat(ctx).st_mode & 0o777, 0o600)
@@ -1930,6 +2023,7 @@ class Live(unittest.TestCase):
         self.assertEqual(st["goal"], "Learn the pay range")
         self.assertEqual([g["text"] for g in st["goals"]], ["Pay range", "Next step"])
         self.assertTrue(st["ai_on"])
+        self.assertTrue(wait_for(lambda: len(self.spawns()) >= 2, 5), self.log())   # warmed up again
         n = len(self.claude_calls())
         self.speak()
         self.assertTrue(wait_for(lambda: len(self.claude_calls()) > n), self.log())
@@ -2113,6 +2207,205 @@ class Live(unittest.TestCase):
         self.assertEqual(self.proc.wait(10), 0, self.log())
         self.assertEqual(len(self.md_files()), 1, self.log())
 
+    # -------------------------------------------------------------- the kept-open suggestions process
+
+    def add_line(self, text, who="Others"):
+        """One more transcript line in the live meeting, after the last one."""
+        con = sqlite3.connect(self.db)
+        mid = con.execute("SELECT id FROM meetings WHERE meeting_status = 'recording' ORDER BY id DESC").fetchone()[0]
+        end = con.execute("SELECT COALESCE(MAX(end_seconds), 0) FROM meeting_transcript_checkpoints "
+                          "WHERE meeting_id = ?", (mid,)).fetchone()[0]
+        con.execute("INSERT INTO meeting_transcript_checkpoints (meeting_id, timestamp_label, speaker, start_seconds, "
+                    "end_seconds, text) VALUES (?, '00:00:00', ?, ?, ?, ?)", (mid, who, end + 1, end + 4, text))
+        con.commit()
+        con.close()
+
+    def turns(self):
+        return [c for c in self.claude_calls() if "turn" in c]
+
+    @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
+    def test_ai_click_warms_up_one_process_that_gets_only_new_lines(self):
+        self.start(MEETING_COPILOT_CONFIRM_AI="1")
+        mid = self.state()["meeting"]["id"]
+        self.assertEqual(self.post("/context", {"goal": "Keep the price flat", "goals": ["Price"]}), 200)
+        time.sleep(1)
+        self.assertEqual(self.spawns(), [])                       # nothing before the click
+        self.assertEqual(self.post("/ai", {"on": True, "meeting": mid}), 200)
+        self.assertTrue(wait_for(lambda: len(self.spawns()) == 1, 5), self.log())   # warm, before any line
+        self.assertEqual(self.claude_calls(), [])                 # warming up spends no AI call
+        pid = self.spawns()[0]["pid"]
+        self.speak()
+        self.assertTrue(wait_for(lambda: (self.state() or {}).get("say")), self.log())
+        first = self.turns()[0]
+        self.assertEqual(first["pid"], pid)
+        self.assertIn("Keep the price flat", first["stdin"])     # the seed: goals, shown items, transcript
+        self.assertIn("## ALREADY SHOWN", first["stdin"])
+        self.assertIn("Thanks for joining", first["stdin"])
+        self.add_line("The new price starts in April.")
+        self.assertTrue(wait_for(lambda: len(self.turns()) >= 2), self.log())
+        second = self.turns()[1]
+        self.assertEqual(second["pid"], pid)                      # the same process
+        self.assertIn("The new price starts in April.", second["stdin"])
+        self.assertNotIn("Thanks for joining", second["stdin"])  # only what is new
+        self.assertNotIn("Keep the price flat", second["stdin"])
+        self.assertNotIn("ALREADY SHOWN", second["stdin"])
+        self.assertEqual(self.post("/context", {"goal": "Keep the price flat", "goals": ["Price", "Start date"]}), 200)
+        self.add_line("We could start on the first of April.")
+        self.assertTrue(wait_for(lambda: len(self.turns()) >= 3), self.log())
+        self.assertIn("1. Start date", self.turns()[2]["stdin"])   # changed goals go along
+        self.assertEqual(len(self.spawns()), 1)
+        rounds = self.state()["ai_rounds"]
+        self.assertTrue(rounds and all(k in rounds[-1] for k in ("sent", "first_byte", "result", "turn")), rounds)
+        # AI off: the process is closed
+        self.assertEqual(self.post("/ai", {"on": False}), 200)
+        self.assertTrue(wait_for(lambda: not alive(pid), 10), self.log())
+        self.assertIn("AI process closed (AI turned off)", self.log())
+
+    @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
+    def test_click_for_the_next_meeting_warms_up_and_the_meeting_uses_that_process(self):
+        fake_meeting.end(copilot.Path(self.db))
+        self.start(MEETING_COPILOT_CONFIRM_AI="1")
+        self.assertEqual(self.post("/ai", {"on": True, "meeting": None}), 200)
+        self.assertTrue(wait_for(lambda: len(self.spawns()) == 1, 5), self.log())
+        pid = self.spawns()[0]["pid"]
+        self.assertIn("for the next meeting", self.log())
+        self.set_status("recording")
+        self.assertTrue(wait_for(lambda: (self.state() or {}).get("ai_on")), self.log())
+        self.speak()
+        self.assertTrue(wait_for(lambda: (self.state() or {}).get("say")), self.log())
+        self.assertEqual([c["pid"] for c in self.turns()][:1], [pid])
+        self.assertEqual(len(self.spawns()), 1)
+        # the meeting ends: closed
+        fake_meeting.end(copilot.Path(self.db))
+        self.assertTrue(wait_for(lambda: not alive(pid), 10), self.log())
+        self.assertIn("AI process closed (meeting ended)", self.log())
+
+    def test_next_meeting_click_that_expires_closes_the_process(self):
+        old = (copilot.S, copilot.E, copilot.SESSION)
+        try:
+            copilot.S = copilot.Settings({"MEETING_COPILOT_CONFIRM_AI": "1", "MEETING_COPILOT_DATA_DIR": self.t,
+                                          "MEETING_COPILOT_API_CREDIT": "off"})
+            copilot.E = copilot.State()
+            closed = []
+
+            class Fake:
+                owner = "next"
+
+                def alive(self):
+                    return True
+
+                def close(self, why, wait=False):
+                    closed.append(why)
+
+                def warm(self, owner, why=""):
+                    raise AssertionError("no warm-up expected")
+            copilot.SESSION = Fake()
+            copilot.S.claude = "/bin/true"
+            copilot.E.ai_for, copilot.E.ai_next_at = "next", time.time() - copilot.NEXT_MEETING_ARM_S - 1
+            copilot.ai_reconcile()
+            self.assertEqual(closed, ["AI not allowed now"])
+        finally:
+            copilot.S, copilot.E, copilot.SESSION = old
+
+    @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
+    def test_meeting_start_warms_up_without_confirm_ai(self):
+        self.start()
+        self.assertTrue(wait_for(lambda: len(self.spawns()) == 1, 5), self.log())
+        self.assertEqual(self.claude_calls(), [])
+        pid = self.spawns()[0]["pid"]
+        fake_meeting.end(copilot.Path(self.db))
+        self.assertTrue(wait_for(lambda: not alive(pid), 10), self.log())
+
+    @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
+    def test_watchdog_kills_a_silent_process_and_retries_on_a_fresh_one(self):
+        self.start(FAKE_CLAUDE_HANG_ONCE=os.path.join(self.t, "hung"), MEETING_COPILOT_AI_FIRST_BYTE_S="1",
+                   MEETING_COPILOT_AI_ROUND_S="2")
+        self.assertTrue(wait_for(lambda: self.spawns(), 5), self.log())
+        hung = self.spawns()[0]["pid"]
+        t0 = time.time()
+        self.speak()
+        self.assertTrue(wait_for(lambda: (self.state() or {}).get("say"), 20), self.log())
+        self.assertLess(time.time() - t0, 12)
+        self.assertIn("no first byte from the AI", self.log())
+        self.assertFalse(alive(hung))
+        retry = self.turns()[-1]
+        self.assertNotEqual(retry["pid"], hung)
+        self.assertIn("## ALREADY SHOWN", retry["stdin"])     # the fresh process was seeded
+        self.assertIn("Thanks for joining", retry["stdin"])
+        self.assertEqual(self.state()["ai_rounds"][-1]["attempts"], 2)
+
+    @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
+    def test_rotation_starts_a_fresh_seeded_process_past_the_token_limit(self):
+        self.start(FAKE_CLAUDE_TOKENS=str(copilot.ROTATE_TOKENS))
+        self.speak()
+        self.assertTrue(wait_for(lambda: (self.state() or {}).get("say")), self.log())
+        self.assertTrue(wait_for(lambda: "replaced by a fresh one" in self.log(), 5), self.log())
+        first = self.turns()[0]["pid"]
+        self.add_line("Shall we sign today?")
+        self.assertTrue(wait_for(lambda: len(self.turns()) >= 2), self.log())
+        nxt = self.turns()[1]
+        self.assertNotEqual(nxt["pid"], first)
+        self.assertFalse(alive(first))
+        self.assertIn("## ALREADY SHOWN", nxt["stdin"])
+        self.assertIn("Shall we sign today?", nxt["stdin"])
+
+    @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
+    def test_an_answer_that_is_not_json_is_dropped_and_the_next_round_works(self):
+        self.start(FAKE_CLAUDE_BAD_ONCE=os.path.join(self.t, "bad"))
+        self.speak()
+        self.assertTrue(wait_for(lambda: "the AI answer was not JSON, dropped" in self.log()), self.log())
+        self.assertEqual(self.state()["say"], [])
+        self.add_line("Shall we sign today?")
+        self.assertTrue(wait_for(lambda: (self.state() or {}).get("say")), self.log())
+        self.assertEqual(len(self.spawns()), 1)
+
+    def credit_settings(self, **extra):
+        wrapper = os.path.join(self.t, "claude-credito")
+        with open(wrapper, "w") as f:
+            f.write("#!/bin/sh\nexit 99\n")   # the kept-open process never goes through the wrapper
+        os.chmod(wrapper, 0o755)
+        out = dict(MEETING_COPILOT_API_CREDIT=wrapper, CLAUDE_CREDITO_KEY="sk-ant-test-0000",
+                   CLAUDE_CREDITO_KEYCHAIN="off", CLAUDE_CREDITO_STATE=os.path.join(self.t, "credit-state"),
+                   CLAUDE_CREDITO_LOG=os.path.join(self.t, "credit.log"),
+                   CLAUDE_CREDITO_CONFIG=os.path.join(self.t, "no-credit-config"))
+        out.update(extra)
+        return out
+
+    def pause_file(self):
+        return os.path.join(self.t, "credit-state", "paused-" + hashlib.sha256(b"sk-ant-test-0000").hexdigest()[:16])
+
+    @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
+    def test_api_credit_first_for_the_kept_open_process(self):
+        self.start(**self.credit_settings())
+        self.speak()
+        self.assertTrue(wait_for(lambda: (self.state() or {}).get("say")), self.log())
+        self.assertEqual([c["key"] for c in self.spawns()], [True])
+        self.assertIn("on api credit", self.log())
+        self.assertNotIn("sk-ant-test-0000", self.log())
+        self.assertFalse(os.path.exists(self.pause_file()))
+
+    @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
+    def test_api_refusal_pauses_the_key_and_the_round_goes_on_the_subscription(self):
+        self.start(**self.credit_settings(FAKE_CLAUDE_REFUSE_KEY="1"))
+        self.speak()
+        self.assertTrue(wait_for(lambda: (self.state() or {}).get("say")), self.log())
+        self.assertEqual([c["key"] for c in self.spawns()][:2], [True, False])
+        self.assertEqual([c["key"] for c in self.turns()][:2], [True, False])   # the same round, sent again
+        self.assertIn("## ALREADY SHOWN", self.turns()[1]["stdin"])
+        self.assertTrue(os.path.exists(self.pause_file()))       # the wrapper's own pause: other tools agree
+        with open(os.path.join(self.t, "credit.log"), encoding="utf-8") as f:
+            self.assertIn("API REFUSED (Credit balance is too low)", f.read())
+        self.assertNotIn("sk-ant-test-0000", self.log())
+        self.assertEqual(self.state()["ai_rounds"][-1]["attempts"], 1)
+        # restarted while paused: straight to the subscription
+        self.proc.kill()
+        self.proc.wait()
+        n = len(self.spawns())
+        self.start(**self.credit_settings(FAKE_CLAUDE_REFUSE_KEY="1"))
+        self.assertTrue(wait_for(lambda: len(self.spawns()) > n, 5), self.log())
+        self.assertFalse(self.spawns()[n]["key"])
+        self.assertIn("subscription (API credit paused)", self.log())
+
     def test_missing_db_exits_with_message(self):
         env = dict(self.env, MEETING_COPILOT_DB=os.path.join(self.t, "missing.db"))
         p = subprocess.run([PY, os.path.join(ROOT, "lib", "copilot.py")], env=env, capture_output=True,
@@ -2129,7 +2422,8 @@ class Tools(unittest.TestCase):
         self.t = os.path.realpath(self.tmp.name)
         self.home = os.path.join(self.t, "home")
         os.makedirs(self.home)
-        self.env = {k: v for k, v in os.environ.items() if not k.startswith(("MEETING_COPILOT", "CLAUDE"))}
+        self.env = {k: v for k, v in os.environ.items()
+                    if not k.startswith(("MEETING_COPILOT", "CLAUDE", "ANTHROPIC_API_KEY"))}
         self.env.update(HOME=self.home, USERPROFILE=self.home, XDG_DATA_HOME=os.path.join(self.t, "data"),
                         MEETING_COPILOT_OSASCRIPT="off")   # never a real notification on the test machine
 
