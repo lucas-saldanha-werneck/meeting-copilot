@@ -18,9 +18,11 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import hmac
 import json
 import os
 import re
+import secrets
 import shutil
 import signal
 import socketserver
@@ -36,9 +38,9 @@ from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
-__version__ = "0.7.2"
+__version__ = "0.7.3"
 
 HERE = Path(__file__).resolve().parent
 PAGE = HERE / "page.html"
@@ -66,6 +68,62 @@ def default_data_dir() -> Path:
 
 def _expand(v: str) -> str:
     return os.path.expanduser(os.path.expandvars(v.strip()))
+
+
+def data_dir_from(cfg: dict) -> Path:
+    v = cfg.get("MEETING_COPILOT_DATA_DIR", "")
+    return Path(_expand(v)) if v else default_data_dir()
+
+
+# ---------------------------------------------------------------- page token
+# The page has a password: a random token made once and kept in the data folder (0600). The launcher
+# opens <url>/?token=...; the server then sets a cookie and redirects to the clean URL.
+
+TOKEN_FILE = "token"
+TOKEN_COOKIE = "meeting_copilot_token"
+_TOKEN_OK = re.compile(r"^[A-Za-z0-9_-]{32,}$")
+
+
+def load_token(data_dir: Path) -> str:
+    """The page token in <data_dir>/token, created (random, mode 0600) when missing, empty or malformed."""
+    data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        os.chmod(data_dir, 0o700)   # the folder too: only you can list or open it (as the launcher does)
+    except OSError:
+        pass
+    path = data_dir / TOKEN_FILE
+    for _ in range(5):
+        try:
+            tok = path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            tok = None
+        if tok and _TOKEN_OK.match(tok):
+            try:
+                os.chmod(path, 0o600)   # opened up by hand: private again
+            except OSError:
+                pass
+            return tok
+        new = secrets.token_urlsafe(32)
+        fd, tmp = tempfile.mkstemp(dir=str(data_dir), prefix=".token.", suffix=".tmp")   # mode 0600
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(new + "\n")
+            if tok is None:
+                try:
+                    os.link(tmp, path)    # fails if another process made it meanwhile: use that one
+                except FileExistsError:
+                    continue
+            else:
+                os.replace(tmp, path)     # empty or malformed: replaced whole
+                tmp = None
+            return new
+        finally:
+            if tmp:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+    raise OSError(f"could not create the page token in {path}")
 
 
 def _is_path(cmd: str) -> bool:
@@ -209,7 +267,8 @@ class Settings:
         self.poll_s = float(g("POLL_S", "5"))
         self.assist_s = float(g("ASSIST_S", "25"))
         self.data_s = float(g("DATA_S", "45"))
-        self.data_dir = Path(_expand(g("DATA_DIR"))) if g("DATA_DIR") else default_data_dir()
+        self.data_dir = data_dir_from(cfg)
+        self.token = ""   # set by main() from load_token(); empty = every request is refused
         self.sessions_dir = Path(_expand(g("SESSIONS_DIR"))) if g("SESSIONS_DIR") else self.data_dir / "sessions"
         self.save_sessions = g("SAVE_SESSIONS", "1").strip().lower() not in ("0", "no", "false", "off")
         # CONFIRM_AI=1: no AI call in a meeting until you click "Turn on AI" on the page
@@ -1089,19 +1148,56 @@ class Page(BaseHTTPRequestHandler):
         # blocks DNS rebinding: only our own host names are answered
         return self.headers.get("Host", "") in S.hosts_ok
 
-    def _send(self, code: int, body: bytes, ctype: str) -> None:
+    def _send(self, code: int, body: bytes, ctype: str, headers: dict | None = None) -> None:
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Cache-Control", "no-store")
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
+
+    @staticmethod
+    def _token_ok(given: str) -> bool:
+        return bool(given and S.token) and hmac.compare_digest(given.encode(), S.token.encode())
+
+    def _sent_token(self) -> str:
+        """The token from the cookie, else from an `Authorization: Bearer` header (for scripts)."""
+        for part in self.headers.get("Cookie", "").split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == TOKEN_COOKIE and self._token_ok(v.strip()):
+                return v.strip()
+        auth = self.headers.get("Authorization", "")
+        return auth[7:].strip() if auth[:7].lower() == "bearer " else ""
+
+    def _deny(self) -> None:
+        self._send(401, b"missing or wrong token: open the URL that `meeting-copilot` prints "
+                        b"(it ends in ?token=...)\n", "text/plain; charset=utf-8")
+
+    def _route(self) -> tuple[str, str | None]:
+        """(path, token given in ?token= or None)."""
+        u = urlsplit(self.path)
+        given = [v for k, v in parse_qsl(u.query, keep_blank_values=True) if k == "token"]
+        return u.path, (given[0] if given else None)
 
     def do_GET(self):
         if not self._host_ok():
             return self._send(403, b"host", "text/plain")
-        if self.path == "/":
+        path, given = self._route()
+        if given is not None:
+            if not self._token_ok(given):
+                return self._deny()
+            # remember it in a cookie and drop it from the address bar (and from the browser history)
+            rest = urlencode([(k, v) for k, v in parse_qsl(urlsplit(self.path).query, keep_blank_values=True)
+                              if k != "token"])
+            loc = "/" + path.lstrip("/") + (f"?{rest}" if rest else "")   # never //host: no open redirect
+            cookie = f"{TOKEN_COOKIE}={S.token}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Strict"
+            return self._send(303, b"", "text/plain", {"Location": loc, "Set-Cookie": cookie})
+        if not self._token_ok(self._sent_token()):
+            return self._deny()
+        if path == "/":
             return self._send(200, PAGE.read_bytes(), "text/html; charset=utf-8")
-        if self.path == "/state":
+        if path == "/state":
             return self._send(200, json.dumps(E.public(), ensure_ascii=False).encode(), "application/json")
         self._send(404, b"", "text/plain")
 
@@ -1110,6 +1206,9 @@ class Page(BaseHTTPRequestHandler):
         if not self._host_ok() or self.headers.get("Origin") not in S.origins_ok \
                 or not self.headers.get("Content-Type", "").startswith("application/json"):
             return self._send(403, b"origin", "text/plain")
+        path, given = self._route()
+        if not self._token_ok(given if given is not None else self._sent_token()):
+            return self._deny()
         n = int(self.headers.get("Content-Length", "0") or 0)
         try:
             body = json.loads(self.rfile.read(min(n, 100_000)) or b"{}")
@@ -1118,14 +1217,14 @@ class Page(BaseHTTPRequestHandler):
         if not isinstance(body, dict):
             return self._send(400, b"json", "text/plain")
         with E.lock:
-            if self.path == "/context":
+            if path == "/context":
                 E.goal = str(body.get("goal", ""))[:2000]
                 old = {m["text"]: m["covered"] for m in E.goals}
                 E.goals = [{"text": t, "covered": old.get(t, False)}
                            for t in (str(x).strip() for x in body.get("goals", []) or []) if t][:12]
-            elif self.path == "/mute":
+            elif path == "/mute":
                 E.muted.add(str(body.get("kind", "")))
-            elif self.path == "/ai":
+            elif path == "/ai":
                 # {"on": true, "meeting": <id shown on the page> | null (= the next meeting)}
                 mid = body.get("meeting")
                 if body.get("on") is not True:
@@ -1187,9 +1286,14 @@ def main(argv=None) -> None:
     ap.add_argument("--port", type=int, help="local port (default 4390)")
     ap.add_argument("--version", action="version", version=f"meeting-copilot {__version__}")
     ap.add_argument("--get", metavar="KEY", help=argparse.SUPPRESS)  # for bin/meeting-copilot: PORT, OPEN_CMD
+    ap.add_argument("--token", action="store_true",
+                    help="print the page token (created on first use) and exit")
     args = ap.parse_args(argv)
     seed_config()   # bin/meeting-copilot calls --get first, so any first command creates it
     cfg = load_config()
+    if args.token:
+        print(load_token(data_dir_from(cfg)))
+        return
     if args.get:
         v = cfg.get("MEETING_COPILOT_" + args.get, "")
         print(_expand(v) if v and args.get == "DATA_DIR" else v)
@@ -1199,6 +1303,7 @@ def main(argv=None) -> None:
     if args.port:
         cfg["MEETING_COPILOT_PORT"] = str(args.port)
     S = Settings(cfg)
+    S.token = load_token(S.data_dir)
     if not S.db.exists():
         raise SystemExit(f"Muesli database not found: {S.db}\n"
                          "Install and run Muesli, or point MEETING_COPILOT_DB / --db at its muesli.db.")

@@ -6,6 +6,7 @@ invented meeting, and a fake `claude` first on PATH (tests/fake_claude.py). No r
 """
 import filecmp
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -39,6 +40,11 @@ def free_port() -> int:
     p = s.getsockname()[1]
     s.close()
     return p
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
 
 
 def sha(path) -> str:
@@ -716,6 +722,49 @@ def read_bytes(path):
         return f.read()
 
 
+class Token(unittest.TestCase):
+    """The page token: random, made once, kept private in the data folder (never in the repo)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.t = os.path.realpath(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_created_once_private_and_stable(self):
+        d = copilot.Path(self.t) / "data"
+        tok = copilot.load_token(d)
+        self.assertRegex(tok, r"^[A-Za-z0-9_-]{32,}$")
+        self.assertEqual(copilot.load_token(d), tok)
+        self.assertNotEqual(copilot.load_token(copilot.Path(self.t) / "other"), tok)
+        if not WIN:
+            self.assertEqual(os.stat(d / "token").st_mode & 0o777, 0o600)
+            self.assertEqual(os.stat(d).st_mode & 0o777, 0o700)
+            os.chmod(d / "token", 0o644)          # opened up by hand: closed again, same token
+            os.chmod(d, 0o755)
+            self.assertEqual(copilot.load_token(d), tok)
+            self.assertEqual(os.stat(d / "token").st_mode & 0o777, 0o600)
+            self.assertEqual(os.stat(d).st_mode & 0o777, 0o700)
+
+    def test_empty_or_bad_file_gets_a_new_token(self):
+        d = copilot.Path(self.t)
+        (d / "token").write_text("\n")
+        tok = copilot.load_token(d)
+        self.assertRegex(tok, r"^[A-Za-z0-9_-]{32,}$")
+        (d / "token").write_text("bad token with spaces;\n")
+        self.assertNotEqual(copilot.load_token(d), "bad token with spaces;")
+
+    def test_token_flag_prints_it_from_the_configured_data_dir(self):
+        data = os.path.join(self.t, "mydata")
+        env = {k: v for k, v in os.environ.items() if not k.startswith("MEETING_COPILOT")}
+        env.update(HOME=self.t, USERPROFILE=self.t, MEETING_COPILOT_CONFIG=os.path.join(self.t, "no-config"),
+                   MEETING_COPILOT_DATA_DIR=data)
+        p = subprocess.run([PY, os.path.join(ROOT, "lib", "copilot.py"), "--token"], env=env,
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        with open(os.path.join(data, "token"), encoding="utf-8") as f:
+            self.assertEqual(p.stdout.strip(), f.read().strip())
+
+
 class Seed(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -903,13 +952,35 @@ class Live(unittest.TestCase):
         except (urllib.error.URLError, ConnectionError, OSError):
             return None
 
-    def request(self, path, data=None, headers=None):
-        req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, headers=headers or {})
+    def token(self):
+        """The page token the copilot keeps in its data folder (created on first start)."""
         try:
-            with urllib.request.urlopen(req, timeout=3) as r:
+            with open(os.path.join(self.t, "data", "meeting-copilot", "token"), encoding="utf-8") as f:
+                return f.read().strip()
+        except OSError:
+            return ""
+
+    def request(self, path, data=None, headers=None, auth=True):
+        # auth=True sends the token cookie, as the browser does after opening the printed URL once
+        h = dict(headers or {})
+        if auth and "Cookie" not in h:
+            h["Cookie"] = f"meeting_copilot_token={self.token()}"
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, headers=h)
+        try:
+            with urllib.request.build_opener(NoRedirect).open(req, timeout=3) as r:
                 return r.status, r.read()
         except urllib.error.HTTPError as e:
             return e.code, e.read()
+
+    def raw(self, path, headers=None, method="GET", body=None):
+        """(status, headers, body) without following redirects or adding the cookie."""
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=3)
+        try:
+            c.request(method, path, body=body, headers=headers or {})
+            r = c.getresponse()
+            return r.status, r.headers, r.read()
+        finally:
+            c.close()
 
     def state(self):
         code, body = self.request("/state")
@@ -1108,6 +1179,56 @@ class Live(unittest.TestCase):
         self.assertEqual(st["goal"], "Agree on the date")
         self.assertEqual([g["text"] for g in st["goals"]], ["a", "b"])
         self.assertEqual(st["status"], "live")  # setUp started a recording meeting
+
+    def test_every_endpoint_needs_the_token(self):
+        self.start(MEETING_COPILOT_CLAUDE=os.path.join(self.t, "no-claude"))
+        tok = self.token()
+        self.assertGreaterEqual(len(tok), 32)
+        if not WIN:
+            path = os.path.join(self.t, "data", "meeting-copilot", "token")
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        o = {"Content-Type": "application/json", "Origin": f"http://127.0.0.1:{self.port}"}
+        # no token, a wrong cookie, a wrong ?token: refused with a short plain message, nothing leaks
+        for path in ("/", "/state", "/nope"):
+            code, body = self.request(path, auth=False)
+            self.assertEqual(code, 401, path)
+            self.assertIn(b"token", body)
+            self.assertNotIn(b"Meeting Copilot", body)
+            self.assertEqual(self.request(path, headers={"Cookie": "meeting_copilot_token=wrong"})[0], 401)
+            self.assertEqual(self.request(path + "?token=wrong", auth=False)[0], 401)
+        for path in ("/context", "/mute", "/ai"):
+            self.assertEqual(self.request(path, b'{"goal":"x"}', dict(o), auth=False)[0], 401, path)
+            self.assertEqual(self.request(path + "?token=wrong", b'{"goal":"x"}', dict(o), auth=False)[0], 401)
+        self.assertEqual(self.state()["goal"], "")
+        # ?token=<right> sets an HttpOnly SameSite=Strict cookie and redirects to the clean URL
+        code, hdrs, _ = self.raw(f"/?token={tok}")
+        self.assertEqual(code, 303)
+        self.assertEqual(hdrs["Location"], "/")
+        cookie = hdrs["Set-Cookie"]
+        self.assertIn(f"meeting_copilot_token={tok}", cookie)
+        self.assertIn("HttpOnly", cookie)
+        self.assertIn("SameSite=Strict", cookie)
+        self.assertIn("Path=/", cookie)
+        code, hdrs, _ = self.raw(f"/state?token={tok}")
+        self.assertEqual((code, hdrs["Location"]), (303, "/state"))
+        # the cookie opens everything; a program can also send the token as a bearer header
+        code, body = self.request("/")
+        self.assertEqual(code, 200)
+        self.assertIn(b"Meeting Copilot", body)
+        self.assertEqual(self.post("/context", {"goal": "With cookie"}), 200)
+        code, _, body = self.raw("/state", {"Authorization": f"Bearer {tok}"})
+        self.assertEqual(json.loads(body)["goal"], "With cookie")
+        self.assertEqual(self.raw("/state", {"Authorization": "Bearer wrong"})[0], 401)
+        # a cookie jar with other cookies too
+        self.assertEqual(self.request("/state", headers={"Cookie": f"a=b; meeting_copilot_token={tok}; c=d"})[0],
+                         200)
+        # the host check still comes first
+        self.assertEqual(self.request("/state", headers={"Host": "evil.example:80"})[0], 403)
+        # the same token after a restart: a page left open keeps working
+        self.proc.kill()
+        self.proc.wait()
+        self.start()
+        self.assertEqual(self.token(), tok)
 
     def set_status(self, status, meeting_id=None):
         con = sqlite3.connect(self.db)
@@ -1336,6 +1457,8 @@ class Tools(unittest.TestCase):
             except OSError:
                 time.sleep(0.2)
 
+    token = Live.token   # the same data folder layout: <t>/data/meeting-copilot/token
+
     def test_fake_meeting_refuses_real_db_and_runs(self):
         real = os.path.join(self.home, "Library", "Application Support", "Muesli", "muesli.db")
         os.makedirs(os.path.dirname(real))
@@ -1465,11 +1588,18 @@ class Tools(unittest.TestCase):
         try:
             p = subprocess.run(["bash", link, "--no-open"], env=env, capture_output=True, text=True, timeout=30)
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-            self.assertIn(f"http://127.0.0.1:{port}", p.stdout)
+            tok = self.token()
+            self.assertIn(f"http://127.0.0.1:{port}/?token={tok}", p.stdout)   # printed with the token
             p = subprocess.run(["bash", link, "status"], env=env, capture_output=True, text=True)
             self.assertEqual(p.returncode, 0, p.stdout)
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/state", timeout=3) as r:
+            self.assertIn(f"http://127.0.0.1:{port}/?token={tok}", p.stdout)
+            req = urllib.request.Request(f"http://127.0.0.1:{port}/state",
+                                         headers={"Authorization": f"Bearer {tok}"})
+            with urllib.request.urlopen(req, timeout=3) as r:
                 self.assertTrue(json.loads(r.read())["live"])
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                urllib.request.urlopen(f"http://127.0.0.1:{port}/state", timeout=3)
+            self.assertEqual(cm.exception.code, 401)
         finally:
             p = subprocess.run(["bash", link, "stop"], env=env, capture_output=True, text=True, timeout=30)
         self.assertIn("stopped", p.stdout)
@@ -1499,14 +1629,14 @@ class Tools(unittest.TestCase):
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
             self.assertIn(f"http://127.0.0.1:{port}", p.stdout)        # the port came from the file
             with open(opened) as f:
-                self.assertEqual(f.read(), f"--new-tab|http://127.0.0.1:{port}|--bg|")
+                self.assertEqual(f.read(), f"--new-tab|http://127.0.0.1:{port}/?token={self.token()}|--bg|")
             # without {url}, the URL goes at the end (a later line wins)
             with open(cfg_file, "a") as f:
                 f.write(f"MEETING_COPILOT_OPEN_CMD={opener} -x\n")
             p = subprocess.run(["bash", launcher], env=env, capture_output=True, text=True, timeout=30)
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
             with open(opened) as f:
-                self.assertEqual(f.read(), f"-x|http://127.0.0.1:{port}|")
+                self.assertEqual(f.read(), f"-x|http://127.0.0.1:{port}/?token={self.token()}|")
         finally:
             subprocess.run(["bash", launcher, "stop"], env=env, capture_output=True, text=True, timeout=30)
 
@@ -1531,7 +1661,7 @@ class Tools(unittest.TestCase):
             p = subprocess.run(["bash", launcher], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                stdin=subprocess.DEVNULL, text=True, timeout=20)
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-            url = f"http://127.0.0.1:{port}"
+            url = f"http://127.0.0.1:{port}/?token={self.token()}"
             wait_for(lambda: os.path.exists(opened) and os.path.getsize(opened) > 0, timeout=5)
             with open(opened) as f:
                 self.assertEqual(f.read(), f"{url}|--again|{url}|")      # every {url} is the URL
@@ -1554,7 +1684,7 @@ class Tools(unittest.TestCase):
             p = subprocess.run(["bash", launcher], env=env, capture_output=True, text=True, timeout=30)
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
             self.assertIn("MEETING_COPILOT_OPEN_CMD failed", p.stderr)
-            self.assertIn(f"open http://127.0.0.1:{port} in your browser", p.stdout)
+            self.assertIn(f"open http://127.0.0.1:{port}/?token={self.token()} in your browser", p.stdout)
         finally:
             subprocess.run(["bash", launcher, "stop"], env=env, capture_output=True, text=True, timeout=30)
 

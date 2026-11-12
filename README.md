@@ -20,7 +20,7 @@ The AI runs through `claude -p` (Claude Code), so it uses your Claude Code login
 
 ```
 $ meeting-copilot
-meeting-copilot on http://127.0.0.1:4390 - start a meeting in Muesli
+meeting-copilot on http://127.0.0.1:4390/?token=3q2-…  - start a meeting in Muesli
 ```
 
 Output from a simulated meeting (invented conversation about renewing a cleaning contract, with a notes file that says the increase is 12%):
@@ -50,9 +50,15 @@ cd meeting-copilot
 ```
 meeting-copilot             start (if needed) and open the page in your default browser
 meeting-copilot --no-open   start and only print the URL
-meeting-copilot status
+meeting-copilot status      say whether it runs, with the page URL
 meeting-copilot log
 meeting-copilot stop        stop it (the session is saved)
+```
+
+The page needs a token. `meeting-copilot` opens and prints the URL with it (`…/?token=…`), and `meeting-copilot status` prints it again at any time; the first visit stores it in a cookie and drops it from the address bar, so later visits to `http://127.0.0.1:4390` just work. On another browser or device (for example through `MEETING_COPILOT_EXTRA_HOSTS`), open the printed URL once, with the host swapped. The token is made on first start in your data folder (`~/.local/share/meeting-copilot/token`, or under `$XDG_DATA_HOME` or `MEETING_COPILOT_DATA_DIR` when set; readable only by you) and stays the same across restarts; `python3 lib/copilot.py --token` prints it, and deleting the file makes a new one at the next start. A script can send it as `Authorization: Bearer <token>`:
+
+```
+curl -s -H "Authorization: Bearer $(cat ~/.local/share/meeting-copilot/token)" http://127.0.0.1:4390/state
 ```
 
 Start a recording in Muesli; the page switches to "live" within a few seconds. Open "Objective and goals" on the page to type what you want out of the meeting.
@@ -187,7 +193,7 @@ With neither search folders nor MCP, the "Relevant facts" panel says fact search
 - The transcript of the last 3 minutes, your goals and the items already shown are sent to Claude through `claude -p` on each call. Nothing else leaves the machine.
 - Sessions (full transcript plus suggestions) are saved as JSON files readable only by your user. A meeting saved again (the copilot restarted, or the meeting stopped and recorded again) gets a new file with `-2`, `-3`, and so on, so nothing earlier is overwritten.
 - The fact search may read files only inside the search folders: Read, Grep and Glob are allowed with a path rule for each folder, so a request in the meeting to open any other file is refused. The AI runs in an empty folder of its own and loads no Claude Code settings files, so no hook planted in a search folder runs with it.
-- The page answers only on 127.0.0.1 / localhost (plus any `MEETING_COPILOT_EXTRA_HOSTS`), checks the `Host` header against DNS rebinding, and accepts POSTs only from its own origin. It has no password: any program running on this Mac can read the live page state, transcript lines included.
+- The page answers only on 127.0.0.1 / localhost (plus any `MEETING_COPILOT_EXTRA_HOSTS`), checks the `Host` header against DNS rebinding, and accepts POSTs only from its own origin. Every request (the page, `/state` and each POST) needs the token: a `?token=` in the URL, the `HttpOnly`, `SameSite=Strict` cookie it sets, or an `Authorization: Bearer` header; anything else gets `401`. The token file is readable only by your user, so other users' programs and web pages cannot read the meeting; a program running as you can still read the file.
 
 ## Uninstall
 

@@ -4,6 +4,7 @@
 #   meeting-copilot stop                                  stop it
 #   meeting-copilot status                                say whether it is running
 #   meeting-copilot log                                   show the end of the log
+#   The page needs a token: the URL it prints and opens ends in ?token=... (kept in the data folder).
 set -u
 
 # Resolve the real script location, also when called through a symlink in ~/.local/bin.
@@ -37,7 +38,7 @@ while [ $# -gt 0 ]; do
     --no-open) open_page=0 ;;
     --port) port="$2"; args+=("--port" "$2"); shift ;;
     --db) args+=("--db" "$2"); shift ;;
-    -h|--help) sed -n '2,6p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,7p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "meeting-copilot: unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
@@ -69,12 +70,28 @@ use_running_port() {
   fi
 }
 
+# The page token (the token file is made on first use, mode 0600, in the data folder).
+page_token() { "$PY" "$APP" --token 2>/dev/null; }
+
+# Whether our copilot answers /state with the token. The token goes in on stdin, never on the
+# command line (other users can read process arguments).
 page_up() {
+  local tok="$1"
   if command -v curl >/dev/null 2>&1; then
-    curl -s -o /dev/null --max-time 1 "$URL/state"
+    printf 'Authorization: Bearer %s\n' "$tok" | curl -sf -o /dev/null --max-time 1 -H @- "$URL/state"
   else
-    "$PY" -c "import urllib.request,sys; urllib.request.urlopen(sys.argv[1], timeout=1)" "$URL/state" 2>/dev/null
+    printf '%s' "$tok" | "$PY" -c "
+import sys, urllib.request
+req = urllib.request.Request(sys.argv[1], headers={'Authorization': 'Bearer ' + sys.stdin.read().strip()})
+urllib.request.urlopen(req, timeout=1)" "$URL/state" 2>/dev/null
   fi
+}
+
+# The page URL with its token.
+page_url() {
+  local tok
+  tok="$(page_token)"
+  if [ -n "$tok" ]; then echo "$URL/?token=$tok"; else echo "$URL"; fi
 }
 
 open_url() {
@@ -89,7 +106,7 @@ open_url() {
     esac
     # In the background, so a browser started directly (it keeps running) never holds the
     # terminal; a command that fails within 3 s is still reported. Its output goes to the log.
-    bash -c "$cmd" meeting-copilot "$URL" </dev/null >>"$LOG" 2>&1 &
+    bash -c "$cmd" meeting-copilot "$PAGE" </dev/null >>"$LOG" 2>&1 &
     local pid=$! i
     for i in $(seq 1 15); do kill -0 "$pid" 2>/dev/null || break; sleep 0.2; done
     if kill -0 "$pid" 2>/dev/null || wait "$pid"; then return 0; fi
@@ -97,9 +114,9 @@ open_url() {
     return 1
   fi
   if [ "$(uname -s)" = "Darwin" ] && command -v open >/dev/null 2>&1; then
-    open "$URL" && return 0
+    open "$PAGE" && return 0
   elif command -v xdg-open >/dev/null 2>&1; then
-    xdg-open "$URL" >/dev/null 2>&1 && return 0
+    xdg-open "$PAGE" >/dev/null 2>&1 && return 0
   fi
   return 1
 }
@@ -117,7 +134,7 @@ case "$cmd" in
     fi ;;
   status)
     p="$(running_pid)"
-    if [ -n "$p" ]; then use_running_port "$p"; echo "running (pid $p) on $URL"; else echo "not running"; exit 1; fi ;;
+    if [ -n "$p" ]; then use_running_port "$p"; echo "running (pid $p) on $(page_url)"; else echo "not running"; exit 1; fi ;;
   log)
     tail -n 30 "$LOG" 2>/dev/null || echo "no log yet: $LOG" ;;
   start)
@@ -127,13 +144,14 @@ case "$cmd" in
       use_running_port "$p"
     else
       rm -f "$PORTFILE"
+      tok="$(page_token)"   # made before the server starts, so both use the same file
       nohup "$PY" -u "$APP" ${args[@]+"${args[@]}"} >> "$LOG" 2>&1 &
       np=$!
       echo "$np" > "$PIDFILE"
       # kill -0 only here: until nohup has started python, the process does not look like the copilot yet
       for _ in $(seq 1 40); do
         kill -0 "$np" 2>/dev/null || break
-        page_up && break
+        page_up "$tok" && break
         sleep 0.25
       done
     fi
@@ -143,8 +161,9 @@ case "$cmd" in
       tail -n 5 "$LOG" >&2
       exit 1
     fi
-    echo "meeting-copilot on $URL - start a meeting in Muesli"
+    PAGE="$(page_url)"
+    echo "meeting-copilot on $PAGE - start a meeting in Muesli"
     if [ "$open_page" = 1 ]; then
-      open_url || echo "open $URL in your browser"
+      open_url || echo "open $PAGE in your browser"
     fi ;;
 esac
