@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import hashlib
 import hmac
+import http.client
 import ipaddress
 import json
 import os
@@ -42,10 +44,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 HERE = Path(__file__).resolve().parent
 PAGE = HERE / "page.html"
+LOGIN_PAGE = HERE / "login.html"
 STARTER = HERE.parent / "config.example"   # copied to your config path on first run (seed_config)
 
 COOLDOWN_WARNING_S = 120   # between any two warnings
@@ -78,8 +81,9 @@ def data_dir_from(cfg: dict) -> Path:
 
 
 # ---------------------------------------------------------------- page token
-# The page has a password: a random token made once and kept in the data folder (0600). The launcher
-# opens <url>/?token=...; the server then sets a cookie and redirects to the clean URL.
+# The page has a password: a random token made once and kept in the data folder (0600). Scripts send it as
+# a Bearer header; the launcher uses it to get a one-time login link for the Mac's own browser; an old
+# <url>/?token=... still sets the cookie and redirects to the clean URL. Other browsers use a pairing code.
 
 TOKEN_FILE = "token"
 TOKEN_COOKIE = "meeting_copilot_token"
@@ -126,6 +130,231 @@ def load_token(data_dir: Path) -> str:
                 except OSError:
                     pass
     raise OSError(f"could not create the page token in {path}")
+
+
+# ---------------------------------------------------------------- pairing code
+# A browser without a valid cookie gets a login page that asks for a 6-digit code. The code is shown on the
+# Mac (a notification, `meeting-copilot status`, and the "Pair a device" button on a page that is already
+# logged in). A right code gives that browser its own device cookie, saved hashed in <data_dir>/devices.json
+# and revocable with `meeting-copilot devices forget`. The page token keeps working (?token=, Bearer).
+
+CODE_TTL_S = 300            # a code is valid for 5 minutes
+CODE_MAX_WRONG = 5          # wrong tries before the code is thrown away
+LOGIN_WRONG_PER_MIN = 10    # wrong tries per minute over every code and client; then every try waits
+LOGIN_MAX_WRONG = 20        # wrong tries since the last login: then locked until the Mac asks for a code
+LOGIN_LINK_TTL_S = 60       # the launcher's one-time link for the Mac's own browser
+NOTIFY_EVERY_S = 20         # "send the code again" shows the notification at most this often
+DEVICE_COOKIE = "meeting_copilot_device"
+DEVICES_FILE = "devices.json"
+DEVICE_MAX_AGE_S = 365 * 24 * 3600
+DEVICES_MAX = 50            # the oldest paired device is dropped beyond this
+_CODE_OK = re.compile(r"^[0-9]{6}$")
+_HASH_OK = re.compile(r"^[0-9a-f]{64}$")
+
+
+class Pairing:
+    """The pairing code: 6 random digits, one active code at a time, single use.
+
+    Asking for a code while one is valid returns the same code (several tabs or devices that open the login
+    page never invalidate each other's code, and the Mac gets one notification, not one per page view)."""
+
+    def __init__(self, clock=None) -> None:
+        self.clock = clock or time.time
+        self.lock = threading.Lock()
+        self.code: str | None = None
+        self.expires = 0.0
+        self.wrong = 0
+        self.fails: list[float] = []      # times of recent wrong tries, for the global limit
+        self.strikes = 0                  # wrong tries since the last right code or the Mac's own request
+        self.notified = 0.0
+        self.links: dict[str, float] = {}  # one-time login links: secret -> expiry
+
+    def _active(self, t: float) -> bool:
+        if self.code and t < self.expires:
+            return True
+        self.code = None
+        return False
+
+    def current(self) -> tuple[str, int] | None:
+        """(code, seconds left) of the active code, or None. Never makes one."""
+        with self.lock:
+            t = self.clock()
+            return (self.code, max(1, int(self.expires - t))) if self._active(t) else None
+
+    @property
+    def locked(self) -> bool:
+        return self.strikes >= LOGIN_MAX_WRONG
+
+    def get_or_create(self, owner: bool = False) -> tuple[str | None, int, bool]:
+        """(code, seconds left, made now): the active code, or a new one when there is none.
+
+        owner=True: asked on the Mac (`meeting-copilot code`, "Pair a device" on a logged-in page); this
+        also lifts the lock. When locked, a browser that is not logged in gets (None, 0, False)."""
+        with self.lock:
+            t = self.clock()
+            if owner:
+                self.strikes, self.fails = 0, []
+            elif self.locked:
+                return None, 0, False
+            made = not self._active(t)
+            if made:
+                self.code = f"{secrets.randbelow(10 ** 6):06d}"
+                self.expires, self.wrong = t + CODE_TTL_S, 0
+                self.notified = t
+            return self.code, max(1, int(self.expires - t)), made
+
+    def may_notify_again(self) -> bool:
+        with self.lock:
+            t = self.clock()
+            if t - self.notified < NOTIFY_EVERY_S:
+                return False
+            self.notified = t
+            return True
+
+    def try_code(self, given: str) -> tuple[str, int]:
+        """("ok" | "wrong" | "used_up" | "expired" | "limited" | "locked", number): tries left after a wrong
+        code, seconds to wait when limited, else 0. A right code ends the code; so do CODE_MAX_WRONG wrong ones.
+        LOGIN_MAX_WRONG wrong tries since the last right code lock the login until the Mac asks for a code."""
+        given = re.sub(r"[\s-]", "", str(given or ""))
+        with self.lock:
+            t = self.clock()
+            self.fails = [x for x in self.fails if t - x < 60]
+            if self.locked:
+                return "locked", 0
+            if len(self.fails) >= LOGIN_WRONG_PER_MIN:
+                return "limited", max(1, int(60 - (t - self.fails[0])) + 1)
+            if not self._active(t):
+                return "expired", 0           # nothing to guess: not counted
+
+            # constant time: the code is never compared byte by byte with an early exit
+            ok = hmac.compare_digest(given.encode(), self.code.encode()) and bool(_CODE_OK.match(given))
+            if ok:
+                self.code, self.strikes = None, 0
+                return "ok", 0
+            self.fails.append(t)
+            self.strikes += 1
+            self.wrong += 1
+            if self.locked:
+                self.code = None
+                return "locked", 0
+            if self.wrong >= CODE_MAX_WRONG:
+                self.code = None
+                return "used_up", 0
+            return "wrong", CODE_MAX_WRONG - self.wrong
+
+    def new_link(self) -> str:
+        with self.lock:
+            t = self.clock()
+            self.links = {k: v for k, v in self.links.items() if v > t}
+            secret = secrets.token_urlsafe(24)
+            self.links[secret] = t + LOGIN_LINK_TTL_S
+            return secret
+
+    def use_link(self, secret: str) -> bool:
+        """A one-time login link: valid once, for LOGIN_LINK_TTL_S seconds."""
+        with self.lock:
+            t = self.clock()
+            for k in list(self.links):
+                if hmac.compare_digest(k.encode(), str(secret).encode()):
+                    return self.links.pop(k) > t
+            return False
+
+
+def _hash(secret: str) -> str:
+    return hashlib.sha256(secret.encode()).hexdigest()
+
+
+class Devices:
+    """Browsers that logged in with a pairing code: <data_dir>/devices.json (0600), only hashes of the cookies.
+
+    Read again whenever the file changes, so `meeting-copilot devices forget` logs every device out of the
+    running copilot at once."""
+
+    def __init__(self, path: Path | None) -> None:
+        self.path = path
+        self.lock = threading.Lock()
+        self._sig = None
+        self._items: list[dict] = []
+
+    def _load(self) -> list[dict]:
+        if self.path is None:
+            return []
+        try:
+            st = self.path.stat()
+            sig = (st.st_mtime_ns, st.st_size, st.st_ino)
+        except OSError:
+            self._sig, self._items = None, []
+            return self._items
+        if sig != self._sig:
+            try:
+                data = json.loads(self.path.read_text(encoding="utf-8"))
+                items = [d for d in data.get("devices", [])
+                         if isinstance(d, dict) and isinstance(d.get("id"), str) and _HASH_OK.match(d["id"])]
+            except (OSError, ValueError, AttributeError):
+                items = []
+            self._sig, self._items = sig, items
+        return self._items
+
+    def _live(self, items: list[dict]) -> list[dict]:
+        t = now()
+        return [d for d in items if isinstance(d.get("created"), (int, float)) and t - d["created"] < DEVICE_MAX_AGE_S]
+
+    def list(self) -> list[dict]:
+        with self.lock:
+            return list(self._live(self._load()))
+
+    def add(self, label: str) -> str:
+        """Saves a new device and returns its cookie value (the file keeps only its hash)."""
+        secret = secrets.token_urlsafe(32)
+        with self.lock:
+            items = self._live(self._load())[-(DEVICES_MAX - 1):]
+            # printable ASCII only: `meeting-copilot devices` prints it to a terminal (no escape sequences)
+            label = "".join(c if " " <= c <= "~" else "?" for c in label)[:120]
+            items.append({"id": _hash(secret), "created": int(now()), "label": label})
+            self._save(items)
+        return secret
+
+    def ok(self, secret: str) -> bool:
+        if not secret or self.path is None:
+            return False
+        h = _hash(secret)
+        with self.lock:
+            return any(hmac.compare_digest(h, d["id"]) for d in self._live(self._load()))
+
+    def forget_all(self) -> int:
+        with self.lock:
+            n = len(self._live(self._load()))
+            self._save([])
+            return n
+
+    def _save(self, items: list[dict]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _write_private(self.path, json.dumps({"devices": items}, indent=1))
+        self._sig = None
+
+
+PAIR = Pairing()
+LOCKED_MSG = "Too many wrong codes: login is locked. On the Mac, run: meeting-copilot code"
+DEVICES = Devices(None)   # main() points it at <data_dir>/devices.json
+
+
+def notify(code: str) -> None:
+    """Shows the code as a macOS notification (osascript), in the background. No-op without osascript."""
+    exe = S.osascript
+    if not exe:
+        return
+    # the text goes in as arguments, never pasted into the AppleScript source
+    cmd = [exe, "-e", "on run argv", "-e", "display notification (item 2 of argv) with title (item 1 of argv)",
+           "-e", "end run", "Meeting Copilot", f"Code to open the page: {code} (valid 5 minutes)"]
+
+    def run():
+        try:
+            subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=15)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    threading.Thread(target=run, daemon=True).start()
 
 
 def _is_path(cmd: str) -> bool:
@@ -379,6 +608,12 @@ class Settings:
         self.lan_hosts_ok = {f"{n}:{self.lan_port}" for n in names} | (set(names) if self.lan_port == 80 else set())
         dns_sd = g("DNS_SD").strip()
         self.dns_sd = _expand(dns_sd) if dns_sd else (shutil.which("dns-sd") if sys.platform == "darwin" else None)
+        # the pairing code notification: osascript on macOS; OSASCRIPT=off turns it off
+        osa = g("OSASCRIPT").strip()
+        if osa.lower() in ("0", "no", "false", "off"):
+            self.osascript = None
+        else:
+            self.osascript = _expand(osa) if osa else (shutil.which("osascript") if sys.platform == "darwin" else None)
 
     @property
     def data_enabled(self) -> bool:
@@ -1337,58 +1572,135 @@ class Page(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Cache-Control", "no-store")
+        if ctype.startswith("text/html"):
+            # never inside another site's frame (no clickjacking of the login form or the page buttons)
+            self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
+            self.send_header("X-Frame-Options", "DENY")
         for k, v in (headers or {}).items():
             self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
 
+    def _json(self, code: int, obj: dict, headers: dict | None = None) -> None:
+        self._send(code, json.dumps(obj).encode(), "application/json", headers)
+
     @staticmethod
     def _token_ok(given: str) -> bool:
         return bool(given and S.token) and hmac.compare_digest(given.encode(), S.token.encode())
 
-    def _sent_token(self) -> str:
-        """The token from the cookie, else from an `Authorization: Bearer` header (for scripts)."""
+    def _cookies(self, name: str) -> list[str]:
+        out = []
         for part in self.headers.get("Cookie", "").split(";"):
             k, _, v = part.strip().partition("=")
-            if k == TOKEN_COOKIE and self._token_ok(v.strip()):
-                return v.strip()
+            if k == name:
+                out.append(v.strip())
+        return out
+
+    def _bearer(self) -> str:
         auth = self.headers.get("Authorization", "")
         return auth[7:].strip() if auth[:7].lower() == "bearer " else ""
 
-    def _deny(self) -> None:
-        self._send(401, b"missing or wrong token: open the URL that `meeting-copilot` prints "
-                        b"(it ends in ?token=...)\n", "text/plain; charset=utf-8")
+    def _authed(self) -> bool:
+        """The token cookie, a paired device's cookie, or the token as `Authorization: Bearer` (scripts)."""
+        return (any(self._token_ok(v) for v in self._cookies(TOKEN_COOKIE))
+                or any(DEVICES.ok(v) for v in self._cookies(DEVICE_COOKIE))
+                or self._token_ok(self._bearer()))
 
-    def _route(self) -> tuple[str, str | None]:
-        """(path, token given in ?token= or None)."""
+    def _cookie(self, name: str, value: str) -> str:
+        cookie = f"{name}={value}; Path=/; Max-Age={DEVICE_MAX_AGE_S}; HttpOnly; SameSite=Strict"
+        return cookie + "; Secure" if self._https() else cookie
+
+    def _navigation(self) -> bool:
+        """A browser opening a page (not a script, not the page's own fetch of /state)."""
+        return (self.headers.get("Sec-Fetch-Mode", "").lower() == "navigate"
+                or "text/html" in self.headers.get("Accept", ""))
+
+    def _deny(self) -> None:
+        if self.command == "GET" and self._navigation():
+            code, _, made = PAIR.get_or_create()
+            if made:
+                notify(code)
+            return self._send(401, LOGIN_PAGE.read_bytes(), "text/html; charset=utf-8")
+        self._send(401, b"missing or wrong token: open the page in a browser and type the code shown on the "
+                        b"Mac, or send the token as Authorization: Bearer\n", "text/plain; charset=utf-8")
+
+    def _route(self) -> tuple[str, str | None, str | None]:
+        """(path, token given in ?token= or None, one-time link given in ?once= or None)."""
         u = urlsplit(self.path)
-        given = [v for k, v in parse_qsl(u.query, keep_blank_values=True) if k == "token"]
-        return u.path, (given[0] if given else None)
+        q = parse_qsl(u.query, keep_blank_values=True)
+        token = [v for k, v in q if k == "token"]
+        once = [v for k, v in q if k == "once"]
+        return u.path, (token[0] if token else None), (once[0] if once else None)
+
+    def _clean_redirect(self, path: str) -> None:
+        """Stores the token in a cookie and drops ?token= / ?once= from the address bar (and the history)."""
+        rest = urlencode([(k, v) for k, v in parse_qsl(urlsplit(self.path).query, keep_blank_values=True)
+                          if k not in ("token", "once")])
+        loc = "/" + path.lstrip("/") + (f"?{rest}" if rest else "")   # never //host: no open redirect
+        self._send(303, b"", "text/plain", {"Location": loc, "Set-Cookie": self._cookie(TOKEN_COOKIE, S.token)})
 
     def do_GET(self):
         if not self._client_ok():
             return self._send(403, b"network", "text/plain")
         if not self._host_ok():
             return self._send(403, b"host", "text/plain")
-        path, given = self._route()
+        path, given, once = self._route()
         if given is not None:
-            if not self._token_ok(given):
-                return self._deny()
-            # remember it in a cookie and drop it from the address bar (and from the browser history)
-            rest = urlencode([(k, v) for k, v in parse_qsl(urlsplit(self.path).query, keep_blank_values=True)
-                              if k != "token"])
-            loc = "/" + path.lstrip("/") + (f"?{rest}" if rest else "")   # never //host: no open redirect
-            cookie = f"{TOKEN_COOKIE}={S.token}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Strict"
-            if self._https():
-                cookie += "; Secure"
-            return self._send(303, b"", "text/plain", {"Location": loc, "Set-Cookie": cookie})
-        if not self._token_ok(self._sent_token()):
+            return self._clean_redirect(path) if self._token_ok(given) else self._deny()
+        if once is not None:
+            return self._clean_redirect(path) if PAIR.use_link(once) else self._deny()
+        if not self._authed():
             return self._deny()
         if path == "/":
             return self._send(200, PAGE.read_bytes(), "text/html; charset=utf-8")
         if path == "/state":
             return self._send(200, json.dumps(E.public(), ensure_ascii=False).encode(), "application/json")
+        if path == "/pair":
+            cur = PAIR.current()
+            return self._json(200, {"code": cur[0] if cur else None, "expires_in": cur[1] if cur else 0,
+                                    "locked": PAIR.locked})
+        if path == "/login-link":
+            # only with the token itself (the launcher): a paired device cannot turn itself into the token
+            if not self._token_ok(self._bearer()):
+                return self._send(403, b"token only", "text/plain")
+            return self._json(200, {"path": "/?once=" + PAIR.new_link()})
         self._send(404, b"", "text/plain")
+
+    def _login(self, raw: bytes) -> None:
+        """POST /login {"code": "123456"}: a right code gives this browser its own device cookie."""
+        try:
+            body = json.loads(raw or b"{}")
+            code = str(body.get("code", "")) if isinstance(body, dict) else ""
+        except json.JSONDecodeError:
+            code = ""
+        result, n = PAIR.try_code(code[:20])
+        if result == "ok":
+            label = f"{self.headers.get('User-Agent', '')[:80]} via {self.headers.get('Host', '')[:40]}"
+            try:
+                secret = DEVICES.add(label)
+            except OSError as ex:
+                error(f"saving the paired device: {ex}")
+                return self._json(500, {"error": "could not save this device on the Mac"})
+            print(f"{clock(now())} a device logged in with the pairing code", flush=True)
+            return self._json(200, {"ok": True}, {"Set-Cookie": self._cookie(DEVICE_COOKIE, secret)})
+        if result == "locked":
+            return self._json(429, {"error": LOCKED_MSG})
+        if result == "limited":
+            return self._json(429, {"error": f"Too many wrong codes. Wait {n} seconds."}, {"Retry-After": str(n)})
+        if result == "used_up":
+            return self._json(429, {"error": "Too many wrong tries for this code. Ask for a new code."})
+        if result == "expired":
+            return self._json(410, {"error": "No valid code: it expired or was used. Ask for a new code."})
+        return self._json(401, {"error": f"Wrong code. {n} {'try' if n == 1 else 'tries'} left.", "left": n})
+
+    def _send_code(self) -> None:
+        """POST /login/code: shows the code on the Mac again (a new one when it expired). Never returns it."""
+        code, left, made = PAIR.get_or_create()
+        if code is None:
+            return self._json(429, {"error": LOCKED_MSG})
+        if made or PAIR.may_notify_again():
+            notify(code)
+        self._json(200, {"ok": True})
 
     def do_POST(self):
         # The body is read before any answer, refusals included: closing a connection with unread
@@ -1406,8 +1718,12 @@ class Page(BaseHTTPRequestHandler):
         if not self._host_ok() or not self._origin_ok() \
                 or not self.headers.get("Content-Type", "").startswith("application/json"):
             return self._send(403, b"origin", "text/plain")
-        path, given = self._route()
-        if not self._token_ok(given if given is not None else self._sent_token()):
+        path, given, _ = self._route()
+        if path == "/login":
+            return self._login(raw)
+        if path == "/login/code":
+            return self._send_code()
+        if not (self._token_ok(given) if given is not None else self._authed()):
             return self._deny()
         try:
             body = json.loads(raw or b"{}")
@@ -1415,6 +1731,9 @@ class Page(BaseHTTPRequestHandler):
             return self._send(400, b"json", "text/plain")
         if not isinstance(body, dict):
             return self._send(400, b"json", "text/plain")
+        if path == "/pair":
+            code, left, _ = PAIR.get_or_create(owner=True)   # someone logged in: no notification, lifts the lock
+            return self._json(200, {"code": code, "expires_in": left})
         with E.lock:
             if path == "/context":
                 E.goal = str(body.get("goal", ""))[:2000]
@@ -1489,20 +1808,80 @@ class _LanPage(Page):
 
 
 def print_urls(port: str, lan_port: str) -> None:
-    """For `meeting-copilot status`: the other addresses of the page (LAN, extra hosts), each with the token."""
-    q = "/?token=" + load_token(S.data_dir)
+    """For `meeting-copilot status` and start: the other addresses of the page (LAN, extra hosts), with no
+    token in them (a browser that is not logged in gets the pairing-code login page)."""
     if S.lan:
         if lan_port:
             sfx = "" if lan_port == "80" else f":{lan_port}"
             if S.lan_name and S.dns_sd:
-                print(f"  LAN:    http://{S.lan_name}.local{sfx}{q}")
+                print(f"  LAN:    http://{S.lan_name}.local{sfx}/")
             ip = S.lan_ip or lan_ip()
             if ip:
-                print(f"  LAN IP: http://{ip}{sfx}{q}")
+                print(f"  LAN IP: http://{ip}{sfx}/")
         else:
             print("  LAN:    on in the settings but not listening (see `meeting-copilot log`)")
     for h in S.extra_hosts:
-        print(f"  public: https://{h}{q}")
+        print(f"  public: https://{h}/")
+
+
+def local_call(port: str, path: str, method: str = "GET") -> dict:
+    """Calls the running copilot on 127.0.0.1 with the token as a Bearer header (never through a proxy)."""
+    c = http.client.HTTPConnection("127.0.0.1", int(port), timeout=3)
+    try:
+        h = {"Authorization": f"Bearer {load_token(S.data_dir)}", "Host": f"127.0.0.1:{port}"}
+        if method == "POST":
+            h.update({"Content-Type": "application/json", "Origin": f"http://127.0.0.1:{port}"})
+        c.request(method, path, body=b"{}" if method == "POST" else None, headers=h)
+        r = c.getresponse()
+        body = r.read()
+        if r.status != 200:
+            raise OSError(f"HTTP {r.status}")
+        return json.loads(body)
+    finally:
+        c.close()
+
+
+def _left(seconds: int) -> str:
+    return f"{seconds} s" if seconds < 60 else f"{(seconds + 59) // 60} min"
+
+
+def cli(action: str, port: str) -> int:
+    """The launcher's small commands that talk to the running copilot or read the devices file."""
+    if action == "pair-status":
+        try:
+            cur = local_call(port, "/pair")
+        except (OSError, ValueError):
+            cur = None
+        if cur and cur.get("locked"):
+            print("  code:   locked after too many wrong codes (`meeting-copilot code` unlocks and shows one)")
+        elif cur and cur.get("code"):
+            print(f"  code:   {cur['code']}  (pairing code, valid {_left(int(cur['expires_in']))} more)")
+        else:
+            print("  code:   none now (open the page on the other device, or run `meeting-copilot code`)")
+        n = len(DEVICES.list())
+        print(f"  paired devices: {n}" + ("  (`meeting-copilot devices forget` logs them out)" if n else ""))
+    elif action == "new-code":
+        try:
+            cur = local_call(port, "/pair", "POST")
+        except (OSError, ValueError) as ex:
+            print(f"meeting-copilot: could not get a code from the running copilot ({ex})", file=sys.stderr)
+            return 1
+        print(f"pairing code: {cur['code']}  (valid {_left(int(cur['expires_in']))}; type it on the other device)")
+    elif action == "login-link":
+        # the Mac's own browser logs in through a one-time link (60 s, single use): no token on screen
+        try:
+            print(f"http://127.0.0.1:{port}{local_call(port, '/login-link')['path']}")
+        except (OSError, ValueError, KeyError):
+            print(f"http://127.0.0.1:{port}/")
+    elif action == "devices":
+        items = DEVICES.list()
+        for d in items:
+            when = datetime.fromtimestamp(d["created"]).strftime("%Y-%m-%d %H:%M")
+            print(f"{when}  {d.get('label', '')}")
+        print(f"{len(items)} paired device(s)" + ("; `meeting-copilot devices forget` logs them all out" if items else ""))
+    elif action == "forget-devices":
+        print(f"{DEVICES.forget_all()} paired device(s) logged out")
+    return 0
 
 
 def start_lan() -> bool:
@@ -1534,6 +1913,7 @@ def main(argv=None) -> None:
     ap.add_argument("--urls", nargs=2, metavar=("PORT", "LAN_PORT"), help=argparse.SUPPRESS)  # for `status`
     ap.add_argument("--token", action="store_true",
                     help="print the page token (created on first use) and exit")
+    ap.add_argument("--cli", nargs=2, metavar=("ACTION", "PORT"), help=argparse.SUPPRESS)  # launcher commands
     args = ap.parse_args(argv)
     seed_config()   # bin/meeting-copilot calls --get first, so any first command creates it
     cfg = load_config()
@@ -1548,12 +1928,17 @@ def main(argv=None) -> None:
         S = Settings(cfg)
         print_urls(*args.urls)
         return
+    if args.cli:
+        S = Settings(cfg)
+        DEVICES.path = S.data_dir / DEVICES_FILE
+        raise SystemExit(cli(*args.cli))
     if args.db:
         cfg["MEETING_COPILOT_DB"] = str(args.db)
     if args.port:
         cfg["MEETING_COPILOT_PORT"] = str(args.port)
     S = Settings(cfg)
     S.token = load_token(S.data_dir)
+    DEVICES.path = S.data_dir / DEVICES_FILE
     if not S.db.exists():
         raise SystemExit(f"Muesli database not found: {S.db}\n"
                          "Install and run Muesli, or point MEETING_COPILOT_DB / --db at its muesli.db.")
