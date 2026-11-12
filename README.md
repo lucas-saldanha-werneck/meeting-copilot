@@ -66,6 +66,8 @@ python3 tools/fake_meeting.py speak /tmp/test.db 4     # one invented line every
 python3 tools/fake_meeting.py end /tmp/test.db
 ```
 
+`prepare` refuses a file that already exists; add `--force` to replace it.
+
 ## Settings
 
 Your settings live in your own file, outside the program folder, so updating meeting-copilot
@@ -183,8 +185,9 @@ With neither search folders nor MCP, the "Relevant facts" panel says fact search
 
 - The Muesli database is opened read-only and never written.
 - The transcript of the last 3 minutes, your goals and the items already shown are sent to Claude through `claude -p` on each call. Nothing else leaves the machine.
-- Sessions (full transcript plus suggestions) are saved as JSON files readable only by your user.
-- The page answers only on 127.0.0.1 / localhost (plus any `MEETING_COPILOT_EXTRA_HOSTS`), checks the `Host` header against DNS rebinding, and accepts POSTs only from its own origin.
+- Sessions (full transcript plus suggestions) are saved as JSON files readable only by your user. A meeting saved again (the copilot restarted, or the meeting stopped and recorded again) gets a new file with `-2`, `-3`, and so on, so nothing earlier is overwritten.
+- The fact search may read files only inside the search folders: Read, Grep and Glob are allowed with a path rule for each folder, so a request in the meeting to open any other file is refused. The AI runs in an empty folder of its own and loads no Claude Code settings files, so no hook planted in a search folder runs with it.
+- The page answers only on 127.0.0.1 / localhost (plus any `MEETING_COPILOT_EXTRA_HOSTS`), checks the `Host` header against DNS rebinding, and accepts POSTs only from its own origin. It has no password: any program running on this Mac can read the live page state, transcript lines included.
 
 ## Uninstall
 

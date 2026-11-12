@@ -2,9 +2,10 @@
 """Simulate a live Muesli meeting in a separate SQLite file, to try meeting-copilot without a real call.
 
 Usage:
-  python3 tools/fake_meeting.py prepare <test.db> [--from <muesli.db>]
+  python3 tools/fake_meeting.py prepare <test.db> [--from <muesli.db>] [--force]
         create the test database (an empty Muesli-like schema, or a read-only copy of a real
-        Muesli database with --from) and start a meeting with status 'recording'
+        Muesli database with --from) and start a meeting with status 'recording'.
+        An existing <test.db> is replaced only with --force, and never when it is the --from file.
   python3 tools/fake_meeting.py speak <test.db> [seconds]   insert one line every [seconds] s (default 4)
   python3 tools/fake_meeting.py end <test.db>               mark the meeting as completed
 
@@ -65,7 +66,11 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def prepare(target: Path, source: Path | None = None) -> int:
+def prepare(target: Path, source: Path | None = None, force: bool = False) -> int:
+    if source and source.resolve() == target.resolve():
+        raise SystemExit("refused: the test database and the --from database are the same file")
+    if target.exists() and not force:
+        raise SystemExit(f"refused: {target} already exists (add --force to replace it)")
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists():
         target.unlink()
@@ -125,7 +130,7 @@ def main(argv: list[str]) -> None:
         source = None
         if "--from" in argv:
             source = Path(argv[argv.index("--from") + 1]).resolve()
-        prepare(path, source)
+        prepare(path, source, force="--force" in argv)
     elif action == "speak":
         speak(path, float(argv[2]) if len(argv) > 2 else 4)
     else:

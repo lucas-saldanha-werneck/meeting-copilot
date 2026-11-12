@@ -17,6 +17,7 @@ Configuration: environment variables or ~/.config/meeting-copilot/config (see RE
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import re
@@ -26,6 +27,7 @@ import socketserver
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -36,7 +38,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote
 
-__version__ = "0.7.1"
+__version__ = "0.7.2"
 
 HERE = Path(__file__).resolve().parent
 PAGE = HERE / "page.html"
@@ -64,6 +66,11 @@ def default_data_dir() -> Path:
 
 def _expand(v: str) -> str:
     return os.path.expanduser(os.path.expandvars(v.strip()))
+
+
+def _is_path(cmd: str) -> bool:
+    """A command given as a path (has a folder separator), not a bare name to look up on PATH."""
+    return os.sep in cmd or bool(os.altsep and os.altsep in cmd)
 
 
 def config_path(environ=None) -> Path:
@@ -221,7 +228,8 @@ class Settings:
             self.notices.append(f"MEETING_COPILOT_MUESLI_WAIT_S is not a number, using 600: {g('MUESLI_WAIT_S')}")
             self.muesli_wait_s = 600.0
         claude = _expand(g("CLAUDE") or "claude")
-        self.claude = claude if os.path.isfile(claude) else shutil.which(claude)
+        # a bare name is looked up on PATH only, never in the folder the copilot was started from
+        self.claude = claude if _is_path(claude) and os.path.isfile(claude) else shutil.which(claude)
         # Optional: the claude-credito wrapper. When it is installed, AI calls go through it: the plan's
         # monthly API credit first, and the same call again on the subscription when the API refuses.
         # Not installed (the usual case): calls go straight to `claude`, on the subscription.
@@ -230,11 +238,10 @@ class Settings:
         if self.claude and credit.lower() not in ("0", "no", "false", "off"):
             credit = _expand(credit)
             local = os.path.join(os.path.expanduser("~"), ".local", "bin", credit)
-            if os.path.isfile(credit):
-                self.credit = credit
+            if _is_path(credit):
+                self.credit = credit if os.path.isfile(credit) else None
             else:
-                self.credit = shutil.which(credit) or (
-                    local if os.sep not in credit and os.access(local, os.X_OK) else None)
+                self.credit = shutil.which(credit) or (local if os.access(local, os.X_OK) else None)
 
         # Optional: folders the AI may search for facts (your notes, a wiki, a docs folder).
         self.search_dirs: list[Path] = []
@@ -401,7 +408,8 @@ def data_prompt() -> str:
 def data_sources_text() -> str:
     lines = []
     if S.search_dirs:
-        lines.append("- search the user's notes in these folders (use Grep and Glob before Read): "
+        lines.append("- search the user's notes in these folders (use Grep and Glob before Read, with one of these "
+                     "folders as the path; files outside them are refused): "
                      + ", ".join(str(d) for d in S.search_dirs) + ";")
     if S.mcp_tools:
         lines.append("- use these read-only tools: " + ", ".join(S.mcp_tools) + ".")
@@ -597,7 +605,8 @@ def run_claude(system_prompt: str, message: str, model: str, *, schema: dict | N
     env = {**os.environ, "CLAUDE_CREDITO_REAL": S.claude} if S.credit else None
     cmd = [
         S.credit or S.claude, "-p", "--model", model,
-        "--no-session-persistence", "--setting-sources", "project",
+        # no settings file from anywhere: a .claude/settings.json in a search folder (or yours) could add hooks
+        "--no-session-persistence", "--setting-sources", "",
         "--output-format", "json", "--max-turns", str(max_turns),
         "--append-system-prompt", system_prompt,
         "--strict-mcp-config",
@@ -606,14 +615,18 @@ def run_claude(system_prompt: str, message: str, model: str, *, schema: dict | N
     if tools or mcp_tools:
         if mcp_tools and S.mcp_config:
             cmd += ["--mcp-config", str(S.mcp_config)]
-        cmd += ["--tools", ",".join(tools), "--allowedTools", ",".join(tools + mcp_tools)]
-        for d in dirs[1:]:
+        # File tools are allowed only inside the search folders: a bare "Read" rule would let the AI read
+        # any file on the Mac, and anyone speaking in the meeting can ask it to.
+        rules = [f"{t}(/{Path(d).as_posix()}/**)" for t in tools for d in dirs]
+        cmd += ["--tools", ",".join(tools), "--allowedTools", ",".join(rules + mcp_tools)]
+        for d in dirs:
             cmd += ["--add-dir", str(d)]
     else:
         cmd += ["--tools", ""]
     if schema:
         cmd += ["--json-schema", json.dumps(schema)]
-    cwd = dirs[0] if dirs else S.data_dir
+    # An empty folder of ours: nothing in it to read, and no project settings or CLAUDE.md to load.
+    cwd = S.data_dir / "ai-cwd"
     cwd.mkdir(parents=True, exist_ok=True)
     # The message goes through stdin: --allowedTools, --mcp-config and --add-dir take several
     # values and would swallow the message if it were the last argument.
@@ -692,6 +705,7 @@ def assist_round() -> None:
         seen = E.assist_seen
         shown = [d["text"] for d in E.say[-15:] + E.ask[-15:]] + [c["quote"] for c in E.corrections[-10:]]
         ctx = meeting_context()
+        goals_sent = [m["text"] for m in E.goals]   # the numbers in the answer refer to this list
     msg = (f"{ctx}\n\n## ALREADY SHOWN\n" + ("\n".join(f"- {j}" for j in shown) or "(nothing)")
            + "\n\n" + transcript(lines, seen))
     t0 = now()
@@ -714,9 +728,12 @@ def assist_round() -> None:
             if isinstance(c, dict) and c.get("quote") and not any(similar(c["quote"], x["quote"]) for x in E.corrections):
                 E.corrections.append({"quote": c["quote"], "problem": c.get("problem", ""),
                                       "suggestion": c.get("suggestion", ""), "ts": ts})
-        for i in r.get("goals_covered", []):
-            if isinstance(i, int) and 0 <= i < len(E.goals):
-                E.goals[i]["covered"] = True
+        # the goals may have changed during the call: mark a goal by the text that was sent, not its number
+        covered = {goals_sent[i] for i in r.get("goals_covered", [])
+                   if isinstance(i, int) and not isinstance(i, bool) and 0 <= i < len(goals_sent)}
+        for m in E.goals:
+            if m["text"] in covered:
+                m["covered"] = True
     print(f"{clock(ts)} assist ok in {ts - t0:.1f}s", flush=True)
 
 
@@ -764,11 +781,22 @@ def parse_iso(text) -> datetime | None:
 
 
 def _write_private(path: Path, text: str) -> None:
-    path.write_text(text, encoding="utf-8")
+    """Writes a private (0600) file whole: a temporary file next to it, then renamed over it. A crash or a
+    full disk leaves the old file as it was, and a link at `path` is replaced, never written through."""
+    data = text.encode("utf-8")
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")  # mode 0600
     try:
-        os.chmod(path, 0o600)  # transcripts are private
-    except OSError:
-        pass
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 # Markdown sessions are written to disk as soon as a meeting ends, under a name from the current title.
@@ -793,7 +821,11 @@ def save_session(final: bool = False) -> None:
                         PENDING.append({"id": mid, "ended": now(), "snap": snap, "path": path})
             else:
                 S.sessions_dir.mkdir(parents=True, exist_ok=True)
-                path = S.sessions_dir / f"{datetime.now().strftime('%Y-%m-%d')}-meeting-{mid}.json"
+                # the same meeting saved again (a restart, or it stopped and recorded again) gets -2, -3...
+                stem = f"{datetime.now().strftime('%Y-%m-%d')}-meeting-{mid}"
+                path, n = S.sessions_dir / f"{stem}.json", 2
+                while path.exists():
+                    path, n = S.sessions_dir / f"{stem}-{n}.json", n + 1
                 _write_private(path, json.dumps(snap, ensure_ascii=False, indent=1))
                 print(f"session saved to {path}", flush=True)
         except Exception as ex:   # never lose the loop or the exit over a save
@@ -972,6 +1004,25 @@ class Queue:
         threading.Thread(target=run, daemon=True).start()
 
 
+def read_new_lines(con: sqlite3.Connection, meeting_id: int) -> None:
+    lines = new_lines(con, meeting_id, E.last_id)
+    if lines:
+        with E.lock:
+            E.lines.extend(lines)
+            E.last_id = lines[-1]["id"]
+            E.metrics = compute_metrics(E.lines)
+
+
+def next_round(t: float) -> str | None:
+    """Which AI call is due: "assist", "data" or None. When both are due, the one that ran longer ago goes
+    first (suggestions on a tie), so suggestions that take longer than ASSIST_S never starve the fact search."""
+    assist = E.last_id > E.assist_seen and t - E.last_assist >= S.assist_s
+    data = S.data_enabled and E.last_id > E.data_seen and t - E.last_data >= S.data_s
+    if data and (not assist or E.last_data < E.last_assist):
+        return "data"
+    return "assist" if assist else None
+
+
 def loop(db: Path) -> None:
     q = Queue()
     while True:
@@ -980,6 +1031,10 @@ def loop(db: Path) -> None:
             try:
                 live = live_meeting(con)
                 current = E.meeting
+                if current and (not live or live["id"] != current["id"]):
+                    # the last lines and the end (or the next meeting) can land in the same interval:
+                    # read them before saving
+                    read_new_lines(con, current["id"])
                 if live and (not current or live["id"] != current["id"]):
                     if current:
                         save_session()
@@ -992,13 +1047,6 @@ def loop(db: Path) -> None:
                         E.status = "live"
                     print(f"meeting {live['id']} '{live['title']}' started", flush=True)
                 elif not live and current:
-                    # the last lines and the end can land in the same interval: read them before saving
-                    lines = new_lines(con, current["id"], E.last_id)
-                    if lines:
-                        with E.lock:
-                            E.lines.extend(lines)
-                            E.last_id = lines[-1]["id"]
-                            E.metrics = compute_metrics(E.lines)
                     save_session()
                     with E.lock:
                         E.status = f"meeting {current['id']} ended · waiting for the next one"
@@ -1007,12 +1055,7 @@ def loop(db: Path) -> None:
                 if PENDING:
                     flush_pending(con)
                 if live:
-                    lines = new_lines(con, live["id"], E.last_id)
-                    if lines:
-                        with E.lock:
-                            E.lines.extend(lines)
-                            E.last_id = lines[-1]["id"]
-                            E.metrics = compute_metrics(E.lines)
+                    read_new_lines(con, live["id"])
             finally:
                 con.close()
         except Exception as ex:  # database busy, WAL, etc.: try again next time
@@ -1026,10 +1069,11 @@ def loop(db: Path) -> None:
                     E.last_warning = now()
 
             if S.claude and E.ai_allowed() and not q.busy:
-                if E.last_id > E.assist_seen and now() - E.last_assist >= S.assist_s:
+                kind = next_round(now())
+                if kind == "assist":
                     E.last_assist = now()
                     q.try_run(assist_round)
-                elif S.data_enabled and E.last_id > E.data_seen and now() - E.last_data >= S.data_s:
+                elif kind == "data":
                     E.last_data = now()
                     q.try_run(data_round)
         time.sleep(S.poll_s)
@@ -1101,6 +1145,30 @@ def _stop(*_):
     raise KeyboardInterrupt
 
 
+# bin/meeting-copilot writes our pid to PID_FILE; we write "<pid> <port>" to PORT_FILE once the page is up,
+# so the launcher can show the port really in use. Both go away when we exit (only if they are still ours).
+PID_FILE, PORT_FILE = "meeting-copilot.pid", "meeting-copilot.port"
+
+
+def write_port_file(port: int) -> None:
+    try:
+        S.data_dir.mkdir(parents=True, exist_ok=True)
+        _write_private(S.data_dir / PORT_FILE, f"{os.getpid()} {port}\n")
+    except OSError as ex:
+        print(f"note: could not write {S.data_dir / PORT_FILE}: {ex}", flush=True)
+
+
+def remove_run_files() -> None:
+    me = str(os.getpid())
+    for name in (PID_FILE, PORT_FILE):
+        path = S.data_dir / name
+        try:
+            if path.read_text(encoding="utf-8").split()[:1] == [me]:
+                path.unlink()
+        except (OSError, ValueError):
+            pass
+
+
 class _Server(ThreadingHTTPServer):
     """ThreadingHTTPServer without the reverse-DNS lookup in server_bind.
 
@@ -1148,6 +1216,8 @@ def main(argv=None) -> None:
     signal.signal(signal.SIGTERM, _stop)
     threading.Thread(target=loop, args=(S.db,), daemon=True).start()
     srv = _Server(("127.0.0.1", S.port), Page)
+    atexit.register(remove_run_files)
+    write_port_file(S.port)
     print(f"meeting-copilot on http://127.0.0.1:{S.port}  (database: {S.db})", flush=True)
     try:
         srv.serve_forever()

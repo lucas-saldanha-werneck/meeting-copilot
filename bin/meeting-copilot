@@ -44,11 +44,29 @@ while [ $# -gt 0 ]; do
 done
 URL="http://127.0.0.1:$port"
 
+PORTFILE="$DATA/meeting-copilot.port"
+
+# The pid in the pid file, only while that process is really this copilot: after a crash or a reboot
+# the number can belong to another program, which must never be stopped or taken for the copilot.
 running_pid() {
   [ -f "$PIDFILE" ] || return 1
-  local p
+  local p c
   p="$(cat "$PIDFILE" 2>/dev/null)"
-  [ -n "$p" ] && kill -0 "$p" 2>/dev/null && echo "$p"
+  case "$p" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$p" 2>/dev/null || return 1
+  c="$(ps -p "$p" -o command= 2>/dev/null)"
+  case "$c" in *"$APP"*) echo "$p" ;; *) return 1 ;; esac
+}
+
+# The running copilot may have been started on another port: use the one it wrote down.
+use_running_port() {
+  local p="$1" fpid fport
+  read -r fpid fport < "$PORTFILE" 2>/dev/null || return 0
+  if [ "$fpid" = "$p" ] && [ -n "$fport" ]; then
+    [ "$fport" != "$port" ] && echo "note: meeting-copilot is already running on port $fport; stop it first to use port $port" >&2
+    port="$fport"
+    URL="http://127.0.0.1:$port"
+  fi
 }
 
 page_up() {
@@ -92,28 +110,35 @@ case "$cmd" in
     if [ -n "$p" ]; then
       kill "$p" && echo "meeting-copilot stopped"
       for _ in $(seq 1 20); do kill -0 "$p" 2>/dev/null || break; sleep 0.25; done
-      rm -f "$PIDFILE"
+      rm -f "$PIDFILE" "$PORTFILE"
     else
+      rm -f "$PIDFILE" "$PORTFILE"   # a stale file of a copilot that is gone
       echo "meeting-copilot was not running"
     fi ;;
   status)
     p="$(running_pid)"
-    if [ -n "$p" ]; then echo "running (pid $p) on $URL"; else echo "not running"; exit 1; fi ;;
+    if [ -n "$p" ]; then use_running_port "$p"; echo "running (pid $p) on $URL"; else echo "not running"; exit 1; fi ;;
   log)
     tail -n 30 "$LOG" 2>/dev/null || echo "no log yet: $LOG" ;;
   start)
     mkdir -p "$DATA" && chmod 700 "$DATA"
-    if [ -z "$(running_pid)" ]; then
+    p="$(running_pid)"
+    if [ -n "$p" ]; then
+      use_running_port "$p"
+    else
+      rm -f "$PORTFILE"
       nohup "$PY" -u "$APP" ${args[@]+"${args[@]}"} >> "$LOG" 2>&1 &
-      echo $! > "$PIDFILE"
+      np=$!
+      echo "$np" > "$PIDFILE"
+      # kill -0 only here: until nohup has started python, the process does not look like the copilot yet
       for _ in $(seq 1 40); do
-        [ -n "$(running_pid)" ] || break
+        kill -0 "$np" 2>/dev/null || break
         page_up && break
         sleep 0.25
       done
     fi
     if [ -z "$(running_pid)" ]; then
-      rm -f "$PIDFILE"
+      rm -f "$PIDFILE" "$PORTFILE"
       echo "meeting-copilot did not start. Last log lines:" >&2
       tail -n 5 "$LOG" >&2
       exit 1
