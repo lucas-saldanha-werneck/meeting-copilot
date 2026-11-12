@@ -46,7 +46,8 @@ document.getElementById("f").onsubmit = async ev => {
     // back to the address that was opened, without an old ?token= or ?once= in it
     const u = new URL(location.href);
     u.searchParams.delete("token"); u.searchParams.delete("once");
-    return location.replace(u.pathname + u.search);
+    // "/" + the path without its leading slashes: never "//other.site", which would leave this site
+    return location.replace("/" + u.pathname.replace(/^\/+/, "") + u.search);
   }
   let e = {};
   try { e = await r.json(); } catch {}
@@ -54,8 +55,12 @@ document.getElementById("f").onsubmit = async ev => {
   document.getElementById("code").select();
 };
 document.getElementById("again").onclick = async () => {
-  try { await post("/login/code", {}); msg("Look for the notification on the Mac, or run: meeting-copilot status", true); }
-  catch { msg("The copilot is not answering."); }
+  let r;
+  try { r = await post("/login/code", {}); } catch { return msg("The copilot is not answering."); }
+  if (r.ok) return msg("Look for the notification on the Mac, or run: meeting-copilot status", true);
+  let e = {};
+  try { e = await r.json(); } catch {}
+  msg(e.error || "That did not work. Try again.");
 };
 </script>
 </body>

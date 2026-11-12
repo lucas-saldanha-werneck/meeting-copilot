@@ -1166,6 +1166,48 @@ class PairingCode(unittest.TestCase):
         self.clock.t += 61
         self.assertEqual(self.login(port, right)[0], 200)
 
+    def test_too_many_wrong_codes_lock_until_the_mac_asks(self):
+        port = self.serve()
+        o = {"Content-Type": "application/json", "Origin": self.ORIGIN}
+        for _ in range(20):                                      # no code: probes are not counted
+            self.assertEqual(self.login(port, "123456")[0], 410)
+        for _ in range(4):                                       # 4 codes x 5 wrong, slower than the minute limit
+            self.browse(port)
+            right = self.notified[-1]
+            for _ in range(5):
+                self.login(port, f"{(int(right) + 1) % 10 ** 6:06d}")
+            self.clock.t += 61
+        self.assertTrue(copilot.PAIR.locked)
+        n = len(self.notified)
+        code, _, body = self.browse(port)                        # the page still shows, but no code is made
+        self.assertEqual(code, 401)
+        self.assertIn(b"6-digit code", body)
+        self.assertEqual(len(self.notified), n)
+        self.assertIsNone(copilot.PAIR.current())
+        code, _, body = self.req(port, "/login/code", o, "POST", b"{}")
+        self.assertEqual(code, 429)
+        self.assertIn(b"meeting-copilot code", body)
+        self.assertEqual(len(self.notified), n)
+        self.clock.t += 24 * 3600                                # time alone never unlocks
+        self.assertEqual(self.login(port, "123456")[0], 429)
+        auth = {"Authorization": f"Bearer {self.TOK}"}
+        self.assertTrue(json.loads(self.req(port, "/pair", auth)[2])["locked"])
+        # the Mac asks for a code (`meeting-copilot code` or "Pair a device"): unlocked, and that code works
+        got = json.loads(self.req(port, "/pair", {**auth, **o}, "POST", b"{}")[2])
+        self.assertFalse(copilot.PAIR.locked)
+        self.assertEqual(self.login(port, got["code"])[0], 200)
+
+    def test_a_right_code_resets_the_wrong_count(self):
+        p = copilot.Pairing(clock=self.clock)
+        for _ in range(3):
+            code, _, _ = p.get_or_create()
+            for _ in range(4):
+                self.assertEqual(p.try_code("x")[0], "wrong")
+            self.clock.t += 61
+            self.assertEqual(p.try_code(code)[0], "ok")
+            self.assertEqual(p.strikes, 0)
+        self.assertFalse(p.locked)
+
     def test_code_compare_is_constant_time(self):
         calls = []
         real = copilot.hmac.compare_digest
@@ -1258,7 +1300,7 @@ class PairingCode(unittest.TestCase):
     def test_pair_endpoint_for_logged_in_pages(self):
         port = self.serve()
         auth = {"Authorization": f"Bearer {self.TOK}"}
-        self.assertEqual(json.loads(self.req(port, "/pair", auth)[2]), {"code": None, "expires_in": 0})
+        self.assertEqual(json.loads(self.req(port, "/pair", auth)[2]), {"code": None, "expires_in": 0, "locked": False})
         o = {**auth, "Content-Type": "application/json", "Origin": self.ORIGIN}
         got = json.loads(self.req(port, "/pair", o, "POST", b"{}")[2])
         self.assertRegex(got["code"], r"^[0-9]{6}$")

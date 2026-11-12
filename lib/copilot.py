@@ -141,6 +141,7 @@ def load_token(data_dir: Path) -> str:
 CODE_TTL_S = 300            # a code is valid for 5 minutes
 CODE_MAX_WRONG = 5          # wrong tries before the code is thrown away
 LOGIN_WRONG_PER_MIN = 10    # wrong tries per minute over every code and client; then every try waits
+LOGIN_MAX_WRONG = 20        # wrong tries since the last login: then locked until the Mac asks for a code
 LOGIN_LINK_TTL_S = 60       # the launcher's one-time link for the Mac's own browser
 NOTIFY_EVERY_S = 20         # "send the code again" shows the notification at most this often
 DEVICE_COOKIE = "meeting_copilot_device"
@@ -164,6 +165,7 @@ class Pairing:
         self.expires = 0.0
         self.wrong = 0
         self.fails: list[float] = []      # times of recent wrong tries, for the global limit
+        self.strikes = 0                  # wrong tries since the last right code or the Mac's own request
         self.notified = 0.0
         self.links: dict[str, float] = {}  # one-time login links: secret -> expiry
 
@@ -179,10 +181,21 @@ class Pairing:
             t = self.clock()
             return (self.code, max(1, int(self.expires - t))) if self._active(t) else None
 
-    def get_or_create(self) -> tuple[str, int, bool]:
-        """(code, seconds left, made now): the active code, or a new one when there is none."""
+    @property
+    def locked(self) -> bool:
+        return self.strikes >= LOGIN_MAX_WRONG
+
+    def get_or_create(self, owner: bool = False) -> tuple[str | None, int, bool]:
+        """(code, seconds left, made now): the active code, or a new one when there is none.
+
+        owner=True: asked on the Mac (`meeting-copilot code`, "Pair a device" on a logged-in page); this
+        also lifts the lock. When locked, a browser that is not logged in gets (None, 0, False)."""
         with self.lock:
             t = self.clock()
+            if owner:
+                self.strikes, self.fails = 0, []
+            elif self.locked:
+                return None, 0, False
             made = not self._active(t)
             if made:
                 self.code = f"{secrets.randbelow(10 ** 6):06d}"
@@ -199,24 +212,31 @@ class Pairing:
             return True
 
     def try_code(self, given: str) -> tuple[str, int]:
-        """("ok" | "wrong" | "used_up" | "expired" | "limited", number): tries left after a wrong code,
-        seconds to wait when limited, else 0. A right code ends the code; so do CODE_MAX_WRONG wrong ones."""
+        """("ok" | "wrong" | "used_up" | "expired" | "limited" | "locked", number): tries left after a wrong
+        code, seconds to wait when limited, else 0. A right code ends the code; so do CODE_MAX_WRONG wrong ones.
+        LOGIN_MAX_WRONG wrong tries since the last right code lock the login until the Mac asks for a code."""
         given = re.sub(r"[\s-]", "", str(given or ""))
         with self.lock:
             t = self.clock()
             self.fails = [x for x in self.fails if t - x < 60]
+            if self.locked:
+                return "locked", 0
             if len(self.fails) >= LOGIN_WRONG_PER_MIN:
                 return "limited", max(1, int(60 - (t - self.fails[0])) + 1)
             if not self._active(t):
-                self.fails.append(t)          # probing with no code counts too
-                return "expired", 0
+                return "expired", 0           # nothing to guess: not counted
+
             # constant time: the code is never compared byte by byte with an early exit
             ok = hmac.compare_digest(given.encode(), self.code.encode()) and bool(_CODE_OK.match(given))
             if ok:
-                self.code = None
+                self.code, self.strikes = None, 0
                 return "ok", 0
             self.fails.append(t)
+            self.strikes += 1
             self.wrong += 1
+            if self.locked:
+                self.code = None
+                return "locked", 0
             if self.wrong >= CODE_MAX_WRONG:
                 self.code = None
                 return "used_up", 0
@@ -314,6 +334,7 @@ class Devices:
 
 
 PAIR = Pairing()
+LOCKED_MSG = "Too many wrong codes: login is locked. On the Mac, run: meeting-copilot code"
 DEVICES = Devices(None)   # main() points it at <data_dir>/devices.json
 
 
@@ -1636,7 +1657,8 @@ class Page(BaseHTTPRequestHandler):
             return self._send(200, json.dumps(E.public(), ensure_ascii=False).encode(), "application/json")
         if path == "/pair":
             cur = PAIR.current()
-            return self._json(200, {"code": cur[0] if cur else None, "expires_in": cur[1] if cur else 0})
+            return self._json(200, {"code": cur[0] if cur else None, "expires_in": cur[1] if cur else 0,
+                                    "locked": PAIR.locked})
         if path == "/login-link":
             # only with the token itself (the launcher): a paired device cannot turn itself into the token
             if not self._token_ok(self._bearer()):
@@ -1661,6 +1683,8 @@ class Page(BaseHTTPRequestHandler):
                 return self._json(500, {"error": "could not save this device on the Mac"})
             print(f"{clock(now())} a device logged in with the pairing code", flush=True)
             return self._json(200, {"ok": True}, {"Set-Cookie": self._cookie(DEVICE_COOKIE, secret)})
+        if result == "locked":
+            return self._json(429, {"error": LOCKED_MSG})
         if result == "limited":
             return self._json(429, {"error": f"Too many wrong codes. Wait {n} seconds."}, {"Retry-After": str(n)})
         if result == "used_up":
@@ -1672,6 +1696,8 @@ class Page(BaseHTTPRequestHandler):
     def _send_code(self) -> None:
         """POST /login/code: shows the code on the Mac again (a new one when it expired). Never returns it."""
         code, left, made = PAIR.get_or_create()
+        if code is None:
+            return self._json(429, {"error": LOCKED_MSG})
         if made or PAIR.may_notify_again():
             notify(code)
         self._json(200, {"ok": True})
@@ -1706,7 +1732,7 @@ class Page(BaseHTTPRequestHandler):
         if not isinstance(body, dict):
             return self._send(400, b"json", "text/plain")
         if path == "/pair":
-            code, left, _ = PAIR.get_or_create()   # shown to someone already logged in: no notification
+            code, left, _ = PAIR.get_or_create(owner=True)   # someone logged in: no notification, lifts the lock
             return self._json(200, {"code": code, "expires_in": left})
         with E.lock:
             if path == "/context":
@@ -1826,7 +1852,9 @@ def cli(action: str, port: str) -> int:
             cur = local_call(port, "/pair")
         except (OSError, ValueError):
             cur = None
-        if cur and cur.get("code"):
+        if cur and cur.get("locked"):
+            print("  code:   locked after too many wrong codes (`meeting-copilot code` unlocks and shows one)")
+        elif cur and cur.get("code"):
             print(f"  code:   {cur['code']}  (pairing code, valid {_left(int(cur['expires_in']))} more)")
         else:
             print("  code:   none now (open the page on the other device, or run `meeting-copilot code`)")
