@@ -87,7 +87,14 @@ let editing = false;
 let last = {}, aiMsg = "";
 async function refresh() {
   let e;
-  try { e = await (await fetch("/state")).json(); }
+  try {
+    const r = await fetch("/state");
+    if (r.status === 401) {
+      document.getElementById("status").textContent = "token needed: open the URL that meeting-copilot prints";
+      return;
+    }
+    e = await r.json();
+  }
   catch { document.getElementById("status").textContent = "copilot stopped"; return; }
   const st = document.getElementById("status");
   st.textContent = e.status; st.className = "pill" + (e.live ? " live" : "");
