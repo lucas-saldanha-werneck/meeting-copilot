@@ -168,6 +168,176 @@ class Logic(unittest.TestCase):
             self.assertTrue(copilot.is_empty(t))
         self.assertFalse(copilot.is_empty("The price is 10."))
 
+    def _with_state(self, settings: dict, meeting=None):
+        """Fresh copilot.S and copilot.E for one test, put back afterwards."""
+        old_s, old_e = copilot.S, copilot.E
+        self.addCleanup(setattr, copilot, "S", old_s)
+        self.addCleanup(setattr, copilot, "E", old_e)
+        copilot.S = copilot.Settings(settings)
+        copilot.E = copilot.State()
+        copilot.E.meeting = meeting
+
+    def test_saving_the_same_meeting_again_keeps_the_earlier_file(self):
+        # a restart mid-meeting, or a meeting that stops and records again, saves it a second time
+        with tempfile.TemporaryDirectory() as d:
+            self._with_state({"MEETING_COPILOT_SESSIONS_DIR": d}, {"id": 9, "title": "t", "start": ""})
+            copilot.E.say.append({"text": "first run", "ts": 1.0})
+            copilot.save_session()
+            copilot.E.say[:] = [{"text": "second run", "ts": 2.0}]
+            copilot.save_session()
+            files = sorted(os.listdir(d))
+            self.assertEqual(len(files), 2, files)
+            texts = []
+            for name in files:
+                with open(os.path.join(d, name), encoding="utf-8") as f:
+                    texts.append(json.load(f)["say"][0]["text"])
+            self.assertEqual(sorted(texts), ["first run", "second run"])
+            self.assertTrue(any(name.endswith("-meeting-9-2.json") for name in files), files)
+
+    def test_write_private_replaces_the_file_whole(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = copilot.Path(d) / "s.json"
+            path.write_text("old", encoding="utf-8")
+            with self.assertRaises(UnicodeEncodeError):   # a write that fails half-way
+                copilot._write_private(path, "new \ud800")
+            self.assertEqual(path.read_text(encoding="utf-8"), "old")
+            self.assertEqual(os.listdir(d), ["s.json"])     # no temporary file left behind
+            copilot._write_private(path, "new")
+            self.assertEqual(path.read_text(encoding="utf-8"), "new")
+            if not WIN:
+                self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+    @unittest.skipIf(WIN, "symlinks need extra rights on Windows")
+    def test_write_private_never_writes_through_a_link(self):
+        with tempfile.TemporaryDirectory() as d:
+            target = os.path.join(d, "elsewhere.txt")
+            with open(target, "w") as f:
+                f.write("keep me")
+            link = copilot.Path(d) / "s.json"
+            os.symlink(target, link)
+            copilot._write_private(link, "session")
+            with open(target) as f:
+                self.assertEqual(f.read(), "keep me")
+            self.assertFalse(os.path.islink(link))
+            self.assertEqual(link.read_text(encoding="utf-8"), "session")
+            self.assertEqual(os.stat(link).st_mode & 0o777, 0o600)
+
+    def test_late_answer_marks_only_the_goal_it_was_asked_about(self):
+        self._with_state({}, {"id": 3, "title": "t", "start": ""})
+        copilot.E.goals = [{"text": "Price", "covered": False}, {"text": "End date", "covered": False}]
+
+        def answer(*a, **k):   # while the AI thinks, the user replaces the goals
+            with copilot.E.lock:
+                copilot.E.goals = [{"text": "Budget", "covered": False}, {"text": "Price", "covered": False}]
+            return {"structured_output": {"say": [], "ask": [], "corrections": [], "goals_covered": [0, 1]}}
+
+        old = copilot.run_claude
+        copilot.run_claude = answer
+        try:
+            copilot.assist_round()
+        finally:
+            copilot.run_claude = old
+        # goal 0 sent was "Price", goal 1 "End date" (gone): only "Price" is marked, wherever it is now
+        self.assertEqual([(g["text"], g["covered"]) for g in copilot.E.goals], [("Budget", False), ("Price", True)])
+
+    def test_slow_suggestions_never_starve_the_fact_search(self):
+        self._with_state({"MEETING_COPILOT_ASSIST_S": "25", "MEETING_COPILOT_DATA_S": "45"})
+        notes = tempfile.mkdtemp()
+        self.addCleanup(os.rmdir, notes)
+        copilot.S.search_dirs = [copilot.Path(notes)]
+        e = copilot.E
+        e.last_id, e.assist_seen, e.data_seen = 10, 0, 0
+        t = 1000.0
+        self.assertEqual(copilot.next_round(t), "assist")     # suggestions go first
+        ran = []
+        for _ in range(6):    # each suggestions call takes longer than ASSIST_S: it is always due again
+            kind = copilot.next_round(t)
+            ran.append(kind)
+            if kind == "assist":
+                e.last_assist = t
+            elif kind == "data":
+                e.last_data = t
+            t += 60
+        self.assertIn("data", ran)
+        self.assertIn("assist", ran[1:])
+        e.last_id = 0        # nothing new: nothing to do
+        self.assertIsNone(copilot.next_round(t))
+
+    @unittest.skipIf(WIN, "Windows searches the current folder for commands by design")
+    def test_claude_by_name_never_comes_from_the_current_folder(self):
+        with tempfile.TemporaryDirectory() as d:
+            here, onpath = os.path.join(d, "here"), os.path.join(d, "bin")
+            os.makedirs(here)
+            os.makedirs(onpath)
+            for folder in (here, onpath):
+                for name in ("claude", "claude-credito"):
+                    p = os.path.join(folder, name)
+                    with open(p, "w") as f:
+                        f.write("#!/bin/sh\n")
+                    os.chmod(p, 0o755)
+            old_cwd, old_path = os.getcwd(), os.environ.get("PATH", "")
+            os.chdir(here)
+            os.environ["PATH"] = onpath
+            try:
+                s = copilot.Settings({})
+            finally:
+                os.chdir(old_cwd)
+                os.environ["PATH"] = old_path
+            self.assertEqual(s.claude, os.path.join(onpath, "claude"))
+            self.assertEqual(s.credit, os.path.join(onpath, "claude-credito"))
+
+    @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
+    def test_fact_search_may_read_only_inside_the_search_folders(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = os.path.realpath(d)
+            notes, wiki, data = (os.path.join(d, x) for x in ("notes", "wiki", "data"))
+            for x in (notes, wiki):
+                os.makedirs(os.path.join(x, ".claude"))
+            log = os.path.join(d, "calls.jsonl")
+            claude = os.path.join(d, "claude")
+            with open(claude, "w") as f:
+                f.write(f'#!/bin/sh\nFAKE_CLAUDE_LOG="{log}" exec "{PY}" "{ROOT}/tests/fake_claude.py" "$@"\n')
+            os.chmod(claude, 0o755)
+            self._with_state({"MEETING_COPILOT_CLAUDE": claude, "MEETING_COPILOT_DATA_DIR": data,
+                              "MEETING_COPILOT_API_CREDIT": "off",
+                              "MEETING_COPILOT_SEARCH_DIRS": notes + os.pathsep + wiki})
+            copilot.run_claude("p", "m", "sonnet", tools=["Read", "Grep", "Glob"], dirs=copilot.S.search_dirs)
+            with open(log, encoding="utf-8") as f:
+                call = json.loads(f.readline())
+            a = call["argv"]
+            allowed = a[a.index("--allowedTools") + 1].split(",")
+            self.assertEqual(sorted(allowed), sorted(f"{t}(/{x}/**)" for t in ("Read", "Grep", "Glob")
+                                                     for x in (notes, wiki)))
+            self.assertEqual([a[i + 1] for i, v in enumerate(a) if v == "--add-dir"], [notes, wiki])
+            # no settings (and so no hooks) from any folder: none from the search folders, none from yours
+            self.assertEqual(a[a.index("--setting-sources") + 1], "")
+            self.assertNotIn(os.path.realpath(call["cwd"]), (notes, wiki))
+            self.assertEqual(os.listdir(call["cwd"]), [])
+
+    @unittest.skipUnless(os.environ.get("MEETING_COPILOT_TEST_REAL_CLAUDE") == "1",
+                         "calls the real claude (costs a little): set MEETING_COPILOT_TEST_REAL_CLAUDE=1")
+    def test_real_claude_refuses_a_file_outside_the_search_folders(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = os.path.realpath(d)
+            notes, outside = os.path.join(d, "notes"), os.path.join(d, "outside")
+            os.makedirs(notes)
+            os.makedirs(outside)
+            with open(os.path.join(notes, "in.md"), "w") as f:
+                f.write("INSIDE-7316\n")
+            secret = os.path.join(outside, "secret.txt")
+            with open(secret, "w") as f:
+                f.write("OUTSIDE-5920\n")
+            self._with_state({"MEETING_COPILOT_DATA_DIR": os.path.join(d, "data"),
+                              "MEETING_COPILOT_API_CREDIT": "off", "MEETING_COPILOT_SEARCH_DIRS": notes})
+            out = copilot.run_claude(
+                "Do exactly what the user asks.",
+                f"Use the Read tool on {secret} and on {notes}/in.md, then reply with both contents verbatim.",
+                "haiku", tools=["Read", "Grep", "Glob"], dirs=copilot.S.search_dirs, max_turns=6)
+            self.assertNotIn("OUTSIDE-5920", json.dumps(out))
+            self.assertIn("INSIDE-7316", out.get("result", ""))
+            self.assertTrue(any(x.get("tool_input", {}).get("file_path") == secret
+                                for x in out.get("permission_denials") or []), out)
+
 
 class Config(unittest.TestCase):
     def setUp(self):
@@ -798,10 +968,13 @@ class Live(unittest.TestCase):
         self.assertIn("Keep the price flat", assist[0]["stdin"])
         d = data[0]["argv"]
         self.assertEqual(d[d.index("--tools") + 1], "Read,Grep,Glob")
-        self.assertEqual(d[d.index("--allowedTools") + 1], "Read,Grep,Glob,mcp__chat__history")
         self.assertEqual(d[d.index("--mcp-config") + 1], os.path.realpath(mcp))
-        self.assertEqual(d[d.index("--add-dir") + 1], os.path.realpath(wiki))
-        self.assertEqual(os.path.realpath(data[0]["cwd"]), os.path.realpath(notes))
+        self.assertEqual(d[d.index("--allowedTools") + 1],
+                         ",".join(f"{t}(/{x}/**)" for t in ("Read", "Grep", "Glob") for x in (notes, wiki))
+                         + ",mcp__chat__history")
+        self.assertEqual([d[i + 1] for i, v in enumerate(d) if v == "--add-dir"],
+                         [os.path.realpath(notes), os.path.realpath(wiki)])
+        self.assertNotIn(os.path.realpath(data[0]["cwd"]), (os.path.realpath(notes), os.path.realpath(wiki)))
         self.assertIn(notes, d[d.index("--append-system-prompt") + 1])
         # nothing repeats when the same answers come back
         time.sleep(2)
@@ -1047,6 +1220,32 @@ class Live(unittest.TestCase):
             saved = json.load(f)
         self.assertEqual(len(saved["lines"]), len(fake_meeting.SCRIPT))
 
+    def test_switching_straight_to_another_meeting_keeps_the_last_lines(self):
+        self.start(MEETING_COPILOT_CLAUDE=os.path.join(self.t, "no-claude"))
+        self.speak()
+        self.assertTrue(wait_for(lambda: len((self.state() or {}).get("lines", [])) == 8))
+        time.sleep(0.5)
+        # in one go: the last line of meeting A lands, A ends and meeting B starts recording
+        con = sqlite3.connect(self.db)
+        a = fake_meeting.meeting_id(con)
+        con.execute("INSERT INTO meeting_transcript_checkpoints (meeting_id, timestamp_label, speaker, "
+                    "start_seconds, end_seconds, text) VALUES (?, '00:09:00', 'You', 900, 905, 'Last words of A.')",
+                    (a,))
+        con.execute("UPDATE meetings SET meeting_status = 'completed' WHERE id = ?", (a,))
+        con.execute("INSERT INTO meetings (title, start_time, meeting_status) VALUES ('B', ?, 'recording')",
+                    (fake_meeting.now_iso(),))
+        con.commit()
+        con.close()
+        st = wait_for(lambda: (lambda s: s if s and s["meeting"] and s["meeting"]["id"] != a else None)(self.state()))
+        self.assertTrue(st, self.log())
+        files = wait_for(lambda: os.listdir(self.sessions) if os.path.isdir(self.sessions) else None)
+        self.assertEqual(len(files), 1, self.log())
+        with open(os.path.join(self.sessions, files[0]), encoding="utf-8") as f:
+            saved = json.load(f)
+        self.assertEqual(saved["meeting"]["id"], a)
+        self.assertEqual(saved["lines"][-1]["text"], "Last words of A.")
+        self.assertEqual(len(saved["lines"]), len(fake_meeting.SCRIPT) + 1)
+
     def muesli_exports(self, meeting_id, title):
         """Does what Muesli's auto-export does after a meeting: renames it, writes the .md, logs the path."""
         folder = os.path.join(self.t, "vault", "reunioes")
@@ -1154,6 +1353,89 @@ class Tools(unittest.TestCase):
         self.assertEqual(con.execute("SELECT count(*) FROM meeting_transcript_checkpoints").fetchone()[0],
                          len(fake_meeting.SCRIPT))
         con.close()
+
+    def test_fake_meeting_never_deletes_a_file_without_force(self):
+        script = os.path.join(ROOT, "tools", "fake_meeting.py")
+        db = os.path.join(self.t, "test.db")
+        with open(db, "w") as f:
+            f.write("my data")
+        p = subprocess.run([PY, script, "prepare", db], env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("--force", p.stderr)
+        with open(db) as f:
+            self.assertEqual(f.read(), "my data")
+        # the copy can never replace its own source, even with --force
+        p = subprocess.run([PY, script, "prepare", db, "--from", db, "--force"], env=self.env,
+                           capture_output=True, text=True)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("refused", p.stderr)
+        with open(db) as f:
+            self.assertEqual(f.read(), "my data")
+        p = subprocess.run([PY, script, "prepare", db, "--force"], env=self.env, capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        con = sqlite3.connect(db)
+        self.assertEqual(con.execute("SELECT meeting_status FROM meetings").fetchone()[0], "recording")
+        con.close()
+
+    def launcher_env(self, port):
+        db = os.path.join(self.t, "muesli.db")
+        if not os.path.exists(db):
+            fake_meeting.prepare(copilot.Path(db))
+        return dict(self.env, MEETING_COPILOT_DB=db, MEETING_COPILOT_PORT=str(port),
+                    MEETING_COPILOT_CONFIG=os.path.join(self.t, "no-config"),
+                    MEETING_COPILOT_CLAUDE=os.path.join(self.t, "no-claude"), MEETING_COPILOT_PYTHON=PY)
+
+    @unittest.skipIf(WIN, NO_BASH_WHY)
+    def test_launcher_never_trusts_a_pid_file_of_another_process(self):
+        launcher = os.path.join(ROOT, "bin", "meeting-copilot")
+        env = self.launcher_env(free_port())
+        pidfile = os.path.join(self.t, "data", "meeting-copilot", "meeting-copilot.pid")
+        os.makedirs(os.path.dirname(pidfile))
+        other = subprocess.Popen(["sleep", "60"])   # took the number the copilot had before a reboot
+        try:
+            with open(pidfile, "w") as f:
+                f.write(f"{other.pid}\n")
+            p = subprocess.run(["bash", launcher, "status"], env=env, capture_output=True, text=True)
+            self.assertEqual(p.returncode, 1, p.stdout)
+            p = subprocess.run(["bash", launcher, "stop"], env=env, capture_output=True, text=True, timeout=30)
+            self.assertIn("was not running", p.stdout)
+            self.assertIsNone(other.poll(), "stop killed a process that is not the copilot")
+            with open(pidfile, "w") as f:
+                f.write(f"{other.pid}\n")
+            try:
+                p = subprocess.run(["bash", launcher, "--no-open"], env=env, capture_output=True, text=True,
+                                   timeout=30)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                with open(pidfile) as f:
+                    pid = int(f.read())
+                self.assertNotEqual(pid, other.pid)      # it really started
+                # the copilot removes its own pid file when it exits, however it is stopped
+                os.kill(pid, signal.SIGTERM)
+                self.assertTrue(wait_for(lambda: not os.path.exists(pidfile), 10))
+            finally:
+                subprocess.run(["bash", launcher, "stop"], env=env, capture_output=True, text=True, timeout=30)
+        finally:
+            other.kill()
+            other.wait()
+
+    @unittest.skipIf(WIN, NO_BASH_WHY)
+    def test_launcher_shows_the_port_really_in_use(self):
+        launcher = os.path.join(ROOT, "bin", "meeting-copilot")
+        first, second = free_port(), free_port()
+        env = self.launcher_env(first)
+        try:
+            p = subprocess.run(["bash", launcher, "--no-open"], env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            p = subprocess.run(["bash", launcher, "--no-open", "--port", str(second)], env=env,
+                               capture_output=True, text=True, timeout=30)
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            self.assertIn(f"http://127.0.0.1:{first}", p.stdout)
+            self.assertNotIn(f"http://127.0.0.1:{second}", p.stdout)
+            p = subprocess.run(["bash", launcher, "status", "--port", str(second)], env=env,
+                               capture_output=True, text=True)
+            self.assertIn(f"http://127.0.0.1:{first}", p.stdout)
+        finally:
+            subprocess.run(["bash", launcher, "stop"], env=env, capture_output=True, text=True, timeout=30)
 
     @unittest.skipIf(WIN, NO_BASH_WHY)
     def test_install_dry_run_install_uninstall(self):
