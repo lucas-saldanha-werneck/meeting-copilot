@@ -1909,6 +1909,52 @@ class Live(unittest.TestCase):
         self.assertEqual(len(self.claude_calls()), n)
 
     @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
+    def test_restart_during_a_meeting_keeps_goals_and_the_ai_click(self):
+        # a restart in the middle of a meeting (config change, `meeting-copilot stop`) used to drop the
+        # objective, the goals and the "Turn on AI" click: the page went blank and the AI stayed off
+        self.start(MEETING_COPILOT_CONFIRM_AI="1")
+        self.speak()
+        self.assertTrue(wait_for(lambda: (self.state() or {}).get("live")), self.log())
+        mid = self.state()["meeting"]["id"]
+        self.assertEqual(self.post("/context", {"goal": "Learn the pay range", "goals": ["Pay range", "Next step"]}), 200)
+        self.assertEqual(self.post("/ai", {"on": True, "meeting": mid}), 200)
+        self.proc.send_signal(signal.SIGTERM)
+        self.proc.wait(10)
+        ctx = os.path.join(self.t, "data", "meeting-copilot", "context.json")
+        if not WIN:
+            self.assertEqual(os.stat(ctx).st_mode & 0o777, 0o600)
+        self.start(MEETING_COPILOT_CONFIRM_AI="1")
+        self.assertTrue(wait_for(lambda: (self.state() or {}).get("live")), self.log())
+        st = self.state()
+        self.assertEqual(st["meeting"]["id"], mid)
+        self.assertEqual(st["goal"], "Learn the pay range")
+        self.assertEqual([g["text"] for g in st["goals"]], ["Pay range", "Next step"])
+        self.assertTrue(st["ai_on"])
+        n = len(self.claude_calls())
+        self.speak()
+        self.assertTrue(wait_for(lambda: len(self.claude_calls()) > n), self.log())
+        # the next meeting still asks again
+        fake_meeting.end(copilot.Path(self.db))
+        self.assertTrue(wait_for(lambda: (lambda s: s and not s["live"])(self.state())), self.log())
+        self.set_status("recording")
+        self.assertTrue(wait_for(lambda: (self.state() or {}).get("live")), self.log())
+        self.assertFalse(self.state()["ai_on"])
+
+    def test_old_or_broken_context_file_is_ignored(self):
+        d = os.path.join(self.t, "data", "meeting-copilot")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "context.json"), "w") as f:
+            json.dump({"saved": time.time() - 7 * 3600, "meeting": 1, "goal": "old", "goals": [], "ai_for": 1}, f)
+        self.start(MEETING_COPILOT_CONFIRM_AI="1")
+        self.assertEqual(self.state()["goal"], "")
+        self.proc.kill()
+        self.proc.wait()
+        with open(os.path.join(d, "context.json"), "w") as f:
+            f.write("{not json")
+        self.start(MEETING_COPILOT_CONFIRM_AI="1")
+        self.assertEqual(self.state()["goal"], "")
+
+    @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
     def test_confirm_ai_stop_drops_the_answer_still_running(self):
         self.start(MEETING_COPILOT_CONFIRM_AI="1", FAKE_CLAUDE_SLEEP="3")
         mid = self.state()["meeting"]["id"]

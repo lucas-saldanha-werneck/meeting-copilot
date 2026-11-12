@@ -159,13 +159,17 @@ for (const id of ["goal", "goalsTxt"]) {
   document.getElementById(id).addEventListener("focus", () => editing = true);
 }
 document.getElementById("save").onclick = async () => {
-  await post("/context", {
-    goal: document.getElementById("goal").value,
-    goals: document.getElementById("goalsTxt").value.split("\n"),
-  });
-  editing = false;
-  document.getElementById("saved").textContent = "saved";
-  setTimeout(() => document.getElementById("saved").textContent = "", 2000);
+  let ok = false;
+  try {
+    ok = (await post("/context", {
+      goal: document.getElementById("goal").value,
+      goals: document.getElementById("goalsTxt").value.split("\n"),
+    })).ok;
+  } catch {}
+  // not saved: keep your text in the boxes (the next refresh would replace it) and say so
+  editing = !ok;
+  document.getElementById("saved").textContent = ok ? "saved" : "not saved, try again";
+  setTimeout(() => document.getElementById("saved").textContent = "", ok ? 2000 : 6000);
 };
 refresh();
 setInterval(refresh, 2000);
