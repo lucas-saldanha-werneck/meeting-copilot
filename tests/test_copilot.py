@@ -310,6 +310,7 @@ class Logic(unittest.TestCase):
                                         "CLAUDE_CREDITO_PAUSE_S": "0"}).choose()
             self.assertEqual(env["ANTHROPIC_API_KEY"], "sk-ant-conf-2222")
 
+    @unittest.skipIf(WIN, "Windows finds commands on PATH by extension (PATHEXT); the tool is macOS-only")
     def test_api_credit_on_means_the_default_wrapper_name(self):
         with tempfile.TemporaryDirectory() as d:
             w = os.path.join(d, "claude-credito")
