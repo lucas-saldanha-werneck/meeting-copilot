@@ -1484,6 +1484,10 @@ class _LanServer(_Server):
     lan = True
 
 
+class _LanPage(Page):
+    timeout = 30   # seconds a LAN connection may sit idle: a slow client cannot hold a thread forever
+
+
 def print_urls(port: str, lan_port: str) -> None:
     """For `meeting-copilot status`: the other addresses of the page (LAN, extra hosts), each with the token."""
     q = "/?token=" + load_token(S.data_dir)
@@ -1506,7 +1510,7 @@ def start_lan() -> bool:
     if not S.lan:
         return False
     try:
-        lan = _LanServer(("0.0.0.0", S.lan_port), Page)
+        lan = _LanServer(("0.0.0.0", S.lan_port), _LanPage)
     except OSError as ex:
         print(f"note: LAN page off: cannot listen on 0.0.0.0:{S.lan_port}: {ex}", flush=True)
         return False

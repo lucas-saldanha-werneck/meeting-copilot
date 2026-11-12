@@ -843,6 +843,10 @@ class Lan(unittest.TestCase):
         self.assertEqual((s.lan_port, s.lan_name), (80, "copilot"))
         self.assertEqual(s.hosts_ok, {"127.0.0.1:4390", "localhost:4390"})
 
+    def test_lan_handler_drops_slow_clients(self):
+        self.assertEqual(copilot._LanPage.timeout, 30)   # a slow LAN client cannot hold a thread forever
+        self.assertTrue(issubclass(copilot._LanPage, copilot.Page))
+
     def test_settings_name_and_hosts(self):
         s = copilot.Settings({"MEETING_COPILOT_LAN": "1", "MEETING_COPILOT_LAN_NAME": "Copilot.local"})
         self.assertEqual(s.lan_name, "copilot")
