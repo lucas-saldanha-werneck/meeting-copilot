@@ -11,7 +11,7 @@
 # Muesli database, opened read-only.
 #MEETING_COPILOT_DB=~/Library/Application Support/Muesli/muesli.db
 
-# Local port. The server listens on 127.0.0.1 only.
+# Local port. The server listens on 127.0.0.1 (see MEETING_COPILOT_LAN for the home network).
 #MEETING_COPILOT_PORT=4390
 
 # Path to the Claude Code CLI. Default: `claude` on your PATH.
@@ -67,6 +67,21 @@
 # Extra host names allowed to load the page (behind your own reverse proxy or
 # tunnel), comma-separated. Empty: none.
 #MEETING_COPILOT_EXTRA_HOSTS=
+
+# 1: also answer your other devices on the home network: a second listener on
+# 0.0.0.0:LAN_PORT that refuses every address outside the private ranges, with the
+# same token. Plain http: use it only on a network you trust. Default: 0.
+#MEETING_COPILOT_LAN=0
+# Port of that listener (80 = no port in the URL; macOS lets your user use it).
+#MEETING_COPILOT_LAN_PORT=80
+# Name published as <name>.local with macOS dns-sd, e.g. http://copilot.local
+# off: not published (use the LAN IP URL that `meeting-copilot status` prints).
+#MEETING_COPILOT_LAN_NAME=copilot
+# A fixed LAN address to publish. Empty: found by itself and followed when it changes.
+#MEETING_COPILOT_LAN_IP=
+# The dns-sd command that publishes the name. Default: dns-sd (macOS only; elsewhere
+# no name is published).
+#MEETING_COPILOT_DNS_SD=dns-sd
 
 # 1: no AI call in a meeting until you click "Turn on AI" on the page. Each
 # meeting asks again. Useful when the copilot starts at login. Default: 0.

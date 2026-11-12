@@ -19,12 +19,14 @@ from __future__ import annotations
 import argparse
 import atexit
 import hmac
+import ipaddress
 import json
 import os
 import re
 import secrets
 import shutil
 import signal
+import socket
 import socketserver
 import sqlite3
 import subprocess
@@ -40,7 +42,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
-__version__ = "0.7.4"
+__version__ = "0.8.0"
 
 HERE = Path(__file__).resolve().parent
 PAGE = HERE / "page.html"
@@ -257,6 +259,9 @@ def check_prompt(text: str, path, kind: str = "assist") -> list[str]:
     return notes
 
 
+LAN_NAME_OK = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+
+
 class Settings:
     def __init__(self, cfg: dict) -> None:
         g = lambda k, d="": cfg.get("MEETING_COPILOT_" + k) or d  # noqa: E731  (KEY= with no value: the default)
@@ -348,9 +353,32 @@ class Settings:
         self.data_prompt = load_prompt_file(g("DATA_PROMPT_FILE"), "data", self.notices)
 
         hosts = [h.strip() for h in g("EXTRA_HOSTS").split(",") if h.strip()]
+        self.extra_hosts = hosts
         self.hosts_ok = {f"127.0.0.1:{self.port}", f"localhost:{self.port}", *hosts}
         self.origins_ok = {f"http://127.0.0.1:{self.port}", f"http://localhost:{self.port}",
                            *(f"https://{h}" for h in hosts)}
+
+        # Optional: a second listener for your other devices on the home network (LAN=1), on
+        # 0.0.0.0:LAN_PORT, answering only clients from private addresses, published as <LAN_NAME>.local.
+        self.lan = g("LAN", "0").strip().lower() in ("1", "yes", "true", "on")
+        try:
+            self.lan_port = int(g("LAN_PORT", "80"))
+        except ValueError:
+            self.notices.append(f"MEETING_COPILOT_LAN_PORT is not a number, using 80: {g('LAN_PORT')}")
+            self.lan_port = 80
+        name = g("LAN_NAME", "copilot").strip().lower()
+        name = name[:-len(".local")] if name.endswith(".local") else name
+        if name in ("0", "no", "false", "off"):
+            name = ""
+        elif not LAN_NAME_OK.match(name):
+            self.notices.append(f"MEETING_COPILOT_LAN_NAME must be letters, digits and -, not published: {name}")
+            name = ""
+        self.lan_name = name
+        self.lan_ip = g("LAN_IP").strip()   # empty: found by itself, and followed when it changes
+        names = ([f"{name}.local"] if name else []) + ["localhost"]
+        self.lan_hosts_ok = {f"{n}:{self.lan_port}" for n in names} | (set(names) if self.lan_port == 80 else set())
+        dns_sd = g("DNS_SD").strip()
+        self.dns_sd = _expand(dns_sd) if dns_sd else (shutil.which("dns-sd") if sys.platform == "darwin" else None)
 
     @property
     def data_enabled(self) -> bool:
@@ -1140,13 +1168,170 @@ def loop(db: Path) -> None:
 # ---------------------------------------------------------------- local server
 
 
+# The LAN listener answers only these client addresses: loopback and the private ranges.
+LAN_NETS = tuple(ipaddress.ip_network(n) for n in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "fc00::/7", "fe80::/10"))
+
+
+def _ip(text: str):
+    try:
+        a = ipaddress.ip_address(text.split("%", 1)[0])
+    except ValueError:
+        return None
+    return getattr(a, "ipv4_mapped", None) or a
+
+
+def lan_client_ok(ip: str) -> bool:
+    """Whether an address is loopback or in a private range (never a public internet address)."""
+    a = _ip(ip)
+    return a is not None and (a.is_loopback or any(a.version == n.version and a in n for n in LAN_NETS))
+
+
+def lan_host_ok(host: str, s: Settings) -> bool:
+    """Host header check of the LAN listener: <name>.local / localhost, or a LAN IP literal, on our port.
+
+    An IP literal is safe against DNS rebinding, which needs a host name the attacker controls."""
+    host = host.strip().lower()
+    if host in s.lan_hosts_ok:
+        return True
+    if not host or any(c in host for c in "/?#@\\ "):
+        return False
+    try:
+        u = urlsplit("//" + host)
+        port = u.port
+    except ValueError:
+        return False
+    if (port or 80) != s.lan_port or not u.hostname:
+        return False
+    return lan_client_ok(u.hostname)
+
+
+def _no80(hostport: str) -> str:
+    return hostport[:-3] if hostport.endswith(":80") else hostport
+
+
+def lan_origin_ok(origin: str | None, host: str) -> bool:
+    """A POST on the LAN listener must come from the page itself: Origin http://<the Host it was sent to>."""
+    return bool(origin and host) and _no80(origin.strip().lower()) == _no80("http://" + host.strip().lower())
+
+
+def lan_ip() -> str | None:
+    """This computer's address on the local network, or None (offline, or only a public address)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("192.0.2.1", 9))   # UDP connect sends nothing: it only picks the outgoing address
+        ip = s.getsockname()[0]
+    except OSError:
+        ip = ""
+    finally:
+        s.close()
+    if ip and not ip.startswith("127.") and lan_client_ok(ip):
+        return ip
+    if sys.platform == "darwin":
+        for ifc in ("en0", "en1"):
+            try:
+                out = subprocess.run(["ipconfig", "getifaddr", ifc], capture_output=True, text=True,
+                                     timeout=3).stdout.strip()
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if out and lan_client_ok(out):
+                return out
+    return None
+
+
+class Mdns:
+    """Publishes <name>.local -> this computer's LAN address with macOS `dns-sd -P`, while the copilot runs.
+
+    The address is checked every `every` seconds and published again when it changes. dns-sd runs under a
+    small sh watcher that stops it when the copilot is gone, even after a kill -9."""
+
+    def __init__(self, dns_sd: str, name: str, port: int, ip_fn, every: float = 30.0) -> None:
+        self.dns_sd, self.name, self.port, self.ip_fn, self.every = dns_sd, name, port, ip_fn, every
+        self.ip = None
+        self.proc: subprocess.Popen | None = None
+        self._halt = threading.Event()
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> "Mdns":
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def _run(self) -> None:
+        while not self._halt.is_set():
+            try:
+                ip = self.ip_fn()
+            except Exception:
+                ip = None
+            with self._lock:
+                if self._halt.is_set():
+                    break
+                if ip != self.ip or (ip and (self.proc is None or self.proc.poll() is not None)):
+                    self._kill()
+                    self.ip = ip
+                    if ip:
+                        self._spawn(ip)
+            self._halt.wait(self.every)
+
+    def _spawn(self, ip: str) -> None:
+        args = [self.dns_sd, "-P", self.name, "_http._tcp", "local", str(self.port), f"{self.name}.local", ip]
+        watch = ('"$@" & c=$!; trap \'kill $c 2>/dev/null\' EXIT; trap \'exit 0\' TERM INT HUP; '
+                 f'while kill -0 {os.getpid()} 2>/dev/null && kill -0 $c 2>/dev/null; do sleep 1 & wait $!; done')
+        try:
+            self.proc = subprocess.Popen(["/bin/sh", "-c", watch, "dns-sd", *args], stdin=subprocess.DEVNULL,
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as ex:
+            self.proc = None
+            print(f"note: could not publish {self.name}.local: {ex}", flush=True)
+
+    def _kill(self) -> None:
+        p, self.proc = self.proc, None
+        if p and p.poll() is None:
+            p.terminate()
+            try:
+                p.wait(5)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait()
+
+    def stop(self) -> None:
+        self._halt.set()
+        with self._lock:
+            self._kill()
+        if self._thread:
+            self._thread.join(5)
+
+
 class Page(BaseHTTPRequestHandler):
     def log_message(self, *a):  # quiet
         pass
 
+    @property
+    def _lan(self) -> bool:
+        return getattr(self.server, "lan", False)
+
+    def _client_ok(self) -> bool:
+        # the LAN listener (0.0.0.0) never answers an address from outside the local network
+        return not self._lan or lan_client_ok(str(self.client_address[0]))
+
     def _host_ok(self) -> bool:
         # blocks DNS rebinding: only our own host names are answered
-        return self.headers.get("Host", "") in S.hosts_ok
+        host = self.headers.get("Host", "")
+        return lan_host_ok(host, S) if self._lan else host in S.hosts_ok
+
+    def _origin_ok(self) -> bool:
+        origin = self.headers.get("Origin")
+        return lan_origin_ok(origin, self.headers.get("Host", "")) if self._lan else origin in S.origins_ok
+
+    def _https(self) -> bool:
+        """The browser reached us over https (a tunnel such as Cloudflare's says so in these headers)."""
+        if self.headers.get("X-Forwarded-Proto", "").split(",")[0].strip().lower() == "https":
+            return True
+        try:
+            return json.loads(self.headers.get("Cf-Visitor") or "{}").get("scheme") == "https"
+        except (ValueError, AttributeError):
+            return False
 
     def _send(self, code: int, body: bytes, ctype: str, headers: dict | None = None) -> None:
         self.send_response(code)
@@ -1181,6 +1366,8 @@ class Page(BaseHTTPRequestHandler):
         return u.path, (given[0] if given else None)
 
     def do_GET(self):
+        if not self._client_ok():
+            return self._send(403, b"network", "text/plain")
         if not self._host_ok():
             return self._send(403, b"host", "text/plain")
         path, given = self._route()
@@ -1192,6 +1379,8 @@ class Page(BaseHTTPRequestHandler):
                               if k != "token"])
             loc = "/" + path.lstrip("/") + (f"?{rest}" if rest else "")   # never //host: no open redirect
             cookie = f"{TOKEN_COOKIE}={S.token}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Strict"
+            if self._https():
+                cookie += "; Secure"
             return self._send(303, b"", "text/plain", {"Location": loc, "Set-Cookie": cookie})
         if not self._token_ok(self._sent_token()):
             return self._deny()
@@ -1211,8 +1400,10 @@ class Page(BaseHTTPRequestHandler):
         if n > 100_000:
             self.close_connection = True
         raw = self.rfile.read(min(n, 100_000)) if n else b""
+        if not self._client_ok():
+            return self._send(403, b"network", "text/plain")
         # no CORS headers: another site can neither read this nor send JSON here
-        if not self._host_ok() or self.headers.get("Origin") not in S.origins_ok \
+        if not self._host_ok() or not self._origin_ok() \
                 or not self.headers.get("Content-Type", "").startswith("application/json"):
             return self._send(403, b"origin", "text/plain")
         path, given = self._route()
@@ -1252,15 +1443,16 @@ def _stop(*_):
     raise KeyboardInterrupt
 
 
-# bin/meeting-copilot writes our pid to PID_FILE; we write "<pid> <port>" to PORT_FILE once the page is up,
-# so the launcher can show the port really in use. Both go away when we exit (only if they are still ours).
+# bin/meeting-copilot writes our pid to PID_FILE; we write "<pid> <port> [<LAN port>]" to PORT_FILE once the
+# page is up, so the launcher can show the ports really in use. Both go away when we exit (only if still ours).
 PID_FILE, PORT_FILE = "meeting-copilot.pid", "meeting-copilot.port"
 
 
-def write_port_file(port: int) -> None:
+def write_port_file(port: int, lan_port: int | None = None) -> None:
     try:
         S.data_dir.mkdir(parents=True, exist_ok=True)
-        _write_private(S.data_dir / PORT_FILE, f"{os.getpid()} {port}\n")
+        lan = f" {lan_port}" if lan_port else ""
+        _write_private(S.data_dir / PORT_FILE, f"{os.getpid()} {port}{lan}\n")
     except OSError as ex:
         print(f"note: could not write {S.data_dir / PORT_FILE}: {ex}", flush=True)
 
@@ -1287,6 +1479,51 @@ class _Server(ThreadingHTTPServer):
         self.server_name, self.server_port = "127.0.0.1", self.server_address[1]
 
 
+class _LanServer(_Server):
+    """The optional listener on 0.0.0.0 for other devices on the local network (see Page._client_ok)."""
+    lan = True
+
+
+class _LanPage(Page):
+    timeout = 30   # seconds a LAN connection may sit idle: a slow client cannot hold a thread forever
+
+
+def print_urls(port: str, lan_port: str) -> None:
+    """For `meeting-copilot status`: the other addresses of the page (LAN, extra hosts), each with the token."""
+    q = "/?token=" + load_token(S.data_dir)
+    if S.lan:
+        if lan_port:
+            sfx = "" if lan_port == "80" else f":{lan_port}"
+            if S.lan_name and S.dns_sd:
+                print(f"  LAN:    http://{S.lan_name}.local{sfx}{q}")
+            ip = S.lan_ip or lan_ip()
+            if ip:
+                print(f"  LAN IP: http://{ip}{sfx}{q}")
+        else:
+            print("  LAN:    on in the settings but not listening (see `meeting-copilot log`)")
+    for h in S.extra_hosts:
+        print(f"  public: https://{h}{q}")
+
+
+def start_lan() -> bool:
+    """LAN=1: the second listener on 0.0.0.0:LAN_PORT, and its .local name. A failure is a note, not an exit."""
+    if not S.lan:
+        return False
+    try:
+        lan = _LanServer(("0.0.0.0", S.lan_port), _LanPage)
+    except OSError as ex:
+        print(f"note: LAN page off: cannot listen on 0.0.0.0:{S.lan_port}: {ex}", flush=True)
+        return False
+    threading.Thread(target=lan.serve_forever, daemon=True).start()
+    print(f"LAN page on port {S.lan_port} (private addresses only)", flush=True)
+    if S.lan_name and S.dns_sd:
+        mdns = Mdns(S.dns_sd, S.lan_name, S.lan_port, lambda: S.lan_ip or lan_ip()).start()
+        atexit.register(mdns.stop)
+    elif S.lan_name:
+        print(f"note: {S.lan_name}.local is not published (dns-sd not found; it is a macOS command)", flush=True)
+    return True
+
+
 def main(argv=None) -> None:
     global S
     ap = argparse.ArgumentParser(description="Live meeting copilot (reads the Muesli app's live transcript).")
@@ -1294,6 +1531,7 @@ def main(argv=None) -> None:
     ap.add_argument("--port", type=int, help="local port (default 4390)")
     ap.add_argument("--version", action="version", version=f"meeting-copilot {__version__}")
     ap.add_argument("--get", metavar="KEY", help=argparse.SUPPRESS)  # for bin/meeting-copilot: PORT, OPEN_CMD
+    ap.add_argument("--urls", nargs=2, metavar=("PORT", "LAN_PORT"), help=argparse.SUPPRESS)  # for `status`
     ap.add_argument("--token", action="store_true",
                     help="print the page token (created on first use) and exit")
     args = ap.parse_args(argv)
@@ -1305,6 +1543,10 @@ def main(argv=None) -> None:
     if args.get:
         v = cfg.get("MEETING_COPILOT_" + args.get, "")
         print(_expand(v) if v and args.get == "DATA_DIR" else v)
+        return
+    if args.urls:
+        S = Settings(cfg)
+        print_urls(*args.urls)
         return
     if args.db:
         cfg["MEETING_COPILOT_DB"] = str(args.db)
@@ -1330,7 +1572,8 @@ def main(argv=None) -> None:
     threading.Thread(target=loop, args=(S.db,), daemon=True).start()
     srv = _Server(("127.0.0.1", S.port), Page)
     atexit.register(remove_run_files)
-    write_port_file(S.port)
+    lan_up = start_lan()
+    write_port_file(S.port, S.lan_port if lan_up else None)
     print(f"meeting-copilot on http://127.0.0.1:{S.port}  (database: {S.db})", flush=True)
     try:
         srv.serve_forever()
