@@ -16,6 +16,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.error
@@ -763,6 +764,219 @@ class Token(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         with open(os.path.join(data, "token"), encoding="utf-8") as f:
             self.assertEqual(p.stdout.strip(), f.read().strip())
+
+
+def fake_dns_sd(folder) -> tuple[str, str]:
+    """A fake dns-sd: appends '<pid> <args>' to a file, then stays up like the real one."""
+    log = os.path.join(folder, "dns-sd.log")
+    path = os.path.join(folder, "dns-sd")
+    with open(path, "w") as f:
+        f.write(f'#!/bin/sh\necho "$$ $*" >> "{log}"\nexec sleep 60\n')
+    os.chmod(path, 0o755)
+    return path, log
+
+
+def dns_sd_calls(log) -> list[tuple[int, str]]:
+    try:
+        with open(log, encoding="utf-8") as f:
+            return [(int(x.split(" ", 1)[0]), x.split(" ", 1)[1].strip()) for x in f if x.strip()]
+    except OSError:
+        return []
+
+
+def alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    out = subprocess.run(["ps", "-p", str(pid), "-o", "stat="], capture_output=True, text=True).stdout
+    return bool(out.strip()) and not out.strip().startswith("Z")
+
+
+class Lan(unittest.TestCase):
+    """The optional LAN listener (0.0.0.0), its mDNS name, and https behind a tunnel."""
+
+    TOK = "t" * 40
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.t = os.path.realpath(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        old = copilot.S
+        self.addCleanup(setattr, copilot, "S", old)
+        self.use({"MEETING_COPILOT_LAN": "1", "MEETING_COPILOT_LAN_PORT": "8080"})
+
+    def use(self, cfg):
+        copilot.S = copilot.Settings(cfg)
+        copilot.S.token = self.TOK
+
+    def serve(self, lan=True, client_ip=None):
+        """An in-process server on 127.0.0.1; client_ip pretends every client comes from that address."""
+        base = copilot._LanServer if lan else copilot._Server
+
+        class Srv(base):
+            def get_request(s):
+                sock, addr = super().get_request()
+                return sock, ((client_ip, addr[1]) if client_ip else addr)
+
+        srv = Srv(("127.0.0.1", 0), copilot.Page)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return srv.server_address[1]
+
+    def req(self, port, path, host, headers=None, method="GET", body=None, auth=True):
+        h = {"Host": host, **(headers or {})}
+        if auth:
+            h.setdefault("Cookie", f"meeting_copilot_token={self.TOK}")
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+        try:
+            c.request(method, path, body=body, headers=h)
+            r = c.getresponse()
+            return r.status, r.headers, r.read()
+        finally:
+            c.close()
+
+    def test_defaults_keep_todays_behaviour(self):
+        s = copilot.Settings({})
+        self.assertFalse(s.lan)
+        self.assertEqual((s.lan_port, s.lan_name), (80, "copilot"))
+        self.assertEqual(s.hosts_ok, {"127.0.0.1:4390", "localhost:4390"})
+
+    def test_settings_name_and_hosts(self):
+        s = copilot.Settings({"MEETING_COPILOT_LAN": "1", "MEETING_COPILOT_LAN_NAME": "Copilot.local"})
+        self.assertEqual(s.lan_name, "copilot")
+        self.assertIn("copilot.local", s.lan_hosts_ok)
+        self.assertIn("copilot.local:80", s.lan_hosts_ok)
+        self.assertNotIn("copilot.local", s.hosts_ok)          # the main listener stays 127.0.0.1-only
+        s = copilot.Settings({"MEETING_COPILOT_LAN": "1", "MEETING_COPILOT_LAN_PORT": "8080"})
+        self.assertIn("copilot.local:8080", s.lan_hosts_ok)
+        self.assertNotIn("copilot.local", s.lan_hosts_ok)      # bare = port 80, not us
+        for bad in ("bad name", "a.b", "-x"):
+            s = copilot.Settings({"MEETING_COPILOT_LAN": "1", "MEETING_COPILOT_LAN_NAME": bad})
+            self.assertEqual(s.lan_name, "", bad)
+            self.assertTrue(s.notices)
+        self.assertEqual(copilot.Settings({"MEETING_COPILOT_LAN_NAME": "off"}).lan_name, "")
+        s = copilot.Settings({"MEETING_COPILOT_LAN_PORT": "eighty"})
+        self.assertEqual(s.lan_port, 80)
+        self.assertTrue(s.notices)
+
+    def test_lan_client_ranges(self):
+        for ip in ("127.0.0.1", "10.1.2.3", "172.16.0.9", "172.31.255.1", "192.168.1.20", "169.254.3.4",
+                   "::1", "fd12::1", "fe80::1%en0", "::ffff:192.168.1.20"):
+            self.assertTrue(copilot.lan_client_ok(ip), ip)
+        for ip in ("8.8.8.8", "172.32.0.1", "100.64.0.1", "203.0.113.5", "2001:db8::1", "::ffff:8.8.8.8",
+                   "", "nonsense"):
+            self.assertFalse(copilot.lan_client_ok(ip), ip)
+
+    def test_public_client_gets_403_before_anything(self):
+        port = self.serve(client_ip="203.0.113.5")
+        for path in ("/", "/state", f"/?token={self.TOK}", "/nope"):
+            code, _, body = self.req(port, path, "copilot.local:8080")
+            self.assertEqual((code, body), (403, b"network"), path)
+        code, _, body = self.req(port, "/mute", "copilot.local:8080", method="POST", body=b'{"kind":"x"}',
+                                 headers={"Origin": "http://copilot.local:8080",
+                                          "Content-Type": "application/json"})
+        self.assertEqual((code, body), (403, b"network"))
+
+    def test_private_client_needs_the_token_and_our_host(self):
+        port = self.serve(client_ip="192.168.1.20")
+        self.assertEqual(self.req(port, "/", "copilot.local:8080")[0], 200)
+        self.assertEqual(self.req(port, "/state", "copilot.local:8080", auth=False)[0], 401)
+        self.assertEqual(self.req(port, "/state", "copilot.local:8080",
+                                  headers={"Cookie": "meeting_copilot_token=wrong"})[0], 401)
+        self.assertEqual(self.req(port, "/state", "copilot.local:8080",
+                                  headers={"Authorization": f"Bearer {self.TOK}"}, auth=False)[0], 200)
+        code, hdrs, _ = self.req(port, f"/?token={self.TOK}", "copilot.local:8080", auth=False)
+        self.assertEqual((code, hdrs["Location"]), (303, "/"))
+        self.assertNotIn("Secure", hdrs["Set-Cookie"])          # plain http on the LAN
+        # a LAN IP literal works (no DNS rebinding without a name); other names and ports do not
+        self.assertEqual(self.req(port, "/", "192.168.1.10:8080")[0], 200)
+        for host in ("evil.example:8080", "copilot.local", "copilot.local:9999", "192.168.1.10",
+                     "8.8.8.8:8080", "127.0.0.1:4390", ""):
+            self.assertEqual(self.req(port, "/", host)[0], 403, host)
+
+    def test_lan_post_origin_must_be_the_page_itself(self):
+        port = self.serve(client_ip="10.0.0.7")
+
+        def post(host, origin):
+            h = {"Content-Type": "application/json"}
+            if origin is not None:
+                h["Origin"] = origin
+            return self.req(port, "/mute", host, method="POST", body=b'{"kind":"x"}', headers=h)[0]
+
+        self.assertEqual(post("copilot.local:8080", "http://copilot.local:8080"), 200)
+        self.assertEqual(post("192.168.1.10:8080", "http://192.168.1.10:8080"), 200)
+        for host, origin in (("copilot.local:8080", "http://evil.example"),
+                             ("copilot.local:8080", "http://192.168.1.50:8080"),   # another LAN device
+                             ("copilot.local:8080", "https://copilot.local:8080"),
+                             ("copilot.local:8080", None)):
+            self.assertEqual(post(host, origin), 403, (host, origin))
+
+    def test_origin_rule_on_port_80(self):
+        self.use({"MEETING_COPILOT_LAN": "1"})
+        S = copilot.S
+        self.assertTrue(copilot.lan_host_ok("copilot.local", S))
+        self.assertTrue(copilot.lan_host_ok("COPILOT.LOCAL:80", S))
+        self.assertTrue(copilot.lan_host_ok("192.168.1.10", S))
+        self.assertTrue(copilot.lan_host_ok("[fe80::1]", S))
+        self.assertFalse(copilot.lan_host_ok("copilot.local:8080", S))
+        self.assertFalse(copilot.lan_host_ok("copilot.local:bad", S))
+        self.assertTrue(copilot.lan_origin_ok("http://copilot.local", "copilot.local"))
+        self.assertTrue(copilot.lan_origin_ok("http://copilot.local", "copilot.local:80"))
+        self.assertFalse(copilot.lan_origin_ok("http://copilot.local", "192.168.1.10"))
+        self.assertFalse(copilot.lan_origin_ok(None, "copilot.local"))
+
+    def test_main_listener_has_no_client_check_and_ignores_lan_names(self):
+        port = self.serve(lan=False, client_ip="203.0.113.5")   # e.g. a tunnel: it connects from 127.0.0.1
+        self.assertEqual(self.req(port, "/", "127.0.0.1:4390")[0], 200)
+        self.assertEqual(self.req(port, "/", "copilot.local")[0], 403)
+
+    def test_cookie_secure_behind_https_tunnel(self):
+        self.use({"MEETING_COPILOT_EXTRA_HOSTS": "copilot.example.com"})
+        port = self.serve(lan=False)
+        for extra, secure in (({"X-Forwarded-Proto": "https"}, True), ({"X-Forwarded-Proto": "https, http"}, True),
+                              ({"Cf-Visitor": '{"scheme":"https"}'}, True), ({"Cf-Visitor": '"x"'}, False),
+                              ({"Cf-Visitor": "not json"}, False), ({"X-Forwarded-Proto": "http"}, False), ({}, False)):
+            code, hdrs, _ = self.req(port, f"/?token={self.TOK}", "copilot.example.com", extra, auth=False)
+            self.assertEqual(code, 303)
+            self.assertEqual("; Secure" in hdrs["Set-Cookie"], secure, extra)
+        self.assertEqual(self.req(port, "/", "copilot.example.com")[0], 200)
+
+    @unittest.skipIf(WIN, NO_BASH_WHY)
+    def test_mdns_child_started_republished_and_stopped(self):
+        exe, log = fake_dns_sd(self.t)
+        ips = ["192.168.1.10"]
+        m = copilot.Mdns(exe, "copilot", 80, lambda: ips[0], every=0.2)
+        m.start()
+        try:
+            calls = wait_for(lambda: dns_sd_calls(log), 10)
+            self.assertEqual(calls[0][1], "-P copilot _http._tcp local 80 copilot.local 192.168.1.10")
+            first = calls[0][0]
+            self.assertTrue(alive(first))
+            ips[0] = "192.168.1.11"                                  # the Mac moved to another address
+            calls = wait_for(lambda: dns_sd_calls(log)[1:], 10)
+            self.assertEqual(calls[0][1], "-P copilot _http._tcp local 80 copilot.local 192.168.1.11")
+            self.assertTrue(wait_for(lambda: not alive(first), 10), "old dns-sd still running")
+            second = calls[0][0]
+            ips[0] = None                                            # off the network: nothing published
+            self.assertTrue(wait_for(lambda: not alive(second), 10))
+            ips[0] = "192.168.1.11"
+            calls = wait_for(lambda: dns_sd_calls(log)[2:], 10)
+            third = calls[0][0]
+        finally:
+            m.stop()
+        self.assertTrue(wait_for(lambda: not alive(third), 10), "dns-sd outlived stop()")
+        n = len(dns_sd_calls(log))
+        time.sleep(0.6)
+        self.assertEqual(len(dns_sd_calls(log)), n)                  # nothing restarted after stop
+
+    def test_mdns_is_a_noop_without_dns_sd(self):
+        s = copilot.Settings({"MEETING_COPILOT_LAN": "1", "PATH": ""})
+        if sys.platform != "darwin":
+            self.assertIsNone(s.dns_sd)
+        s = copilot.Settings({"MEETING_COPILOT_LAN": "1", "MEETING_COPILOT_DNS_SD": "/x/dns-sd"})
+        self.assertEqual(s.dns_sd, "/x/dns-sd")
 
 
 class Seed(unittest.TestCase):
@@ -1615,6 +1829,62 @@ class Tools(unittest.TestCase):
         self.assertIn("stopped", p.stdout)
         p = subprocess.run(["bash", link, "status"], env=env, capture_output=True, text=True)
         self.assertEqual(p.returncode, 1)
+
+    @unittest.skipIf(WIN, NO_BASH_WHY)
+    def test_launcher_lan_listener_mdns_and_status_urls(self):
+        launcher = os.path.join(ROOT, "bin", "meeting-copilot")
+        port, lan = free_port(), free_port()
+        exe, log = fake_dns_sd(self.t)
+        env = dict(self.launcher_env(port), MEETING_COPILOT_LAN="1", MEETING_COPILOT_LAN_PORT=str(lan),
+                   MEETING_COPILOT_LAN_IP="192.168.50.7", MEETING_COPILOT_DNS_SD=exe,
+                   MEETING_COPILOT_EXTRA_HOSTS="copilot.example.com")
+        pidfile = os.path.join(self.t, "data", "meeting-copilot", "meeting-copilot.pid")
+        try:
+            p = subprocess.run(["bash", launcher, "--no-open"], env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            tok = self.token()
+            self.assertIn(f"http://copilot.local:{lan}/?token={tok}", p.stdout)
+            p = subprocess.run(["bash", launcher, "status"], env=env, capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stdout)
+            self.assertIn(f"http://127.0.0.1:{port}/?token={tok}", p.stdout)
+            self.assertIn(f"http://copilot.local:{lan}/?token={tok}", p.stdout)
+            self.assertIn(f"http://192.168.50.7:{lan}/?token={tok}", p.stdout)
+            self.assertIn(f"https://copilot.example.com/?token={tok}", p.stdout)
+            calls = wait_for(lambda: dns_sd_calls(log), 10)
+            self.assertEqual(calls[0][1], f"-P copilot _http._tcp local {lan} copilot.local 192.168.50.7")
+            child = calls[0][0]
+            self.assertTrue(alive(child))
+            # the LAN listener answers with the same token rules
+            c = http.client.HTTPConnection("127.0.0.1", lan, timeout=3)
+            c.request("GET", "/state", headers={"Host": f"copilot.local:{lan}", "Authorization": f"Bearer {tok}"})
+            self.assertEqual(c.getresponse().status, 200)
+            c.close()
+            c = http.client.HTTPConnection("127.0.0.1", lan, timeout=3)
+            c.request("GET", "/state", headers={"Host": f"copilot.local:{lan}"})
+            self.assertEqual(c.getresponse().status, 401)
+            c.close()
+            with open(pidfile) as f:
+                pid = int(f.read())
+        finally:
+            p = subprocess.run(["bash", launcher, "stop"], env=env, capture_output=True, text=True, timeout=30)
+        self.assertIn("stopped", p.stdout)
+        self.assertTrue(wait_for(lambda: not alive(pid), 10))
+        self.assertTrue(wait_for(lambda: not alive(child), 10), "dns-sd outlived the copilot")
+
+    @unittest.skipIf(WIN, NO_BASH_WHY)
+    def test_status_without_lan_prints_only_the_local_url(self):
+        launcher = os.path.join(ROOT, "bin", "meeting-copilot")
+        port = free_port()
+        env = self.launcher_env(port)
+        try:
+            p = subprocess.run(["bash", launcher, "--no-open"], env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            p = subprocess.run(["bash", launcher, "status"], env=env, capture_output=True, text=True)
+            self.assertEqual(p.stdout.strip().splitlines(),
+                             [f"running (pid {p.stdout.split('pid ')[1].split(')')[0]}) on "
+                              f"http://127.0.0.1:{port}/?token={self.token()}"])
+        finally:
+            subprocess.run(["bash", launcher, "stop"], env=env, capture_output=True, text=True, timeout=30)
 
     @unittest.skipIf(WIN, NO_BASH_WHY)
     def test_launcher_port_from_config_file_and_open_cmd(self):

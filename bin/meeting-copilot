@@ -2,7 +2,7 @@
 # meeting-copilot: live meeting copilot that reads the Muesli app's live transcript.
 #   meeting-copilot [--no-open] [--db PATH] [--port N]   start (if needed) and open the page
 #   meeting-copilot stop                                  stop it
-#   meeting-copilot status                                say whether it is running
+#   meeting-copilot status                                say whether it is running, and every URL
 #   meeting-copilot log                                   show the end of the log
 #   The page needs a token: the URL it prints and opens ends in ?token=... (kept in the data folder).
 set -u
@@ -29,6 +29,7 @@ LOG="${MEETING_COPILOT_LOG:-$DATA/meeting-copilot.log}"
 
 port="$(setting PORT)"
 port="${port:-4390}"
+lanport=""
 open_page=1
 args=()
 cmd=start
@@ -61,9 +62,10 @@ running_pid() {
 
 # The running copilot may have been started on another port: use the one it wrote down.
 use_running_port() {
-  local p="$1" fpid fport
-  read -r fpid fport < "$PORTFILE" 2>/dev/null || return 0
+  local p="$1" fpid fport flan
+  read -r fpid fport flan < "$PORTFILE" 2>/dev/null || return 0
   if [ "$fpid" = "$p" ] && [ -n "$fport" ]; then
+    lanport="${flan:-}"
     [ "$fport" != "$port" ] && echo "note: meeting-copilot is already running on port $fport; stop it first to use port $port" >&2
     port="$fport"
     URL="http://127.0.0.1:$port"
@@ -93,6 +95,9 @@ page_url() {
   tok="$(page_token)"
   if [ -n "$tok" ]; then echo "$URL/?token=$tok"; else echo "$URL"; fi
 }
+
+# The other addresses of the running page (LAN, extra hosts), one per line, each with the token.
+more_urls() { "$PY" "$APP" --urls "$port" "$lanport" 2>/dev/null; }
 
 open_url() {
   # MEETING_COPILOT_OPEN_CMD: your own command, e.g. open -a "Firefox". The URL goes in as one
@@ -134,7 +139,7 @@ case "$cmd" in
     fi ;;
   status)
     p="$(running_pid)"
-    if [ -n "$p" ]; then use_running_port "$p"; echo "running (pid $p) on $(page_url)"; else echo "not running"; exit 1; fi ;;
+    if [ -n "$p" ]; then use_running_port "$p"; echo "running (pid $p) on $(page_url)"; more_urls; else echo "not running"; exit 1; fi ;;
   log)
     tail -n 30 "$LOG" 2>/dev/null || echo "no log yet: $LOG" ;;
   start)
@@ -154,6 +159,7 @@ case "$cmd" in
         page_up "$tok" && break
         sleep 0.25
       done
+      np="$(running_pid)" && use_running_port "$np"   # learn the LAN port it really opened
     fi
     if [ -z "$(running_pid)" ]; then
       rm -f "$PIDFILE" "$PORTFILE"
@@ -163,6 +169,7 @@ case "$cmd" in
     fi
     PAGE="$(page_url)"
     echo "meeting-copilot on $PAGE - start a meeting in Muesli"
+    more_urls
     if [ "$open_page" = 1 ]; then
       open_url || echo "open $PAGE in your browser"
     fi ;;

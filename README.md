@@ -50,7 +50,7 @@ cd meeting-copilot
 ```
 meeting-copilot             start (if needed) and open the page in your default browser
 meeting-copilot --no-open   start and only print the URL
-meeting-copilot status      say whether it runs, with the page URL
+meeting-copilot status      say whether it runs, with every page URL (local, LAN, extra hosts)
 meeting-copilot log
 meeting-copilot stop        stop it (the session is saved)
 ```
@@ -60,6 +60,23 @@ The page needs a token. `meeting-copilot` opens and prints the URL with it (`…
 ```
 curl -s -H "Authorization: Bearer $(cat ~/.local/share/meeting-copilot/token)" http://127.0.0.1:4390/state
 ```
+
+### From your phone or another computer
+
+Two optional ways, both off by default:
+
+- **Home network** (`MEETING_COPILOT_LAN=1`): a second listener on `0.0.0.0` port 80, published as `http://copilot.local` with macOS `dns-sd` (the name follows the Mac's address when it changes). It answers only private addresses (`10/8`, `172.16/12`, `192.168/16`, `169.254/16`, `fc00::/7`, `fe80::/10` and loopback); anything else gets `403` before the token is even looked at. The token rules are the same: open the `LAN:` URL that `meeting-copilot status` prints once on each device. Devices that do not resolve `.local` names can use the `LAN IP:` URL. This is plain http: anyone on the same Wi-Fi who can watch its traffic can see the token, so use it only on a network you trust.
+- **Internet, through a tunnel** (`MEETING_COPILOT_EXTRA_HOSTS=<your host>`): point a tunnel (e.g. Cloudflare Tunnel, with Cloudflare Access in front) at `http://127.0.0.1:4390` and add its host name. The page then accepts that `Host` and the `https://<host>` origin; when the tunnel says the visit came over https (`X-Forwarded-Proto` or `Cf-Visitor`), the token cookie is also marked `Secure`. `meeting-copilot status` prints it as `public: https://<host>/?token=…`.
+
+For example, in your settings file:
+
+```
+MEETING_COPILOT_LAN=1
+MEETING_COPILOT_LAN_NAME=copilot
+MEETING_COPILOT_EXTRA_HOSTS=copilot.example.com
+```
+
+On macOS your user may listen on `0.0.0.0:80` without root (not on Linux: pick a `MEETING_COPILOT_LAN_PORT` above 1023 there). macOS may ask once to allow incoming connections for Python. If the port is taken, the log says so and only the LAN page stays off.
 
 Start a recording in Muesli; the page switches to "live" within a few seconds. Open "Objective and goals" on the page to type what you want out of the meeting.
 
@@ -94,7 +111,7 @@ Every key:
 | Variable | Default | Meaning |
 |---|---|---|
 | `MEETING_COPILOT_DB` | `~/Library/Application Support/Muesli/muesli.db` | Muesli database (opened read-only) |
-| `MEETING_COPILOT_PORT` | `4390` | Local port; the server listens on 127.0.0.1 only |
+| `MEETING_COPILOT_PORT` | `4390` | Local port; the server listens on 127.0.0.1 (plus the optional LAN listener) |
 | `MEETING_COPILOT_CLAUDE` | `claude` on PATH | Path to the Claude Code CLI |
 | `MEETING_COPILOT_API_CREDIT` | `claude-credito` | Optional wrapper for the AI calls ([api-credit](https://github.com/lucas-saldanha-werneck/api-credit)). When this command is installed (on PATH or in `~/.local/bin`), calls go through it: your plan's monthly API credit first, and the same call again on the subscription when the API refuses. Not installed: nothing changes. `off` never uses it |
 | `MEETING_COPILOT_MODEL` | `sonnet` | Model for suggestions (`MEETING_COPILOT_DATA_MODEL` for fact search) |
@@ -103,7 +120,12 @@ Every key:
 | `MEETING_COPILOT_MCP_TOOLS` | empty | Comma-separated allowlist of tools from that file, e.g. `mcp__notes__search`. Required: without it MCP stays off |
 | `MEETING_COPILOT_SESSIONS_DIR` | `~/.local/share/meeting-copilot/sessions` | Where each meeting's transcript and suggestions are saved when it ends (`MEETING_COPILOT_SAVE_SESSIONS=0` to turn off) |
 | `MEETING_COPILOT_SAVE_FORMAT` | `json` | `markdown`: save a readable `<Muesli export name>-copilot.md` (suggestions, corrections, facts, warnings; no transcript) instead of the JSON. It waits up to `MEETING_COPILOT_MUESLI_WAIT_S` seconds (600) for Muesli's auto-export, reads its name from Muesli's export log and links to it. The file says it is AI-written: keep it out of folders the fact search reads, or it can come back as a "fact" |
-| `MEETING_COPILOT_EXTRA_HOSTS` | empty | Extra host names allowed to load the page, e.g. behind your own reverse proxy or tunnel (POSTs then accept `https://<host>` as origin) |
+| `MEETING_COPILOT_EXTRA_HOSTS` | empty | Extra host names allowed to load the page, e.g. behind your own reverse proxy or tunnel (POSTs then accept `https://<host>` as origin; the cookie gets `Secure` when the tunnel reports https) |
+| `MEETING_COPILOT_LAN` | `0` | `1`: also answer devices on your home network, on `0.0.0.0:<LAN_PORT>`, private addresses only. See [From your phone or another computer](#from-your-phone-or-another-computer) |
+| `MEETING_COPILOT_LAN_PORT` | `80` | Port of the LAN listener (80: no port in the URL) |
+| `MEETING_COPILOT_LAN_NAME` | `copilot` | Published as `<name>.local` (macOS `dns-sd`); `off`: not published |
+| `MEETING_COPILOT_LAN_IP` | empty (found by itself, checked every 30 s) | A fixed LAN address to publish instead |
+| `MEETING_COPILOT_DNS_SD` | `dns-sd` on macOS | The `dns-sd` command; elsewhere no name is published |
 | `MEETING_COPILOT_CONFIRM_AI` | `0` | `1`: no AI call in a meeting until you click "Turn on AI" on the page; each meeting asks again. Useful when the copilot starts at login and should not spend AI on every recording |
 | `MEETING_COPILOT_ASSIST_S`, `_DATA_S`, `_POLL_S` | `25`, `45`, `5` | Intervals in seconds |
 | `MEETING_COPILOT_CONTEXT_FILE` | empty | A text file about you that both AI calls read: your name and role, your projects, what your notes folders and MCP tools hold, words the transcript tends to get wrong. The first 8000 characters are used |
@@ -193,7 +215,7 @@ With neither search folders nor MCP, the "Relevant facts" panel says fact search
 - The transcript of the last 3 minutes, your goals and the items already shown are sent to Claude through `claude -p` on each call. Nothing else leaves the machine.
 - Sessions (full transcript plus suggestions) are saved as JSON files readable only by your user. A meeting saved again (the copilot restarted, or the meeting stopped and recorded again) gets a new file with `-2`, `-3`, and so on, so nothing earlier is overwritten.
 - The fact search may read files only inside the search folders: Read, Grep and Glob are allowed with a path rule for each folder, so a request in the meeting to open any other file is refused. The AI runs in an empty folder of its own and loads no Claude Code settings files, so no hook planted in a search folder runs with it.
-- The page answers only on 127.0.0.1 / localhost (plus any `MEETING_COPILOT_EXTRA_HOSTS`), checks the `Host` header against DNS rebinding, and accepts POSTs only from its own origin. Every request (the page, `/state` and each POST) needs the token: a `?token=` in the URL, the `HttpOnly`, `SameSite=Strict` cookie it sets, or an `Authorization: Bearer` header; anything else gets `401`. The token file is readable only by your user, so other users' programs and web pages cannot read the meeting; a program running as you can still read the file.
+- The page answers only on 127.0.0.1 / localhost (plus any `MEETING_COPILOT_EXTRA_HOSTS`, and, with `MEETING_COPILOT_LAN=1`, private addresses on the home network, where POSTs must come from the page's own `http://<host>` origin), checks the `Host` header against DNS rebinding, and accepts POSTs only from its own origin. Every request (the page, `/state` and each POST) needs the token: a `?token=` in the URL, the `HttpOnly`, `SameSite=Strict` cookie it sets, or an `Authorization: Bearer` header; anything else gets `401`. The token file is readable only by your user, so other users' programs and web pages cannot read the meeting; a program running as you can still read the file.
 
 ## Uninstall
 
