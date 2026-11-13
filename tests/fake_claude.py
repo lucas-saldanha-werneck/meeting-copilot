@@ -15,6 +15,9 @@ suggestions JSON. It ends at the end of its input. Test knobs (environment):
   FAKE_CLAUDE_TOKENS      context tokens reported per turn (grows with each turn of the process)
   FAKE_CLAUDE_REFUSE_KEY  1: a process started with ANTHROPIC_API_KEY answers "Credit balance is too low"
 Every entry has "key": whether ANTHROPIC_API_KEY was set (never its value).
+A message with images (content blocks) is logged with "text" and "images" ([{media_type, len}]) in both modes.
+One-shot with images (`--input-format stream-json` plus --json-schema): the stream-json events ending with the
+same result object as `--output-format json`.
 """
 import json
 import os
@@ -67,7 +70,13 @@ def stream_mode():
             continue
         msg = json.loads(raw)["message"]["content"]
         turn += 1
-        log({"argv": argv, "stdin": msg, "cwd": os.getcwd(), "pid": os.getpid(), "turn": turn, "key": key})
+        entry = {"argv": argv, "stdin": msg, "cwd": os.getcwd(), "pid": os.getpid(), "turn": turn, "key": key}
+        if isinstance(msg, list):
+            entry["stdin"] = msg[0]["text"]
+            entry["text"] = "\n".join(b["text"] for b in msg if b["type"] == "text")
+            entry["images"] = [{"media_type": b["source"]["media_type"], "len": len(b["source"]["data"])}
+                               for b in msg if b["type"] == "image"]
+        log(entry)
         emit({"type": "system", "subtype": "init"})
         if key and os.environ.get("FAKE_CLAUDE_REFUSE_KEY") == "1":
             emit({"type": "result", "subtype": "success", "is_error": True, "num_turns": 1, "modelUsage": {},
@@ -85,19 +94,33 @@ def stream_mode():
                         "cache_creation_input_tokens": 0, "output_tokens": 50}})
 
 
-if "--input-format" in argv and argv[argv.index("--input-format") + 1] == "stream-json":
+stream = "--input-format" in argv and argv[argv.index("--input-format") + 1] == "stream-json"
+if stream and "--json-schema" not in argv:      # the kept-open process; a one-shot call has a schema
     stream_mode()
     sys.exit(0)
 
 stdin = sys.stdin.read()
-log({"argv": argv, "stdin": stdin, "cwd": os.getcwd()})
+stream = "--input-format" in argv and argv[argv.index("--input-format") + 1] == "stream-json"
+entry = {"argv": argv, "stdin": stdin, "cwd": os.getcwd()}
+if stream:
+    msg = json.loads(stdin.splitlines()[0])["message"]
+    entry["text"] = "\n".join(b["text"] for b in msg["content"] if b["type"] == "text")
+    entry["images"] = [{"media_type": b["source"]["media_type"], "len": len(b["source"]["data"])}
+                       for b in msg["content"] if b["type"] == "image"]
+    entry["stdin"] = msg["content"][0]["text"]
+log(entry)
 if os.environ.get("FAKE_CLAUDE_STDERR"):
     sys.stderr.write(os.environ["FAKE_CLAUDE_STDERR"] + "\n")
     sys.stderr.flush()
 time.sleep(float(os.environ.get("FAKE_CLAUDE_SLEEP", "0")))   # a slow or stuck call
 
 if "--json-schema" in argv:
-    print(json.dumps({"type": "result", "subtype": "success", "result": "", "structured_output": SUGGESTIONS}))
+    res = {"type": "result", "subtype": "success", "result": "", "structured_output": SUGGESTIONS,
+           "total_cost_usd": 0.0}
+    if stream:
+        print(json.dumps({"type": "system", "subtype": "init"}))
+        print(json.dumps({"type": "assistant", "message": {"content": []}}))
+    print(json.dumps(res))
 else:
     print(json.dumps({"type": "result", "subtype": "success",
                       "result": "The current contract ends on 2027-03-31.\nSource: contracts.md"}))

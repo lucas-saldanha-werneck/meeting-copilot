@@ -156,6 +156,27 @@ class Logic(unittest.TestCase):
             self.assertIn("did not answer in 1s", str(cm.exception))
             self.assertIn("overloaded, retrying", str(cm.exception))
 
+    @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
+    def test_timeout_stops_a_wrapper_and_its_child(self):
+        # a wrapper (as claude-credito) whose claude never answers: both are gone after the timeout
+        with tempfile.TemporaryDirectory() as d:
+            wrap, pidf = os.path.join(d, "claude"), os.path.join(d, "child.pid")
+            with open(wrap, "w") as f:
+                f.write(f'#!/bin/sh\nsleep 60 &\necho $! > "{pidf}"\nwait\n')
+            os.chmod(wrap, 0o755)
+            old_s, old_t = getattr(copilot, "S", None), copilot.AI_TIMEOUT_S
+            copilot.S = copilot.Settings({"MEETING_COPILOT_CLAUDE": wrap, "MEETING_COPILOT_DATA_DIR": d,
+                                          "MEETING_COPILOT_API_CREDIT": "off"})
+            copilot.AI_TIMEOUT_S = 1
+            try:
+                with self.assertRaises(RuntimeError):
+                    copilot.run_claude("p", "m", "sonnet")
+            finally:
+                copilot.S, copilot.AI_TIMEOUT_S = old_s, old_t
+            with open(pidf) as f:
+                child = int(f.read())
+            self.assertTrue(wait_for(lambda: not alive(child), 5), "the wrapper's child is still running")
+
     def test_bad_save_format_or_wait_falls_back_with_a_note(self):
         s = copilot.Settings({"MEETING_COPILOT_SAVE_FORMAT": "md", "MEETING_COPILOT_MUESLI_WAIT_S": "10m"})
         self.assertEqual(s.save_format, "json")
@@ -1463,6 +1484,448 @@ class PairingCode(unittest.TestCase):
 PairingCode.real_notify = staticmethod(copilot.notify)
 
 
+def png_bytes(w, h, rgb) -> bytes:
+    """A small solid-color PNG, written by hand (no image library needed)."""
+    import struct
+    import zlib
+    raw = b"".join(b"\x00" + bytes(rgb) * w for _ in range(h))
+
+    def chunk(t, d):
+        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xFFFFFFFF)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+def bmp_bytes(w, h, gray_fn) -> bytes:
+    import struct
+    row = (w * 3 + 3) & ~3
+    pix = b""
+    for y in range(h):
+        r = b"".join(bytes([gray_fn(x, y)] * 3) for x in range(w))
+        pix += r + b"\x00" * (row - w * 3)
+    head = b"BM" + struct.pack("<IHHI", 54 + len(pix), 0, 0, 54)
+    info = struct.pack("<IiiHHIIiiII", 40, w, -h, 1, 24, 0, len(pix), 2835, 2835, 0, 0)
+    return head + info + pix
+
+
+MEETING_WINDOWS = [
+    {"id": 11, "owner": "Google Chrome", "name": "Inbox - mail", "layer": 0, "w": 1400, "h": 900},
+    {"id": 12, "owner": "zoom.us", "name": "Zoom Workplace", "layer": 0, "w": 900, "h": 700},
+    {"id": 13, "owner": "zoom.us", "name": "Zoom Meeting", "layer": 0, "w": 1200, "h": 800},
+    {"id": 14, "owner": "Window Server", "name": "Menubar", "layer": 25, "w": 2560, "h": 30},
+]
+
+
+@unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
+class Vision(unittest.TestCase):
+    """Screen capture, frames and response times, in-process, with fake screencapture/window list/claude.
+    Never a real screencapture: the commands are always the fakes in tests/fake_screen.py."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        t = self.t = os.path.realpath(self.tmp.name)
+        self.sc_log = os.path.join(t, "sc.jsonl")
+        self.claude_log = os.path.join(t, "claude.jsonl")
+        self.windows = os.path.join(t, "windows.json")
+        self.image = os.path.join(t, "frame.png")
+        self.set_windows(MEETING_WINDOWS)
+        self.set_image((10, 120, 200))
+        bin_ = os.path.join(t, "bin")
+        os.makedirs(bin_)
+        self.sc = os.path.join(bin_, "screencapture")
+        self.wl = os.path.join(bin_, "windows")
+        self.claude = os.path.join(bin_, "claude")
+        for path, body in ((self.sc, f'exec "{PY}" "{ROOT}/tests/fake_screen.py" capture "$@"'),
+                           (self.wl, f'exec "{PY}" "{ROOT}/tests/fake_screen.py" windows'),
+                           (self.claude, f'exec "{PY}" "{ROOT}/tests/fake_claude.py" "$@"')):
+            with open(path, "w") as f:
+                f.write("#!/bin/sh\n" + body + "\n")
+            os.chmod(path, 0o755)
+        self.old = (copilot.S, copilot.E, copilot.FRAMES, dict(os.environ))
+        os.environ.update(FAKE_SC_LOG=self.sc_log, FAKE_SC_WINDOWS=self.windows, FAKE_SC_IMAGE=self.image,
+                          FAKE_CLAUDE_LOG=self.claude_log)
+        os.environ.pop("FAKE_SC_FAIL", None)
+        copilot.E = copilot.State()
+        copilot.FRAMES = copilot.Frames()
+        self.settings()
+        self.meeting(7)
+
+    def tearDown(self):
+        copilot.S, copilot.E, copilot.FRAMES, env = self.old
+        os.environ.clear()
+        os.environ.update(env)
+        self.tmp.cleanup()
+
+    def settings(self, **extra):
+        cfg = {"MEETING_COPILOT_SCREEN": "1", "MEETING_COPILOT_DATA_DIR": os.path.join(self.t, "data"),
+               "MEETING_COPILOT_SCREENCAPTURE": self.sc, "MEETING_COPILOT_WINDOW_LIST": f'"{self.wl}"',
+               "MEETING_COPILOT_SIPS": "off", "MEETING_COPILOT_CLAUDE": self.claude,
+               "MEETING_COPILOT_API_CREDIT": "off"}
+        cfg.update({"MEETING_COPILOT_" + k: v for k, v in extra.items()})
+        copilot.S = copilot.Settings(cfg)
+        return copilot.S
+
+    def meeting(self, mid):
+        copilot.E.reset({"id": mid, "title": "T", "start": "2026-11-12T10:00:00Z"})
+
+    def set_windows(self, wins):
+        with open(self.windows, "w") as f:
+            json.dump(wins, f)
+
+    def set_image(self, rgb, size=(64, 48)):
+        with open(self.image, "wb") as f:
+            f.write(png_bytes(size[0], size[1], rgb))
+
+    def sc_calls(self):
+        if not os.path.exists(self.sc_log):
+            return []
+        with open(self.sc_log) as f:
+            return [json.loads(x) for x in f if x.strip()]
+
+    def captures(self):
+        return [c for c in self.sc_calls() if c[0] == "capture"]
+
+    # -------------------------------------------------------------- capture
+
+    def test_toggle_off_captures_nothing(self):
+        w = copilot.ScreenWatcher()
+        for t in (1000, 1030, 1060, 1090):
+            self.assertFalse(w.tick(t))
+        self.assertEqual(self.sc_calls(), [])            # not even the window list
+        # on for another meeting only: still nothing for this one
+        copilot.E.screen_for = 8
+        self.assertFalse(w.tick(2000))
+        # SCREEN off in the settings: the toggle alone does nothing
+        self.settings(SCREEN="0")
+        copilot.E.screen_for = 7
+        self.assertFalse(w.tick(3000))
+        self.assertEqual(self.sc_calls(), [])
+        # CONFIRM_AI and the AI not turned on: no capture either
+        self.settings(CONFIRM_AI="1")
+        self.assertFalse(w.tick(4000))
+        self.assertEqual(self.sc_calls(), [])
+
+    def test_on_captures_every_interval_only_the_meeting_window(self):
+        copilot.E.screen_for = 7
+        w = copilot.ScreenWatcher()
+        did = [t for t in (1000, 1010, 1029, 1030, 1059, 1061, 1080, 1091) if w.tick(t)]
+        self.assertEqual(did, [1000, 1030, 1061, 1091])
+        caps = self.captures()
+        self.assertEqual(len(caps), 4)
+        a = caps[0]
+        self.assertEqual(a[1:6], ["-x", "-o", "-l", "13", "-t"])   # the Zoom meeting window, no sound
+        self.assertNotIn("-m", a)
+        self.assertEqual(copilot.E.screen_msg, "")
+        self.assertEqual(copilot.E.screen_last, 1091)
+        # turned off: no more captures, and the next "on" captures at once
+        copilot.E.screen_for = None
+        self.assertFalse(w.tick(1200))
+        copilot.E.screen_for = 7
+        self.assertTrue(w.tick(1201))
+
+    def test_unchanged_frame_is_not_kept(self):
+        copilot.E.screen_for = 7
+        w = copilot.ScreenWatcher()
+        w.tick(1000)
+        w.tick(1030)
+        self.assertEqual(len(copilot.FRAMES.items), 1)
+        self.assertEqual(copilot.FRAMES.items[0]["seen"], 1030)   # still current
+        self.set_image((200, 30, 30))
+        w.tick(1060)
+        self.assertEqual([f["id"] for f in copilot.FRAMES.items], [1, 2])
+        for _ in range(10):   # at most FRAMES_KEEP per source on disk
+            self.set_image((len(copilot.FRAMES.items) * 20 % 255, 0, 0))
+            w.tick(w.last + 30)
+        folder = os.path.join(self.t, "data", "frames", "7")
+        self.assertEqual(len(copilot.FRAMES.items), copilot.FRAMES_KEEP)
+        self.assertEqual(len([n for n in os.listdir(folder) if not n.startswith(".")]), copilot.FRAMES_KEEP)
+        self.assertEqual(os.stat(folder).st_mode & 0o777, 0o700)
+        for n in os.listdir(folder):
+            self.assertEqual(os.stat(os.path.join(folder, n)).st_mode & 0o777, 0o600, n)
+
+    def test_no_meeting_window_captures_nothing_and_says_so(self):
+        self.set_windows([w for w in MEETING_WINDOWS if w["id"] != 13])
+        copilot.E.screen_for = 7
+        copilot.ScreenWatcher().tick(1000)
+        self.assertEqual(self.captures(), [])
+        self.assertIn("no meeting window found", copilot.E.screen_msg)
+        self.assertEqual(copilot.FRAMES.items, [])
+        # no title visible at all: macOS hides them without the permission
+        self.set_windows([{**w, "name": ""} for w in MEETING_WINDOWS])
+        copilot.ScreenWatcher().tick(2000)
+        self.assertIn("Screen & System Audio Recording", copilot.E.screen_msg)
+
+    def test_permission_failure_message(self):
+        os.environ["FAKE_SC_FAIL"] = "1"
+        copilot.E.screen_for = 7
+        copilot.ScreenWatcher().tick(1000)
+        msg = copilot.E.screen_msg
+        self.assertIn("Screen Recording", msg)
+        self.assertIn("Privacy & Security > Screen & System Audio Recording", msg)
+        self.assertIn(copilot.app_name(), msg)
+        self.assertEqual(copilot.FRAMES.items, [])
+        st = copilot.E.public()
+        self.assertEqual(st["vision"]["screen_msg"], msg)
+        # a black capture is the other way a missing permission shows up
+        self.assertTrue(copilot.looks_blank([0] * 768))
+        self.assertTrue(copilot.looks_blank([3, 5] * 384))
+        self.assertFalse(copilot.looks_blank([0, 200] * 384))
+        self.assertFalse(copilot.looks_blank([128] * 768))   # one light color: a blank slide, not a failure
+        self.assertFalse(copilot.looks_blank("abc"))
+
+    @unittest.skipUnless(sys.platform == "darwin" and os.path.exists("/usr/bin/sips"), "needs macOS sips")
+    def test_black_capture_with_sips_is_reported(self):
+        self.settings(SIPS="/usr/bin/sips")
+        self.set_image((0, 0, 0), size=(640, 480))
+        copilot.E.screen_for = 7
+        copilot.ScreenWatcher().tick(1000)
+        self.assertIn("black or empty", copilot.E.screen_msg)
+        self.assertEqual(copilot.FRAMES.items, [])
+        # a real image: shrunk to a JPEG of at most 1280 px, fingerprint is a 32x24 thumbnail
+        self.set_image((10, 120, 200), size=(2000, 1000))
+        copilot.ScreenWatcher().tick(2000)
+        self.assertEqual(copilot.E.screen_msg, "")
+        fr = copilot.FRAMES.items[0]
+        self.assertEqual(fr["media_type"], "image/jpeg")
+        with open(fr["path"], "rb") as f:
+            self.assertEqual(copilot.image_size(f.read()), (1280, 640))
+        self.assertEqual(len(fr["thumb"]), 32 * 24)
+
+    def test_full_mode_takes_the_main_display_without_listing_windows(self):
+        self.settings(SCREEN_MODE="full")
+        copilot.E.screen_for = 7
+        copilot.ScreenWatcher().tick(1000)
+        calls = self.sc_calls()
+        self.assertEqual([c[0] for c in calls], ["capture"])
+        self.assertEqual(calls[0][1:3], ["-x", "-m"])
+        self.assertNotIn("-l", calls[0])
+
+    def test_pick_meeting_window(self):
+        pick = copilot.pick_meeting_window
+        self.assertEqual(pick(MEETING_WINDOWS)["id"], 13)
+        meet = {"id": 20, "owner": "Google Chrome", "name": "Meet - abc-defg-hij", "layer": 0, "w": 800, "h": 600}
+        self.assertEqual(pick([MEETING_WINDOWS[0], meet])["id"], 20)
+        self.assertEqual(pick([meet, MEETING_WINDOWS[2]])["id"], 13)    # the app wins over a browser tab
+        self.assertIsNone(pick([MEETING_WINDOWS[0], MEETING_WINDOWS[1]]))  # Zoom's main window is no meeting
+        teams = [{"id": 30, "owner": "Microsoft Teams", "name": "Chat | Microsoft Teams", "layer": 0, "w": 900, "h": 700},
+                 {"id": 31, "owner": "Microsoft Teams", "name": "Weekly sync | Microsoft Teams", "layer": 0,
+                  "w": 900, "h": 700}]
+        self.assertEqual(pick(teams)["id"], 31)
+        self.assertIsNone(pick(teams[:1]))
+        small = {**meet, "id": 21, "w": 120, "h": 90}
+        self.assertIsNone(pick([small]))
+        self.assertIsNone(pick([{**meet, "layer": 3}]))
+        other = {"id": 40, "owner": "Around", "name": "Standup", "layer": 0, "w": 800, "h": 600}
+        self.assertIsNone(pick([other]))
+        self.assertEqual(pick([other], ["around"])["id"], 40)
+        self.assertEqual(pick([other], ["standup"])["id"], 40)
+        self.assertIsNone(pick([{"id": "x"}, {"owner": None}, {}]))
+
+    # -------------------------------------------------------------- images and fingerprints
+
+    def test_image_helpers(self):
+        p = png_bytes(64, 48, (1, 2, 3))
+        self.assertEqual(copilot.image_kind(p), "image/png")
+        self.assertEqual(copilot.image_size(p), (64, 48))
+        with open(os.path.join(ROOT, "tools", "sample-slide.jpg"), "rb") as f:
+            j = f.read()
+        self.assertEqual(copilot.image_kind(j), "image/jpeg")
+        self.assertEqual(copilot.image_size(j), (1280, 720))
+        self.assertIsNone(copilot.image_kind(b"GIF89a...."))
+        self.assertIsNone(copilot.image_kind(b"<svg"))
+        self.assertIsNone(copilot.image_size(b"\xff\xd8\xff"))
+        g = copilot.bmp_gray(bmp_bytes(32, 24, lambda x, y: 100 if x < 16 else 200))
+        self.assertEqual(len(g), 32 * 24)
+        self.assertEqual((g[0], g[31]), (100, 200))
+        with self.assertRaises(ValueError):
+            copilot.bmp_gray(b"BM" + b"\x00" * 10)
+        a = [100] * 768
+        self.assertFalse(copilot.frame_changed(a, list(a)))
+        self.assertFalse(copilot.frame_changed(a, [101] * 768))         # noise
+        self.assertTrue(copilot.frame_changed(a, [110] * 768))          # everything a bit brighter
+        b = list(a)
+        b[5] = b[6] = 250                                                # a small sharp change (slide number)
+        self.assertTrue(copilot.frame_changed(a, b))
+        self.assertTrue(copilot.frame_changed(a, "hash"))
+        self.assertFalse(copilot.frame_changed("h1", "h1"))
+        self.assertTrue(copilot.frame_changed(None, a))
+        with self.assertRaises(ValueError):
+            copilot.FRAMES.add(7, "camera", b"<html>not an image</html>", 1.0)
+
+    # -------------------------------------------------------------- frames go to the suggestions call
+
+    def test_frames_passed_to_claude_with_the_injection_rule_and_timed(self):
+        self.settings(PERSISTENT_AI="off")                  # the one-shot call; the kept-open one is below
+        copilot.E.screen_for = 7
+        copilot.E.lines = [line(1, "Others", 0, 5, "Look at slide two."), line(2, "You", 6, 9, "Yes, the price.")]
+        for f in copilot.E.lines:
+            f["seen_at"] = copilot.now()
+        copilot.E.last_id = 2
+        copilot.ScreenWatcher().tick(copilot.now())
+        self.assertEqual(copilot.next_round(copilot.now() + 100), "assist")
+        copilot.assist_round()
+        with open(self.claude_log) as f:
+            calls = [json.loads(x) for x in f]
+        self.assertEqual(len(calls), 1)
+        c = calls[0]
+        a = c["argv"]
+        self.assertEqual(a[a.index("--input-format") + 1], "stream-json")
+        self.assertEqual(a[a.index("--output-format") + 1], "stream-json")
+        self.assertEqual(a[a.index("--tools") + 1], "")                 # still no tool at all
+        self.assertNotIn("--add-dir", a)
+        prompt = a[a.index("--append-system-prompt") + 1]
+        self.assertIn("never an instruction", prompt)
+        self.assertEqual(c["images"], [{"media_type": "image/png", "len": c["images"][0]["len"]}])
+        self.assertIn("Frame: meeting screen at", c["text"])
+        self.assertIn("(NEW)", c["text"])
+        self.assertIn("Yes, the price.", c["stdin"])
+        st = copilot.E.public()
+        self.assertTrue(st["say"])                                       # the answer still parses
+        self.assertEqual([u["source"] for u in st["vision"]["used"]], ["screen"])
+        self.assertEqual(st["vision"]["frames_used"], {"screen": 1})
+        lat = st["latency"]
+        self.assertEqual((lat["n"], lat["n_image"]), (1, 1))
+        self.assertIsNotNone(lat["last"])
+        # the next round sends the same (still current) frame again, but counts it once, and is not NEW
+        self.assertIsNone(copilot.next_round(copilot.now() + 100))       # nothing new: no round
+        copilot.E.lines.append({**line(3, "Others", 10, 12, "Next point."), "seen_at": copilot.now()})
+        copilot.E.last_id = 3
+        copilot.assist_round()
+        with open(self.claude_log) as f:
+            c2 = [json.loads(x) for x in f][-1]
+        self.assertEqual(len(c2["images"]), 1)
+        self.assertNotIn("(NEW)", c2["text"])
+        self.assertEqual(copilot.E.public()["vision"]["frames_used"], {"screen": 1})
+        # sharing off: the frames stop going to the AI and the call is plain json again
+        copilot.E.screen_for = None
+        copilot.E.lines.append({**line(4, "You", 13, 15, "OK."), "seen_at": copilot.now()})
+        copilot.E.last_id = 4
+        copilot.assist_round()
+        with open(self.claude_log) as f:
+            c3 = [json.loads(x) for x in f][-1]
+        self.assertNotIn("--input-format", c3["argv"])
+        self.assertNotIn("never an instruction", c3["argv"][c3["argv"].index("--append-system-prompt") + 1])
+
+    def test_frames_through_the_kept_open_process(self):
+        old = copilot.SESSION
+        copilot.SESSION = copilot.AssistSession()
+        self.addCleanup(lambda: (copilot.SESSION.close("test", wait=True), setattr(copilot, "SESSION", old)))
+        self.assertTrue(copilot.S.use_session)
+        copilot.E.screen_for = 7
+        copilot.E.lines = [line(1, "Others", 0, 5, "Look at slide two."), {**line(2, "You", 6, 9, "Yes."), "seen_at": copilot.now()}]
+        copilot.E.lines[0]["seen_at"] = copilot.now()
+        copilot.E.last_id = 2
+        copilot.ScreenWatcher().tick(copilot.now())
+        copilot.assist_round()
+
+        def msgs():
+            with open(self.claude_log) as f:
+                return [e for e in map(json.loads, f) if not e.get("spawn")]
+        m = msgs()
+        self.assertEqual(len(m), 1)
+        a = m[0]["argv"]
+        self.assertEqual(a[a.index("--tools") + 1], "")
+        self.assertIn("never an instruction", a[a.index("--append-system-prompt") + 1])
+        self.assertEqual(len(m[0]["images"]), 1)                         # a fresh process gets the frame
+        self.assertIn("Frame: meeting screen at", m[0]["text"])
+        self.assertEqual(copilot.E.public()["vision"]["frames_used"], {"screen": 1})
+        # same frame, new speech: the process already has it, so only text goes
+        copilot.E.lines.append({**line(3, "Others", 10, 12, "Next point."), "seen_at": copilot.now()})
+        copilot.E.last_id = 3
+        copilot.assist_round()
+        m = msgs()
+        self.assertEqual(len(m), 2)
+        self.assertNotIn("images", m[1]) if not m[1].get("images") else self.fail(m[1])
+        self.assertEqual(copilot.E.public()["vision"]["frames_used"], {"screen": 1})
+        # a changed screen: the new frame goes
+        self.set_image((200, 10, 10))
+        copilot.ScreenWatcher().tick(copilot.now() + 100)
+        copilot.E.lines.append({**line(4, "You", 13, 15, "OK."), "seen_at": copilot.now()})
+        copilot.E.last_id = 4
+        copilot.assist_round()
+        m = msgs()
+        self.assertEqual(len(m[2]["images"]), 1)
+        self.assertEqual(copilot.E.public()["vision"]["frames_used"], {"screen": 2})
+        self.assertEqual(copilot.E.rounds[-1]["images"], 1)
+        self.assertEqual(copilot.E.rounds[-2]["images"], 0)
+        self.assertEqual(copilot.E.public()["latency"]["n"], 3)
+
+    def test_newest_frames_of_each_source_in_turn(self):
+        for i in range(5):
+            copilot.FRAMES.add(7, "screen", png_bytes(8, 8, (i * 40, 0, 0)), 1000 + i)
+        for i in range(4):
+            copilot.FRAMES.add(7, "camera", png_bytes(8, 8, (0, i * 40, 0)), 1000 + i)
+        got = copilot.FRAMES.for_ai(7, 1010, {"screen", "camera"})
+        self.assertEqual(len(got), copilot.FRAMES_PER_ROUND)
+        self.assertEqual(sorted(f["source"] for f in got), ["camera", "camera", "screen"])
+        self.assertEqual([f["id"] for f in got], sorted(f["id"] for f in got))   # oldest first
+        self.assertEqual([f["source"] for f in copilot.FRAMES.for_ai(7, 1010, {"screen"})], ["screen"] * 3)
+        self.assertEqual(copilot.FRAMES.for_ai(7, 1010 + 10_000, {"screen", "camera"}), [])   # stale
+        self.assertEqual(copilot.FRAMES.for_ai(8, 1010, {"screen"}), [])                      # other meeting
+
+    def test_frames_deleted_when_the_meeting_ends(self):
+        copilot.FRAMES.add(7, "screen", png_bytes(8, 8, (1, 1, 1)), 1000)
+        folder = os.path.join(self.t, "data", "frames", "7")
+        self.assertTrue(os.listdir(folder))
+        fid = copilot.FRAMES.items[0]["id"]
+        self.assertIsNotNone(copilot.FRAMES.get(fid))
+        copilot.end_frames(7)
+        self.assertFalse(os.path.exists(folder))
+        self.assertIsNone(copilot.FRAMES.get(fid))
+        # KEEP_FRAMES=1: forgotten by the copilot but left on disk
+        self.settings(KEEP_FRAMES="1")
+        copilot.FRAMES.add(7, "screen", png_bytes(8, 8, (2, 2, 2)), 1000)
+        copilot.end_frames(7)
+        self.assertTrue(os.listdir(folder))
+        self.assertEqual(copilot.FRAMES.items, [])
+        # at start, a crashed run's frames are removed
+        copilot.FRAMES.clear_all()
+        self.assertFalse(os.path.exists(os.path.join(self.t, "data", "frames")))
+
+    # -------------------------------------------------------------- response time
+
+    def test_latency_rows_log_and_summary(self):
+        base = 1_800_000_000.0
+        rows = []
+        for i, (total, images) in enumerate([(5, 0), (7, 0), (9, 1), (11, 2), (6, 0)]):
+            rows.append(copilot.record_round({"meeting": 7, "event": base, "last_event": base, "speech": base - 2,
+                                              "start": base + 1, "end": base + total, "images": images,
+                                              "ok": True}))
+        copilot.record_round({"meeting": 7, "event": base, "last_event": base, "speech": None, "start": base,
+                              "end": base + 120, "images": 0, "ok": False, "error": "timeout"})
+        self.assertEqual(rows[0]["total_s"], 5)
+        self.assertEqual(rows[0]["call_s"], 4)
+        self.assertEqual(rows[0]["wait_s"], 1)
+        self.assertEqual(rows[0]["from_speech_s"], 7)
+        s = copilot.latency_summary(copilot.E.rounds)
+        self.assertEqual((s["n"], s["failed"], s["last"], s["median"], s["n_image"]), (5, 1, 6, 7, 2))
+        self.assertEqual((s["median_image"], s["median_text"], s["p90"]), (10, 6, 11))
+        logs = os.listdir(os.path.join(self.t, "data", "latency"))
+        self.assertEqual(len(logs), 1)
+        self.assertTrue(logs[0].endswith("-meeting-7.jsonl"))
+        path = os.path.join(self.t, "data", "latency", logs[0])
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        with open(path) as f:
+            self.assertEqual(len(f.read().splitlines()), 6)
+        rep = copilot.latency_report(copilot.Path(self.t, "data"))
+        self.assertIn("5 rounds, event to answer median 7 s, p90 11 s", rep)
+        self.assertIn("with images median 10 s (2 rounds)", rep)
+        self.assertIn("1 failed", rep)
+        self.assertIn("no response times yet", copilot.latency_report(copilot.Path(self.t, "nothing")))
+        self.assertEqual(copilot.latency_summary([])["median"], None)
+
+    def test_stream_result_parsing(self):
+        out = '{"type":"system"}\nnoise\n{"type":"result","structured_output":{"say":[]}}\n'
+        self.assertEqual(copilot.stream_result(out)["structured_output"], {"say": []})
+        with self.assertRaises(ValueError):
+            copilot.stream_result('{"type":"assistant"}\n')
+        msg = json.loads(copilot.image_message("hello", [{"label": "Frame A", "media_type": "image/png",
+                                                            "data": b"\x89PNG"}]))
+        content = msg["message"]["content"]
+        self.assertEqual([b["type"] for b in content], ["text", "text", "image"])
+        self.assertEqual(content[2]["source"]["data"], "iVBORw==")
+
+
 class Seed(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -2282,7 +2745,7 @@ class Live(unittest.TestCase):
         # AI off: the process is closed
         self.assertEqual(self.post("/ai", {"on": False}), 200)
         self.assertTrue(wait_for(lambda: not alive(pid), 10), self.log())
-        self.assertIn("AI process closed (AI turned off)", self.log())
+        self.assertTrue(wait_for(lambda: "AI process closed (" in self.log(), 5), self.log())   # reason: the click, or the poll first
 
     @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
     def test_click_for_the_next_meeting_warms_up_and_the_meeting_uses_that_process(self):
@@ -2429,6 +2892,119 @@ class Live(unittest.TestCase):
         self.assertTrue(wait_for(lambda: len(self.spawns()) > n, 5), self.log())
         self.assertFalse(self.spawns()[n]["key"])
         self.assertIn("subscription (API credit paused)", self.log())
+
+    def fake_screen(self):
+        """Fake screencapture and window list (tests/fake_screen.py): never a real capture."""
+        sc, wl = os.path.join(self.fakebin, "screencapture"), os.path.join(self.fakebin, "windows")
+        for path, mode in ((sc, "capture"), (wl, "windows")):
+            with open(path, "w") as f:
+                f.write(f'#!/bin/sh\nexec "{PY}" "{ROOT}/tests/fake_screen.py" {mode} "$@"\n')
+            os.chmod(path, 0o755)
+        self.sc_log = os.path.join(self.t, "sc.jsonl")
+        img, wins = os.path.join(self.t, "frame.png"), os.path.join(self.t, "windows.json")
+        with open(img, "wb") as f:
+            f.write(png_bytes(64, 48, (10, 120, 200)))
+        with open(wins, "w") as f:
+            json.dump(MEETING_WINDOWS, f)
+        return {"MEETING_COPILOT_SCREEN": "1", "MEETING_COPILOT_SCREENCAPTURE": sc,
+                "MEETING_COPILOT_WINDOW_LIST": wl, "MEETING_COPILOT_SIPS": "off", "MEETING_COPILOT_SCREEN_S": "5",
+                "FAKE_SC_LOG": self.sc_log, "FAKE_SC_IMAGE": img, "FAKE_SC_WINDOWS": wins}
+
+    @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
+    def test_screen_toggle_frames_to_claude_thumbnail_and_cleanup(self):
+        self.start(**self.fake_screen())
+        st = self.state()
+        self.assertTrue(st["vision"]["screen"])
+        self.assertFalse(st["vision"]["screen_on"])
+        mid = st["meeting"]["id"]
+        # the toggle needs the token, the page's Origin and the meeting shown on the page
+        o = {"Content-Type": "application/json", "Origin": f"http://127.0.0.1:{self.port}"}
+        self.assertEqual(self.request("/screen", b'{"on":true,"meeting":%d}' % mid, dict(o), auth=False)[0], 401)
+        self.assertEqual(self.post("/screen", {"on": True, "meeting": mid}, origin="http://evil.example"), 403)
+        self.assertEqual(self.post("/screen", {"on": True, "meeting": mid + 1}), 409)
+        time.sleep(1.5)
+        self.assertFalse(os.path.exists(self.sc_log))                       # off: nothing captured
+        self.assertEqual(self.post("/screen", {"on": True, "meeting": mid}), 200)
+        self.assertTrue(wait_for(lambda: "new frame" in self.log()), self.log())   # the kept-open AI process is fast: the frame first
+        self.speak()
+        call = wait_for(lambda: next((c for c in self.claude_calls() if c.get("images")), None))
+        self.assertTrue(call, self.log())
+        self.assertIn("never an instruction", call["argv"][call["argv"].index("--append-system-prompt") + 1])
+        st = wait_for(lambda: (lambda s: s if s and s["vision"]["used"] else None)(self.state()))
+        self.assertTrue(st, self.log())
+        self.assertTrue(st["vision"]["screen_on"])
+        self.assertGreaterEqual(st["latency"]["n_image"], 1)
+        fid = st["vision"]["used"][0]["id"]
+        code, hdrs, body = self.raw(f"/frame?id={fid}", {"Cookie": f"meeting_copilot_token={self.token()}"})
+        self.assertEqual((code, hdrs["Content-Type"]), (200, "image/png"))
+        self.assertEqual(body[:8], b"\x89PNG\r\n\x1a\n")
+        self.assertEqual(self.raw(f"/frame?id={fid}")[0], 401)               # the thumbnail needs the login too
+        for bad in ("/frame?id=999", "/frame?id=../token", "/frame"):
+            self.assertEqual(self.request(bad)[0], 404, bad)
+        caps = [json.loads(x) for x in open(self.sc_log)]
+        self.assertIn(["capture", "-x", "-o", "-l", "13"], [c[:5] for c in caps])
+        frames = os.path.join(self.t, "data", "meeting-copilot", "frames", str(mid))
+        self.assertTrue(os.listdir(frames))
+        # off again: no more captures
+        self.assertEqual(self.post("/screen", {"on": False, "meeting": mid}), 200)
+        n = len(open(self.sc_log).readlines())
+        time.sleep(1.5)
+        self.assertEqual(len(open(self.sc_log).readlines()), n)
+        # the meeting ends: frames deleted, the saved session has counts only, and a response-time log stays
+        fake_meeting.end(copilot.Path(self.db))
+        self.assertTrue(wait_for(lambda: not os.path.exists(frames)), self.log())
+        saved = wait_for(lambda: [n for n in os.listdir(self.sessions)] if os.path.isdir(self.sessions) else None)
+        with open(os.path.join(self.sessions, saved[0]), encoding="utf-8") as f:
+            text = f.read()
+        self.assertNotIn("base64", text)
+        self.assertNotIn("frames" + os.sep, text)
+        self.assertGreaterEqual(json.loads(text)["vision"]["frames_used"]["screen"], 1)
+        logs = os.listdir(os.path.join(self.t, "data", "meeting-copilot", "latency"))
+        self.assertEqual(len(logs), 1)
+
+    def test_screen_toggle_refused_when_off_in_the_settings(self):
+        self.start(MEETING_COPILOT_CLAUDE=os.path.join(self.t, "no-claude"))
+        st = self.state()
+        self.assertFalse(st["vision"]["screen"])
+        self.assertEqual(self.post("/screen", {"on": True, "meeting": st["meeting"]["id"]}), 409)
+        self.assertFalse(self.state()["vision"]["screen_on"])
+
+    @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
+    def test_markdown_session_notes_frames_and_answer_time(self):
+        self.start(MEETING_COPILOT_SAVE_FORMAT="markdown", MEETING_COPILOT_MUESLI_WAIT_S="0", **self.fake_screen())
+        mid = self.state()["meeting"]["id"]
+        self.assertEqual(self.post("/screen", {"on": True, "meeting": mid}), 200)
+        self.assertTrue(wait_for(lambda: "new frame" in self.log()), self.log())   # the kept-open process is fast
+        self.speak()
+        self.assertTrue(wait_for(lambda: (self.state() or {}).get("vision", {}).get("used")), self.log())
+        fake_meeting.end(copilot.Path(self.db))
+        md = wait_for(lambda: [n for n in os.listdir(self.sessions) if n.endswith(".md")]
+                      if os.path.isdir(self.sessions) else None)
+        self.assertTrue(md, self.log())
+        with open(os.path.join(self.sessions, md[0]), encoding="utf-8") as f:
+            text = f.read()
+        self.assertRegex(text, r"- The AI saw [1-9]\d* screen frame\(s\) and 0 camera frame\(s\)")
+        self.assertRegex(text, r"- Answer time: median [\d.]+ s over \d+ rounds, with images")
+        self.assertNotIn("/frame", text)
+
+    @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
+    def test_bench_is_opt_in_and_never_touches_the_running_copilot(self):
+        p = subprocess.run([PY, os.path.join(ROOT, "lib", "copilot.py"), "--bench", "1"], env=self.env,
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("--yes", p.stdout)
+        self.assertEqual(self.claude_calls(), [])
+        p = subprocess.run([PY, os.path.join(ROOT, "lib", "copilot.py"), "--bench", "2", "--yes"], env=self.env,
+                           capture_output=True, text=True, timeout=120)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertRegex(p.stdout, r"text : median [\d.]+ s, p90 [\d.]+ s over 2 round\(s\)")
+        self.assertRegex(p.stdout, r"image: median [\d.]+ s, p90 [\d.]+ s over 2 round\(s\)")
+        calls = self.claude_calls()
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(sum(1 for c in calls if c.get("images")), 2)
+        self.assertEqual(calls[1]["images"][0]["media_type"], "image/jpeg")
+        # it used its own temporary folder: nothing in the real data folder
+        self.assertFalse(os.path.exists(os.path.join(self.t, "data", "meeting-copilot", "latency")))
 
     def test_missing_db_exits_with_message(self):
         env = dict(self.env, MEETING_COPILOT_DB=os.path.join(self.t, "missing.db"))
@@ -2668,7 +3244,8 @@ class Tools(unittest.TestCase):
                              [f"running (pid {p.stdout.split('pid ')[1].split(')')[0]}) on "
                               f"http://127.0.0.1:{port}/",
                               "  code:   none now (open the page on the other device, or run `meeting-copilot code`)",
-                              "  paired devices: 0"])
+                              "  paired devices: 0",
+                      "  answers: no response times yet"])
         finally:
             subprocess.run(["bash", launcher, "stop"], env=env, capture_output=True, text=True, timeout=30)
 

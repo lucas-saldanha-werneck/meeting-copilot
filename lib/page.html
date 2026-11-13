@@ -39,6 +39,13 @@
   .x { float: right; background: none; color: var(--dim); padding: 0 4px; }
   #ai { display: none; }
   #ai.ask { background: var(--say); color: var(--bg); font-weight: 600; }
+  #screen { display: none; }
+  #screen.on, #camera.on { background: #3a1214; color: #ff9a9a; font-weight: 600; }
+  #latency { color: var(--dim); font-size: 12px; }
+  #vision { display: none; gap: 12px; align-items: flex-start; flex-wrap: wrap; padding: 0 16px 8px; color: var(--dim); font-size: 12px; }
+  #vision figure { margin: 0; }
+  #vision img { display: block; max-width: 220px; max-height: 140px; border: 1px solid var(--line); border-radius: 6px; }
+  #vision .msg { color: var(--corr); max-width: 60ch; }
 </style>
 </head>
 <body>
@@ -47,7 +54,9 @@
   <span id="status" class="pill">…</span>
   <span id="title" class="pill"></span>
   <div id="metrics"></div>
+  <span id="latency" title="From the speech or frame reaching the copilot to the answer being ready (the page checks every 2 s)"></span>
   <button id="ai"></button>
+  <button id="screen" title="Send the meeting window to the AI every 30 s or so, for this meeting only"></button>
   <button id="pair" title="Show a code to log in another browser or device">Pair a device</button>
 </header>
 
@@ -66,6 +75,7 @@
   <section id="corrections"><h2>Corrections</h2><div class="list"></div></section>
   <section id="data"><h2>Relevant facts</h2><div class="list"></div></section>
 </main>
+<div id="vision"></div>
 <div id="lines"></div>
 
 <script>
@@ -85,7 +95,7 @@ function list(id, items, render, emptyText = "nothing yet") {
 }
 
 let editing = false;
-let last = {}, aiMsg = "";
+let last = {}, aiMsg = "", screenMsg = "";
 async function refresh() {
   let e;
   try {
@@ -103,6 +113,26 @@ async function refresh() {
   ai.className = e.ai_on || e.ai_next ? "" : "ask";
   if (!aiMsg) ai.textContent = e.ai_on ? "AI on · stop" : e.ai_next ? "AI on for the next meeting · cancel"
     : e.live ? "Turn on AI for this meeting" : "Turn on AI for the next meeting";
+  const v = e.vision || {}, lat = e.latency || {};
+  const sb = document.getElementById("screen");
+  sb.style.display = v.screen && e.live ? "inline-block" : "none";
+  sb.className = v.screen_on ? "on" : "";
+  if (!screenMsg) sb.textContent = v.screen_on ? "Screen shared with AI · stop" : "Share screen with AI";
+  document.getElementById("latency").textContent = lat.n ?
+    `last answer ${lat.last} s · median ${lat.median} s` + (lat.n_image ? `, with image ${lat.median_image} s` : "") : "";
+  const vis = document.getElementById("vision");
+  const used = v.used || [];
+  const showVision = (v.screen_on || used.length || v.screen_msg) && e.live;
+  vis.style.display = showVision ? "flex" : "none";
+  if (showVision) {
+    const key = JSON.stringify([used, v.screen_msg, v.screen_on]);
+    if (vis.dataset.key !== key) {
+      vis.dataset.key = key;
+      vis.innerHTML = (v.screen_msg ? `<div class="msg">${esc(v.screen_msg)}</div>` : "") +
+        used.map(f => `<figure><img alt="" src="/frame?id=${Number(f.id)}"><figcaption>AI saw: ${f.source === "screen" ? "screen" : "camera"} ${esc(new Date(f.ts * 1000).toTimeString().slice(0, 8))}</figcaption></figure>`).join("") +
+        (!used.length && v.screen_on && !v.screen_msg ? "<div>Screen shared: the first frame goes with the next answer.</div>" : "");
+    }
+  }
   const m = e.metrics || {};
   document.getElementById("metrics").innerHTML = m.minutes == null ? "" :
     `<span><b>${m.minutes}</b> min</span><span>you <b>${m.you_pct}%</b> (5 min: <b>${m.you_pct_5min}%</b>)</span>` +
@@ -140,6 +170,17 @@ document.getElementById("ai").onclick = async () => {
     aiMsg = "did not work, try again";
     document.getElementById("ai").textContent = aiMsg;
     setTimeout(() => aiMsg = "", 2500);
+  }
+  refresh();
+};
+document.getElementById("screen").onclick = async () => {
+  const body = { on: !(last.vision || {}).screen_on, meeting: last.meeting ? last.meeting.id : null };
+  let ok = false;
+  try { ok = (await post("/screen", body)).ok; } catch {}
+  if (!ok) {
+    screenMsg = "did not work, try again";
+    document.getElementById("screen").textContent = screenMsg;
+    setTimeout(() => screenMsg = "", 2500);
   }
   refresh();
 };
