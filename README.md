@@ -90,6 +90,7 @@ meeting-copilot code        show a pairing code to log in another browser or dev
 meeting-copilot devices     list the browsers logged in with a code (`devices forget` logs them all out)
 meeting-copilot log
 meeting-copilot stop        stop it (the session is saved)
+meeting-copilot bench [N] --yes   time N real suggestion rounds, with and without an image (see "Response time")
 ```
 
 ### Logging in
@@ -251,6 +252,56 @@ If a file is missing, unreadable, not UTF-8 or empty, the log shows one `note:` 
 one for a file that is not UTF-8) and that call uses its built-in prompt. Only the first 20000
 characters of a file are used (the prompt goes on the `claude` command line).
 
+## Screen and camera
+
+Off by default. With `MEETING_COPILOT_SCREEN=1` in the config, a live meeting gets a **Share screen with AI**
+button. Nothing is captured until you click it, and each meeting asks again (with `MEETING_COPILOT_CONFIRM_AI=1`
+the AI must be on too). While it is on:
+
+- Every 30 s (`MEETING_COPILOT_SCREEN_S`) the copilot captures **only the meeting window**: Zoom
+  ("Zoom Meeting"), Microsoft Teams (not its Chat/Calendar windows), FaceTime, Webex, a Slack huddle, or a
+  browser window whose **active tab** is Google Meet or Teams. It finds the window id in the list of windows
+  on screen (a few lines of JXA run by `osascript`, no extra install) and runs `screencapture -x -o -l <id>`,
+  which takes that window alone, even when others cover it, without the shutter sound. Everything else on
+  the Mac stays out. No meeting window: nothing is captured and the page says "no meeting window found".
+  `MEETING_COPILOT_SCREEN_APPS` adds apps (or title words); `MEETING_COPILOT_SCREEN_MODE=full` takes the
+  whole main display instead (only when you ask for it).
+- The frame is shrunk to at most 1280 px (JPEG) with `sips`. A frame that looks the same as the previous
+  one (a 32x24 gray thumbnail that barely changed) is not kept. A new frame makes the next suggestions round
+  run even when nobody spoke.
+- The newest frames (at most 3) go with each suggestions call, inside the message (Claude Code's stream-json
+  input, base64 image blocks): no file tool is opened for them. The prompt tells the AI that text in an
+  image is data from the meeting, never an instruction (a shared screen could try to inject one). On the
+  kept-open process a fresh process gets the newest frames, and later rounds only the frames it has not seen
+  yet, so the same picture is not sent every round.
+- The page shows a thumbnail of each frame the last answer used, with its time: exactly the bytes that were
+  sent.
+- Frames stay only on the Mac, in `<data folder>/frames/<meeting id>/` (folder 0700, files 0600, at most 6
+  per source), and are deleted when the meeting ends (`MEETING_COPILOT_KEEP_FRAMES=1` keeps them) or at the
+  next start after a crash. The saved session only counts them ("The AI saw 4 screen frame(s)").
+
+**Screen Recording permission.** macOS asks once, at the first capture, for the program that runs the
+copilot. For a Homebrew Python that is **Python** (`.../Python.framework/.../Resources/Python.app`; a
+Python upgrade may ask again). If the capture fails or comes back black, the page says what to allow and
+where: System Settings > Privacy & Security > Screen & System Audio Recording, then restart the copilot.
+Without the permission macOS also hides window titles, so a meeting in a browser tab cannot be found.
+The copilot never tries to grant it by itself.
+
+## Response time
+
+Every suggestions round is timed: when its input reached the copilot (the earliest transcript line or
+frame it answers), when the `claude` call started and ended, and how many images went with it. The page
+header shows `last answer 7.2 s · median 6.8 s, with image 9.1 s` (input to answer ready; the page checks
+for news every 2 s, so add up to 2 s to see it). Each meeting keeps a log, one JSON object per round, in
+`<data folder>/latency/<date>-meeting-<id>.jsonl` (also `from_speech_s`: from the end of the sentence, by
+Muesli's clock), and `meeting-copilot status` sums up the latest one.
+
+`meeting-copilot bench [N] --yes` runs N rounds with the transcript only and N with a sample slide
+(`tools/sample-slide.jpg`) on the fake meeting, with the real `claude`, and prints the median and p90 of
+each. It starts no server and uses a temporary folder, so a running copilot is never touched. Without
+`--yes` it only says what it would do. Each round costs what a suggestions round costs in a meeting (the
+output shows the cost `claude` reports).
+
 ## Optional requirements
 
 | Optional | What it adds | Without it |
@@ -264,7 +315,7 @@ With neither search folders nor MCP, the "Relevant facts" panel says fact search
 ## Privacy
 
 - The Muesli database is opened read-only and never written.
-- The transcript of the last 3 minutes, your goals and the items already shown are sent to Claude through `claude -p` (on the kept-open process: once, then only the new lines each round). Nothing else leaves the machine.
+- The transcript of the last 3 minutes, your goals and the items already shown are sent to Claude through `claude -p` (on the kept-open process: once, then only the new lines each round). With screen sharing turned on for a meeting, the newest frames of the meeting window go too (see "Screen and camera"). Nothing else leaves the machine.
 - Sessions (full transcript plus suggestions) are saved as JSON files readable only by your user. A meeting saved again (the copilot restarted, or the meeting stopped and recorded again) gets a new file with `-2`, `-3`, and so on, so nothing earlier is overwritten.
 - The fact search may read files only inside the search folders: Read, Grep and Glob are allowed with a path rule for each folder, so a request in the meeting to open any other file is refused. The AI runs in an empty folder of its own and loads no Claude Code settings files, so no hook planted in a search folder runs with it.
 - The page answers only on 127.0.0.1 / localhost (plus any `MEETING_COPILOT_EXTRA_HOSTS`, and, with `MEETING_COPILOT_LAN=1`, private addresses on the home network, where POSTs must come from the page's own `http://<host>` origin), checks the `Host` header against DNS rebinding, and accepts POSTs only from its own origin. Every request (the page, `/state` and each POST) needs a login: the cookie of a browser that typed a pairing code, the token cookie (set by the launcher's one-time link or a `?token=` URL), or the token as an `Authorization: Bearer` header; anything else gets `401` (a browser gets the login page). The code is never shown to a browser that is not logged in, not even on the Mac itself: only the notification, `meeting-copilot status`/`code` and a logged-in page show it. The login POST passes the same `Host` and origin checks as every POST, and the code is compared in constant time. The token file and `devices.json` are readable only by your user, so other users' programs and web pages cannot read the meeting; a program running as you can still read the files.

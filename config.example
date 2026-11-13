@@ -126,3 +126,25 @@
 # Muesli's own auto-export (waits up to MUESLI_WAIT_S seconds for it).
 #MEETING_COPILOT_SAVE_FORMAT=json
 #MEETING_COPILOT_MUESLI_WAIT_S=600
+
+# 1: the AI may also look at the meeting screen. Nothing is captured until you click
+# "Share screen with AI" on the page, and each meeting asks again. Default: 0.
+# macOS asks once for the Screen Recording permission (see README, "Screen and camera").
+#MEETING_COPILOT_SCREEN=0
+# window: only the meeting app's window (Zoom, Teams, FaceTime, Webex, a Slack huddle, or a
+# browser window whose active tab is Google Meet/Teams). full: the whole main display.
+#MEETING_COPILOT_SCREEN_MODE=window
+# Seconds between two screen captures (a frame that did not change is not kept).
+#MEETING_COPILOT_SCREEN_S=30
+# More apps whose windows count as the meeting, comma-separated: an app name as macOS
+# shows it, or a word in the window title. Empty: only the built-in list.
+#MEETING_COPILOT_SCREEN_APPS=
+# 1: keep the frames on disk after the meeting ends (in <data folder>/frames). Default: 0
+# (deleted when the meeting ends; never written into the saved session).
+#MEETING_COPILOT_KEEP_FRAMES=0
+# The macOS commands used for the screen (empty: found on PATH; off: not used).
+#MEETING_COPILOT_SCREENCAPTURE=
+#MEETING_COPILOT_SIPS=
+# A command that prints the windows on screen as JSON (id, owner, name, layer, w, h).
+# Empty: a few lines of JXA run by osascript.
+#MEETING_COPILOT_WINDOW_LIST=
