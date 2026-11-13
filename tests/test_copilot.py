@@ -2054,6 +2054,18 @@ class Live(unittest.TestCase):
         finally:
             copilot.CONTEXT_ON, copilot.S, copilot.E = old
 
+    def test_read_errors_leave_the_page_when_muesli_reads_again(self):
+        old = copilot.E
+        try:
+            copilot.E = copilot.State()
+            copilot.error("reading Muesli: disk I/O error")
+            copilot.error("saving the session: disk full")
+            copilot.error("reading Muesli: database is locked")
+            copilot.clear_read_errors()
+            self.assertEqual([e.split(" ", 1)[1] for e in copilot.E.errors], ["saving the session: disk full"])
+        finally:
+            copilot.E = old
+
     def test_old_or_broken_context_file_is_ignored(self):
         d = os.path.join(self.t, "data", "meeting-copilot")
         os.makedirs(d, exist_ok=True)

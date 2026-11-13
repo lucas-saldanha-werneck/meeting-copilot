@@ -45,7 +45,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
-__version__ = "0.9.2"
+__version__ = "0.9.3"
 
 HERE = Path(__file__).resolve().parent
 PAGE = HERE / "page.html"
@@ -904,6 +904,16 @@ def error(msg: str) -> None:
     print(line, flush=True)
     with E.lock:
         E.errors.append(line)
+
+
+READ_ERROR = "reading Muesli: "
+
+
+def clear_read_errors() -> None:
+    """Muesli is readable again: its old read errors leave the page (the log keeps them)."""
+    with E.lock:
+        if any(READ_ERROR in e for e in E.errors):
+            E.errors = [e for e in E.errors if READ_ERROR not in e]
 
 # ---------------------------------------------------------------- Muesli
 
@@ -1960,8 +1970,9 @@ def loop(db: Path) -> None:
                     read_new_lines(con, live["id"])
             finally:
                 con.close()
-        except Exception as ex:  # database busy, WAL, etc.: try again next time
-            error(f"reading Muesli: {ex}")
+            clear_read_errors()
+        except Exception as ex:  # database busy, WAL, full disk, etc.: try again next time
+            error(f"{READ_ERROR}{ex}")
 
         if E.meeting:
             w = check_warnings(E.metrics)
