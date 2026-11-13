@@ -18,7 +18,7 @@ suggestions use one `claude` process per meeting that stays open (`--input-forma
 - **When it starts:** as soon as the AI is allowed, before the first round: the "Turn on AI" click (for the
   live meeting or for the next one), the start of a meeting when the AI is allowed (always, without
   `CONFIRM_AI`), and a restart of the copilot that gives back the click. Starting it costs no AI call.
-- **When it closes:** AI turned off, the meeting ends, a "next meeting" click that expires (30 min), and the
+- **When it closes:** AI turned off, the meeting ends, a "next meeting" click that expires (only with `NEXT_MEETING_ARM_MIN`), and the
   copilot's exit. If the copilot is killed, the process ends by itself at the end of its input.
 - **Each round** sends only what is new since the previous round (new transcript lines, changed goals). The
   first message, and the first after any restart of the process, has the goals, the items already shown and
@@ -176,6 +176,7 @@ Every key:
 | `MEETING_COPILOT_DNS_SD` | `dns-sd` on macOS | The `dns-sd` command; elsewhere no name is published |
 | `MEETING_COPILOT_OSASCRIPT` | `osascript` on macOS | The command that shows the pairing code as a notification; `off`: no notification (the code is still in `meeting-copilot status`) |
 | `MEETING_COPILOT_CONFIRM_AI` | `0` | `1`: no AI call in a meeting until you click "Turn on AI" on the page; each meeting asks again. Useful when the copilot starts at login and should not spend AI on every recording. The click, the objective and the goals are kept in `context.json` in your data folder (only your user can read it), so a restart during a meeting gives them back; a file older than 6 hours is ignored |
+| `MEETING_COPILOT_NEXT_MEETING_ARM_MIN` | `0` | With `CONFIRM_AI=1`: minutes a "Turn on AI for the next meeting" click waits for a meeting to start. `0`: no limit, it waits until the next meeting (turn it off with the same button). Once the meeting starts, the click counts for the whole meeting |
 | `MEETING_COPILOT_ASSIST_S`, `_DATA_S`, `_POLL_S` | `25`, `45`, `5` | Intervals in seconds |
 | `MEETING_COPILOT_PERSISTENT_AI` | `1` | `1`: one kept-open `claude` process per meeting for the suggestions (see "The kept-open AI process"). `0`: a new `claude -p` per round |
 | `MEETING_COPILOT_AI_FIRST_BYTE_S`, `_AI_ROUND_S` | `6`, `10` | Watchdog of a suggestions round on the kept-open process: seconds to the API's first byte, and to the answer |

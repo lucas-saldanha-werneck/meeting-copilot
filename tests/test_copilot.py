@@ -110,14 +110,24 @@ class Logic(unittest.TestCase):
                              "Third", "Fourth"], shown)
         self.assertEqual(out, ["Confirm the date.", "Third"])
 
-    def test_next_meeting_click_expires(self):
+    def test_next_meeting_click_waits_with_no_limit_by_default(self):
         old_s = getattr(copilot, "S", None)
         copilot.S = copilot.Settings({"MEETING_COPILOT_CONFIRM_AI": "1"})
         try:
             st = copilot.State()
+            st.ai_for, st.ai_next_at = "next", copilot.now() - 3 * 86400
+            self.assertTrue(st.ai_armed())
+        finally:
+            copilot.S = old_s
+
+    def test_next_meeting_click_expires(self):
+        old_s = getattr(copilot, "S", None)
+        copilot.S = copilot.Settings({"MEETING_COPILOT_CONFIRM_AI": "1", "MEETING_COPILOT_NEXT_MEETING_ARM_MIN": "30"})
+        try:
+            st = copilot.State()
             st.ai_for, st.ai_next_at = "next", copilot.now()
             self.assertTrue(st.ai_armed())
-            st.ai_next_at = copilot.now() - copilot.NEXT_MEETING_ARM_S - 1
+            st.ai_next_at = copilot.now() - 30 * 60 - 1
             self.assertFalse(st.ai_armed())
             st.meeting = {"id": 7}
             self.assertFalse(st.ai_allowed())
@@ -2314,7 +2324,8 @@ class Live(unittest.TestCase):
                     raise AssertionError("no warm-up expected")
             copilot.SESSION = Fake()
             copilot.S.claude = "/bin/true"
-            copilot.E.ai_for, copilot.E.ai_next_at = "next", time.time() - copilot.NEXT_MEETING_ARM_S - 1
+            copilot.S.next_arm_s = 30 * 60
+            copilot.E.ai_for, copilot.E.ai_next_at = "next", time.time() - 30 * 60 - 1
             copilot.ai_reconcile()
             self.assertEqual(closed, ["AI not allowed now"])
         finally:

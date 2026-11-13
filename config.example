@@ -91,6 +91,8 @@
 # 1: no AI call in a meeting until you click "Turn on AI" on the page. Each
 # meeting asks again. Useful when the copilot starts at login. Default: 0.
 #MEETING_COPILOT_CONFIRM_AI=0
+# minutes a "next meeting" click waits for a meeting (0 = no limit)
+#MEETING_COPILOT_NEXT_MEETING_ARM_MIN=0
 
 # 1: one `claude` process stays open per meeting for the suggestions, so a round
 # has no start-up cost; it starts when the AI is allowed (the "Turn on AI" click,

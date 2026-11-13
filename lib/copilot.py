@@ -45,7 +45,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
-__version__ = "0.9.3"
+__version__ = "0.9.4"
 
 HERE = Path(__file__).resolve().parent
 PAGE = HERE / "page.html"
@@ -60,7 +60,8 @@ DATA_TIMEOUT_S = 40        # one fact search with tools (usually 10-15 s); it ha
 ROTATE_TOKENS = 40000      # the kept-open suggestions process starts fresh past this context size
 ROTATE_TURNS = 150         # ... or after this many rounds
 SEED_KEEP_S = WINDOW_S     # a fresh process is seeded with this much of the transcript
-NEXT_MEETING_ARM_S = 30 * 60   # a "Turn on AI for the next meeting" click expires after this
+# a "Turn on AI for the next meeting" click: waits for the next meeting with no time limit
+# (MEETING_COPILOT_NEXT_MEETING_ARM_MIN > 0 sets one); you turn it off with the same button
 CONTEXT_MAX_CHARS = 8000   # of your context file that goes into each prompt
 PROMPT_MAX_CHARS = 20000   # of your prompt file (it goes on the claude command line)
 
@@ -518,6 +519,11 @@ class Settings:
         # CONFIRM_AI=1: no AI call in a meeting until you click "Turn on AI" on the page
         # (for a copilot that starts at login and should not spend AI on every recording).
         self.confirm_ai = g("CONFIRM_AI", "0").strip().lower() in ("1", "yes", "true", "on")
+        # NEXT_MEETING_ARM_MIN: minutes a "next meeting" click waits for a meeting; 0 = until it starts
+        try:
+            self.next_arm_s = max(0.0, float(g("NEXT_MEETING_ARM_MIN", "0"))) * 60
+        except ValueError:
+            self.next_arm_s = 0.0
         self.notices: list[str] = []
         # PERSISTENT_AI=1: one `claude` process stays open per meeting for the suggestions (no start-up
         # cost per round). 0: a new `claude -p` per round, as before 0.9.2.
@@ -825,7 +831,8 @@ class State:
         return mid is not None and self.ai_for == mid
 
     def ai_armed(self) -> bool:
-        return self.ai_for == "next" and now() - self.ai_next_at <= NEXT_MEETING_ARM_S
+        limit = S.next_arm_s
+        return self.ai_for == "next" and (limit <= 0 or now() - self.ai_next_at <= limit)
 
     def public(self, full: bool = False) -> dict:
         """The page state. full=True: every item (for the saved session), not only the latest."""
