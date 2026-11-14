@@ -6,6 +6,7 @@
 #   meeting-copilot code                                  show a pairing code to log in another browser
 #   meeting-copilot devices [forget]                      list the paired browsers, or log them all out
 #   meeting-copilot log                                   show the end of the log
+#   meeting-copilot bench [N] [--yes]                     time N real suggestion rounds, with and without an image
 #   A browser that is not logged in asks for the 6-digit code shown on the Mac (notification, status).
 set -u
 
@@ -42,7 +43,8 @@ while [ $# -gt 0 ]; do
     --no-open) open_page=0 ;;
     --port) port="$2"; args+=("--port" "$2"); shift ;;
     --db) args+=("--db" "$2"); shift ;;
-    -h|--help) sed -n '2,9p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    bench) cmd=bench; shift; args=("$@"); break ;;
+    -h|--help) sed -n '2,10p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "meeting-copilot: unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
@@ -142,13 +144,24 @@ case "$cmd" in
   status)
     p="$(running_pid)"
     if [ -n "$p" ]; then
-      use_running_port "$p"; echo "running (pid $p) on $(page_url)"; more_urls; cli pair-status
+      use_running_port "$p"; echo "running (pid $p) on $(page_url)"; more_urls; cli pair-status; cli latency
     else echo "not running"; exit 1; fi ;;
   code)
     p="$(running_pid)"
     if [ -n "$p" ]; then use_running_port "$p"; cli new-code; else echo "meeting-copilot is not running"; exit 1; fi ;;
   devices|forget-devices)
     cli "$cmd" ;;
+  bench)
+    # N rounds (default 3); without --yes it only says what it would do and cost
+    n=3; yes=()
+    for a in ${args[@]+"${args[@]}"}; do
+      case "$a" in
+        --yes) yes=(--yes) ;;
+        *[!0-9]*|'') echo "meeting-copilot bench: unknown argument: $a" >&2; exit 2 ;;
+        *) n="$a" ;;
+      esac
+    done
+    "$PY" "$APP" --bench "$n" ${yes[@]+"${yes[@]}"} ;;
   log)
     tail -n 30 "$LOG" 2>/dev/null || echo "no log yet: $LOG" ;;
   start)
