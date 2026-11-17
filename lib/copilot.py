@@ -937,7 +937,6 @@ class State:
         self.look_items: list[dict] = []     # {kind, text, ts, q?}
         self.look_used: list[dict] = []      # {id, ts} of the frames in the last answer
         self.look_msg = ""
-        self.look_busy = False
         self.reset(None)
 
     def reset(self, meeting: dict | None) -> None:
@@ -1014,7 +1013,7 @@ class State:
                 },
                 "look": {
                     "enabled": S.look, "on": S.look and self.look_on, "look_s": S.look_s,
-                    "camera_s": S.camera_s, "busy": self.look_busy, "msg": self.look_msg,
+                    "camera_s": S.camera_s, "busy": QL.busy, "msg": self.look_msg,
                     "items": last(self.look_items, 20), "used": self.look_used,
                     "pending": bool(self.look_question),
                 },
@@ -1211,6 +1210,16 @@ def stream_result(stdout: str) -> dict:
         if isinstance(ev, dict) and ev.get("type") == "result":
             return ev
     raise ValueError(f"no result event in the claude output: {stdout.strip()[-200:]!r}")
+
+
+def structured(out: dict) -> dict:
+    """The JSON object of a schema call (`claude -p --json-schema`); RuntimeError when there is none."""
+    r = out.get("structured_output")
+    if isinstance(r, str):
+        r = json.loads(r)
+    if not isinstance(r, dict):
+        raise RuntimeError(f"no structured_output: {str(out.get('result'))[:200]}")
+    return r
 
 
 def run_claude(system_prompt: str, message: str, model: str, *, schema: dict | None = None,
@@ -1830,11 +1839,7 @@ def assist_round(queued: float | None = None) -> None:
             out = run_claude(assist_prompt() + (IMAGES_NOTE if frames else ""), msg, S.model,
                              schema=SCHEMA_ASSIST, images=frames)
             cost = out.get("total_cost_usd")
-            r = out.get("structured_output")
-            if isinstance(r, str):
-                r = json.loads(r)
-            if not isinstance(r, dict):
-                raise RuntimeError(f"no structured_output: {str(out.get('result'))[:200]}")
+            r = structured(out)
         timing["ok"] = True
     except Exception as ex:
         err = str(ex)[:200]
@@ -2186,9 +2191,17 @@ class Frames:
                 old["path"].unlink(missing_ok=True)
             return dict(fr)
 
-    def newest_id(self, mid, sources) -> int:
+    @staticmethod
+    def current(f: dict, t: float) -> bool:
+        """Seen within FRAME_STALE_S (a screen frame: also within 3 capture intervals): still goes to the AI."""
+        stale = max(FRAME_STALE_S, 3 * S.screen_s) if f["source"] == "screen" else FRAME_STALE_S
+        return t - f["seen"] <= stale
+
+    def newest_id(self, mid, sources, t: float | None = None) -> int:
+        """Newest frame id of these sources; with t, only among the current frames (the ones for_ai sends)."""
         with self.lock:
-            return max((f["id"] for f in self.items if f["meeting"] == mid and f["source"] in sources), default=0)
+            return max((f["id"] for f in self.items if f["meeting"] == mid and f["source"] in sources
+                        and (t is None or self.current(f, t))), default=0)
 
     def for_ai(self, mid, t: float, sources) -> list[dict]:
         """Up to FRAMES_PER_ROUND current frames (newest of each source in turn), oldest first, with their
@@ -2196,8 +2209,7 @@ class Frames:
         with self.lock:
             by_src = {}
             for f in reversed(self.items):
-                stale = max(FRAME_STALE_S, 3 * S.screen_s) if f["source"] == "screen" else FRAME_STALE_S
-                if f["meeting"] == mid and f["source"] in sources and t - f["seen"] <= stale:
+                if f["meeting"] == mid and f["source"] in sources and self.current(f, t):
                     by_src.setdefault(f["source"], []).append(f)
             picked = []
             while len(picked) < FRAMES_PER_ROUND and any(by_src.values()):
@@ -2222,6 +2234,15 @@ class Frames:
             return f["path"].read_bytes(), f["media_type"]
         except OSError:
             return None
+
+    def remove(self, fid: int) -> None:
+        """Forgets one frame and deletes its file."""
+        with self.lock:
+            f = next((x for x in self.items if x["id"] == fid), None)
+            if f:
+                self.items.remove(f)
+        if f:
+            f["path"].unlink(missing_ok=True)
 
     def drop(self, mid) -> None:
         """Forgets a meeting's frames and deletes their folder."""
@@ -2302,17 +2323,19 @@ def look_start() -> None:
         E.look_on, E.look_gen = True, E.look_gen + 1
         E.look_items, E.look_used, E.look_question, E.look_msg = [], [], "", ""
         E.look_seen, E.look_round_at, E.look_last = 0, 0.0, 0.0
+        E.camera_for, E.camera_msg = None, ""   # one camera use at a time: Look takes the meeting camera's place
+    LOOK_WAKE.set()                             # look_loop sleeps while Look is off
     print(f"{clock(now())} look: on", flush=True)
 
 
 def look_due(t: float) -> bool:
-    """A Look round is due: a question waits, or a frame the AI has not seen arrived and LOOK_S has passed.
-    Call with E.lock held."""
-    if not (S.look and E.look_on and S.claude) or E.look_busy:
+    """A Look round is due: a question waits, or a current frame (one for_ai would send) the AI has not seen
+    arrived and LOOK_S has passed. Call with E.lock held."""
+    if not (S.look and E.look_on and S.claude) or QL.busy:
         return False
     if E.look_question:
         return True
-    return FRAMES.newest_id(LOOK_MID, {"camera"}) > E.look_seen and t - E.look_round_at >= S.look_s
+    return FRAMES.newest_id(LOOK_MID, {"camera"}, t) > E.look_seen and t - E.look_round_at >= S.look_s
 
 
 def look_round(queued: float | None = None) -> None:
@@ -2321,10 +2344,19 @@ def look_round(queued: float | None = None) -> None:
         if not (S.look and E.look_on):
             return
         gen, question, seen = E.look_gen, E.look_question, E.look_seen
-        E.look_question, E.look_round_at, E.look_busy = "", now(), True
+        E.look_question, E.look_round_at = "", now()
         shown = [i["text"] for i in E.look_items[-12:]]
+    frames = []
     try:
-        frames = FRAMES.for_ai(LOOK_MID, now(), {"camera"})[-LOOK_FRAMES:]
+        t = now()
+        frames = FRAMES.for_ai(LOOK_MID, t, {"camera"})[-LOOK_FRAMES:]
+        if not frames and not question:
+            # nothing to look at (the frames went stale or could not be read): no call, and those frames
+            # do not make the round due again
+            with E.lock:
+                if E.look_gen == gen:
+                    E.look_seen = max(E.look_seen, FRAMES.newest_id(LOOK_MID, {"camera"}))
+            return
         for fr in frames:
             fr["label"] = f"Picture: phone camera at {clock(fr['ts'])}{' (NEW)' if fr['id'] > seen else ''}"
         msg = (now_line() + "\n\n## ALREADY SHOWN\n" + ("\n".join(f"- {j}" for j in shown) or "(nothing)")
@@ -2332,13 +2364,8 @@ def look_round(queued: float | None = None) -> None:
                + ("" if frames else "\n\n(No picture yet: answer the question from the text alone, or say "
                                      "that a picture is needed.)"))
         t0 = _mono()
-        out = run_claude(personalize(PROMPT_LOOK), msg, S.model, schema=SCHEMA_LOOK,
-                         images=frames or None)
-        r = out.get("structured_output")
-        if isinstance(r, str):
-            r = json.loads(r)
-        if not isinstance(r, dict):
-            raise RuntimeError(f"no structured_output: {str(out.get('result'))[:200]}")
+        r = structured(run_claude(personalize(PROMPT_LOOK), msg, S.model, schema=SCHEMA_LOOK,
+                                  images=frames or None))
         items = []
         for it in r.get("items") or []:
             if not isinstance(it, dict):
@@ -2355,7 +2382,9 @@ def look_round(queued: float | None = None) -> None:
                 return
             if question:
                 items = items or [{"kind": "answer", "text": "(no answer)"}]
-                items[0]["q"] = question[:200]
+                # the answer is listed first, so it is never cut by the 3-item limit below
+                k = next((i for i, x in enumerate(items) if x["kind"] == "answer"), 0)
+                items.insert(0, {**items.pop(k), "q": question[:200]})
             E.look_items.extend({**it, "ts": ts} for it in items[:3])
             del E.look_items[:-LOOK_KEEP_ITEMS]
             if frames:
@@ -2367,21 +2396,24 @@ def look_round(queued: float | None = None) -> None:
     except Exception as ex:
         with E.lock:
             if E.look_gen == gen:
-                # a question is not asked again by itself (a failing call would repeat every second)
+                # nothing is retried by itself: a question is not asked again, and the frames sent count as
+                # seen, so the next try waits for a new picture (else a failing call repeats every LOOK_S)
+                if frames:
+                    E.look_seen = max(E.look_seen, max(fr["id"] for fr in frames))
                 E.look_msg = (f"the AI call failed{' (ask again)' if question else ''}: {str(ex)[:200]}")
         print(f"{clock(now())} look: {ex}", flush=True)
-    finally:
-        with E.lock:
-            E.look_busy = False
 
 
 LOOK_WAKE = threading.Event()
 
 
 def look_loop() -> None:
-    """Starts a Look round when one is due (checked every second, or at once when the page asks)."""
+    """Starts a Look round when one is due: checked every second while Look is on (or at once when the page
+    asks); while Look is off it sleeps until look_start wakes it."""
     while True:
-        LOOK_WAKE.wait(1.0)
+        with E.lock:
+            on = S.look and E.look_on
+        LOOK_WAKE.wait(1.0 if on else None)
         LOOK_WAKE.clear()
         try:
             with E.lock:
@@ -3436,13 +3468,34 @@ class Page(BaseHTTPRequestHandler):
             return self._json(410, {"error": "No valid code: it expired or was used. Ask for a new code."})
         return self._json(401, {"error": f"Wrong code. {n} {'try' if n == 1 else 'tries'} left.", "left": n})
 
+    def _frame_refused(self, raw: bytes, declared: int) -> bool:
+        """Size and image type of a phone frame (camera or Look); True when refused (the answer is sent).
+        Checked before the rate slot: a bad upload does not use it up."""
+        if declared > CAMERA_UPLOAD_MAX:
+            self._json(413, {"error": f"frame over {CAMERA_UPLOAD_MAX // 1_000_000} MB"})
+            return True
+        if not raw or image_kind(raw) is None:
+            self._json(415, {"error": "not a JPEG or PNG image"})
+            return True
+        return False
+
+    def _store_frame(self, mid, raw: bytes, t: float, what: str):
+        """FRAMES.add for a phone frame: the kept frame, None (looks like the previous one), or False when
+        it failed (the error answer is sent)."""
+        try:
+            return FRAMES.add(mid, "camera", raw, t)
+        except ValueError as ex:
+            self._json(415, {"error": str(ex)})
+        except OSError as ex:
+            error(f"saving a {what} frame: {ex}")
+            self._json(500, {"error": "could not save the frame on the Mac"})
+        return False
+
     def _camera_frame(self, raw: bytes, declared: int) -> None:
         """POST /camera/frame: one JPEG or PNG from the phone page (login, Origin and Host already checked).
         Kept only while the camera is on for the live meeting and the AI is allowed for it."""
-        if declared > CAMERA_UPLOAD_MAX:
-            return self._json(413, {"error": f"frame over {CAMERA_UPLOAD_MAX // 1_000_000} MB"})
-        if not raw or image_kind(raw) is None:   # before the rate slot: a bad upload does not use it up
-            return self._json(415, {"error": "not a JPEG or PNG image"})
+        if self._frame_refused(raw, declared):
+            return
         t = now()
         with E.lock:
             mid = (E.meeting or {}).get("id")
@@ -3455,13 +3508,9 @@ class Page(BaseHTTPRequestHandler):
             if t - E.camera_last < S.camera_s / 2:
                 return self._json(429, {"error": "too soon after the last frame: try again in a few seconds"})
             E.camera_last = t
-        try:
-            kept = FRAMES.add(mid, "camera", raw, t)   # None: looks like the previous one (only kept current)
-        except ValueError as ex:
-            return self._json(415, {"error": str(ex)})
-        except OSError as ex:
-            error(f"saving a camera frame: {ex}")
-            return self._json(500, {"error": "could not save the frame on the Mac"})
+        kept = self._store_frame(mid, raw, t, "camera")   # None: looks like the previous one (only kept current)
+        if kept is False:
+            return
         with E.lock:
             gone = (E.meeting or {}).get("id") != mid
         if gone:   # the meeting ended while it was being stored
@@ -3474,10 +3523,8 @@ class Page(BaseHTTPRequestHandler):
     def _look_frame(self, raw: bytes, declared: int) -> None:
         """POST /look/frame: one JPEG or PNG from the phone page while Look is on (login, Origin and Host
         already checked). No meeting needed; the tap on Look is the consent."""
-        if declared > CAMERA_UPLOAD_MAX:
-            return self._json(413, {"error": f"frame over {CAMERA_UPLOAD_MAX // 1_000_000} MB"})
-        if not raw or image_kind(raw) is None:
-            return self._json(415, {"error": "not a JPEG or PNG image"})
+        if self._frame_refused(raw, declared):
+            return
         t = now()
         with E.lock:
             if not (S.look and E.look_on):
@@ -3485,19 +3532,20 @@ class Page(BaseHTTPRequestHandler):
             if t - E.look_last < S.camera_s / 2:
                 return self._json(429, {"error": "too soon after the last frame: try again in a few seconds"})
             E.look_last, gen = t, E.look_gen
-        try:
-            kept = FRAMES.add(LOOK_MID, "camera", raw, t)
-        except ValueError as ex:
-            return self._json(415, {"error": str(ex)})
-        except OSError as ex:
-            error(f"saving a Look frame: {ex}")
-            return self._json(500, {"error": "could not save the frame on the Mac"})
+        kept = self._store_frame(LOOK_MID, raw, t, "Look")
+        if kept is False:
+            return
         with E.lock:
             on, same = E.look_on, E.look_gen == gen
-        if not (on and same):   # Look stopped (or restarted) while it was being stored
-            if not on:
-                FRAMES.drop(LOOK_MID)
+        if not on:   # Look stopped while it was being stored
+            FRAMES.drop(LOOK_MID)
             return self._json(409, {"error": LOOK_OFF})
+        if not same:
+            # Look was stopped and started again meanwhile: this frame belongs to the old run, so it is
+            # dropped; no 409, as the page would stop the new run's stream
+            if kept:
+                FRAMES.remove(kept["id"])
+            return self._json(200, {"ok": True, "kept": False, "stale": True})
         if kept:
             print(f"{clock(t)} look: new frame {kept['id']} ({kept['bytes'] // 1024} KB)", flush=True)
             LOOK_WAKE.set()
@@ -3577,6 +3625,7 @@ class Page(BaseHTTPRequestHandler):
         if path == "/pair":
             code, left, _ = PAIR.get_or_create(owner=True)   # someone logged in: no notification, lifts the lock
             return self._json(200, {"code": code, "expires_in": left})
+        stop_look = False
         with E.lock:
             if path == "/context":
                 E.goal = str(body.get("goal", ""))[:2000]
@@ -3612,6 +3661,7 @@ class Page(BaseHTTPRequestHandler):
                     return self._send(409, CAMERA_AI_OFF.encode(), "text/plain; charset=utf-8")
                 else:
                     E.camera_for, E.camera_msg = mid, ""
+                    stop_look = True   # one camera use at a time: after the lock (look_stop takes it)
             elif path == "/ai":
                 # {"on": true, "meeting": <id shown on the page> | null (= the next meeting)}
                 mid = body.get("meeting")
@@ -3628,6 +3678,8 @@ class Page(BaseHTTPRequestHandler):
                 save_context()
             else:
                 return self._send(404, b"", "text/plain")
+        if stop_look:
+            look_stop("the meeting camera was turned on")
         if path == "/ai":   # start (warm up) or close the kept-open AI process now, not at the next poll
             threading.Thread(target=ai_reconcile, args=("Turn on AI clicked" if body.get("on") is True
                                                          else "AI turned off",), daemon=True).start()

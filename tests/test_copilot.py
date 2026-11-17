@@ -1579,6 +1579,69 @@ class LanHttps(unittest.TestCase):
         self.assertEqual(post("/look", {"on": True})[0], 409)
         self.assertFalse(copilot.E.public()["look"]["enabled"])
 
+    def test_look_frame_of_an_old_run_is_dropped_without_a_409(self):
+        """Stop then start while an upload was being stored: the frame of the old run is not kept for the new
+        one, and the answer is not a 409 (the page would stop the new run's stream)."""
+        copilot.S.claude = "/bin/true"
+        port = self.serve()
+        h = {"Content-Type": "application/json", "Origin": "https://copilot.local:8443"}
+        self.assertEqual(self.req(port, "/look", "copilot.local:8443", h, "POST", b'{"on": true}')[0], 200)
+        add = copilot.FRAMES.add
+
+        def restart_while_storing(*a, **kw):
+            kept = add(*a, **kw)
+            copilot.look_stop("test")
+            copilot.look_start()
+            return kept
+        copilot.FRAMES.add = restart_while_storing
+        try:
+            code, r = self.look_upload(port, png_bytes(64, 48, (10, 120, 200)))
+        finally:
+            copilot.FRAMES.add = add
+        self.assertEqual((code, r), (200, {"ok": True, "kept": False, "stale": True}))
+        self.assertEqual(copilot.FRAMES.items, [])
+        self.assertTrue(copilot.E.look_on)
+        # the new run takes frames as usual
+        self.assertEqual(self.look_upload(port, png_bytes(64, 48, (1, 2, 3))), (200, {"ok": True, "kept": True}))
+
+        # stopped (not started again) while storing: still a 409, and nothing is left
+        def stop_while_storing(*a, **kw):
+            kept = add(*a, **kw)
+            copilot.look_stop("test")
+            return kept
+        copilot.FRAMES.add = stop_while_storing
+        try:
+            self.assertEqual(self.look_upload(port, png_bytes(64, 48, (200, 2, 3)))[0], 409)
+        finally:
+            copilot.FRAMES.add = add
+        self.assertEqual(copilot.FRAMES.items, [])
+
+    def test_one_camera_use_at_a_time(self):
+        """Look on turns the meeting camera off; the meeting camera on turns Look off (on the Mac)."""
+        copilot.S.claude = "/bin/true"
+        port = self.serve()
+        h = {"Content-Type": "application/json", "Origin": "https://copilot.local:8443"}
+
+        def post(path, body):
+            return self.req(port, path, "copilot.local:8443", h, "POST", json.dumps(body).encode())[0]
+        self.assertEqual(post("/camera", {"on": True, "meeting": 7}), 200)
+        self.assertEqual(copilot.E.camera_for, 7)
+        self.assertEqual(post("/look", {"on": True}), 200)
+        self.assertTrue(copilot.E.look_on)
+        self.assertIsNone(copilot.E.camera_for)
+        self.assertEqual(self.look_upload(port, png_bytes(64, 48, (10, 120, 200)))[0], 200)
+        self.assertEqual(post("/camera", {"on": True, "meeting": 7}), 200)
+        self.assertEqual(copilot.E.camera_for, 7)
+        self.assertFalse(copilot.E.look_on)
+        self.assertEqual(copilot.FRAMES.items, [])                      # Look frames go with it
+        # a refused camera tap leaves Look on
+        self.assertEqual(post("/look", {"on": True}), 200)
+        self.assertEqual(post("/camera", {"on": True, "meeting": 8}), 409)
+        self.assertTrue(copilot.E.look_on)
+        # the camera turned off does not touch Look
+        self.assertEqual(post("/camera", {"on": False}), 200)
+        self.assertTrue(copilot.E.look_on)
+
     def test_large_body_only_after_the_checks(self):
         """Host, Origin, type and login are checked from the headers before the body is read: only a logged-in
         camera upload may send more than 100 KB. (With the old order the server waited for all 2 MB.)"""
@@ -2410,6 +2473,88 @@ class Vision(unittest.TestCase):
         # a new start begins empty
         copilot.look_start()
         self.assertEqual(copilot.E.public()["look"]["items"], [])
+
+    def fake_look_ai(self, answer=None, fail=False):
+        """Replaces run_claude for Look rounds; returns the list of calls (message, image count)."""
+        calls, real = [], copilot.run_claude
+        self.addCleanup(setattr, copilot, "run_claude", real)
+
+        def fake(system, msg, model, **kw):
+            calls.append((msg, len(kw.get("images") or [])))
+            if fail:
+                raise RuntimeError("claude exited with code 1")
+            return {"structured_output": answer or {"items": [{"kind": "insight", "text": "A blue square."}]}}
+        copilot.run_claude = fake
+        return calls
+
+    def test_look_failed_round_waits_for_a_new_picture(self):
+        self.settings(PERSISTENT_AI="off", SCREEN="0", CAMERA="1", LOOK_S="10")
+        calls = self.fake_look_ai(fail=True)
+        copilot.look_start()
+        fr = copilot.FRAMES.add(copilot.LOOK_MID, "camera", png_bytes(64, 48, (250, 250, 250)), copilot.now())
+        with copilot.E.lock:
+            self.assertTrue(copilot.look_due(copilot.now()))
+        copilot.look_round()
+        self.assertEqual(len(calls), 1)
+        self.assertIn("the AI call failed", copilot.E.public()["look"]["msg"])
+        self.assertEqual(copilot.E.look_seen, fr["id"])
+        with copilot.E.lock:                                          # not retried every LOOK_S
+            self.assertFalse(copilot.look_due(copilot.now() + 100))
+        copilot.FRAMES.add(copilot.LOOK_MID, "camera", png_bytes(64, 48, (5, 5, 5)), copilot.now())
+        with copilot.E.lock:                                          # a new picture tries again
+            self.assertTrue(copilot.look_due(copilot.now() + 11))
+
+    def test_look_stale_frames_never_make_a_call(self):
+        self.settings(PERSISTENT_AI="off", SCREEN="0", CAMERA="1", LOOK_S="10")
+        calls = self.fake_look_ai()
+        copilot.look_start()
+        old = copilot.now() - copilot.FRAME_STALE_S - 10
+        fr = copilot.FRAMES.add(copilot.LOOK_MID, "camera", png_bytes(64, 48, (250, 250, 250)), old)
+        with copilot.E.lock:                       # for_ai would not send it: so it is not due either
+            self.assertFalse(copilot.look_due(copilot.now()))
+        copilot.look_round()                       # even when started: no call with no picture and no question
+        self.assertEqual(calls, [])
+        self.assertEqual(copilot.E.look_seen, fr["id"])
+        # a question still goes, from the text alone
+        copilot.E.look_question = "What is a PNG?"
+        copilot.look_round()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1], 0)
+        self.assertIn("No picture yet", calls[0][0])
+
+    def test_look_question_goes_with_the_answer(self):
+        self.settings(PERSISTENT_AI="off", SCREEN="0", CAMERA="1", LOOK_S="10")
+        self.fake_look_ai({"items": [{"kind": "insight", "text": "The screen shows a terminal."},
+                                     {"kind": "step", "text": "Run the tests again."},
+                                     {"kind": "insight", "text": "The font is small."},
+                                     {"kind": "answer", "text": "It is a missing import."}]})
+        copilot.look_start()
+        copilot.E.look_question = "Why does it fail?"
+        copilot.look_round()
+        items = copilot.E.public()["look"]["items"]
+        self.assertEqual(len(items), 3)
+        self.assertEqual((items[0]["kind"], items[0]["text"], items[0].get("q")),
+                         ("answer", "It is a missing import.", "Why does it fail?"))
+        self.assertEqual([i.get("q") for i in items[1:]], [None, None])
+        # no answer item: the question goes with the first one
+        self.fake_look_ai({"items": [{"kind": "step", "text": "Point the camera at the error."}]})
+        copilot.E.look_question = "And now?"
+        copilot.look_round()
+        self.assertEqual(copilot.E.public()["look"]["items"][-1].get("q"), "And now?")
+
+    def test_look_busy_comes_from_its_queue(self):
+        self.settings(PERSISTENT_AI="off", SCREEN="0", CAMERA="1", LOOK_S="10")
+        copilot.look_start()
+        copilot.E.look_question = "Hi?"
+        self.addCleanup(setattr, copilot.QL, "busy", False)
+        copilot.QL.busy = True
+        with copilot.E.lock:
+            self.assertFalse(copilot.look_due(copilot.now()))
+        self.assertTrue(copilot.E.public()["look"]["busy"])
+        copilot.QL.busy = False
+        with copilot.E.lock:
+            self.assertTrue(copilot.look_due(copilot.now()))
+        self.assertFalse(copilot.E.public()["look"]["busy"])
 
     def test_frames_through_the_kept_open_process(self):
         old = copilot.SESSION

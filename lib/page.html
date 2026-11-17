@@ -50,7 +50,8 @@
   #lookask { display: flex; gap: 8px; margin-bottom: 6px; }
   #lookq { flex: 1; min-width: 0; background: var(--bg); color: var(--txt); border: 1px solid var(--line); border-radius: 8px; padding: 8px; font: inherit; font-size: 16px; }
   #lookstat { color: var(--dim); font-size: 12px; margin-bottom: 4px; }
-  #lookstat .msg { color: var(--corr); }
+  #lookstat .msg, #lookerr { color: var(--corr); }
+  #lookerr { font-size: 12px; margin-bottom: 4px; }
   #looksec .kind { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; margin-right: 6px; color: var(--data); }
   #looksec .kind.answer { color: var(--say); } #looksec .kind.step { color: var(--ask); }
   #lookused { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
@@ -89,6 +90,7 @@
   <h2>Look</h2>
   <form id="lookask"><input id="lookq" maxlength="1000" autocomplete="off" placeholder="Ask about what the camera sees"><button>Ask</button></form>
   <div id="lookstat"></div>
+  <div id="lookerr" hidden></div>
   <div class="list"></div>
   <div id="lookused"></div>
 </section>
@@ -197,7 +199,9 @@ async function refresh() {
 // ---- phone camera: a live preview, one frame every camera_s seconds (only when it changed), upload as JPEG
 // The same stream serves the meeting camera (mode "meeting", POST /camera/frame) and Look (mode "look",
 // POST /look/frame); only one of them is on at a time.
-const cam = { stream: null, timer: null, wake: null, prev: null, lastSent: 0, n: 0, bytes: 0, msg: "", busy: false, mode: "meeting" };
+const cam = { stream: null, timer: null, wake: null, prev: null, lastSent: 0, n: 0, bytes: 0, msg: "", busy: false, mode: "meeting", gen: 0 };
+// the Mac's own page has no camera use of its own: it shows Look's answers and a Stop button only
+const onMac = ["127.0.0.1", "localhost", "[::1]", "::1"].includes(location.hostname);
 const camOffPath = () => cam.mode === "look" ? "/look" : "/camera";
 const camSecure = !!(window.isSecureContext && navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
 const camEl = id => document.getElementById(id);
@@ -227,8 +231,10 @@ function camPaint() {
 async function camSend(blob, manual) {
   if (cam.busy) return;
   cam.busy = true;
+  const gen = cam.gen;   // an answer that comes after a stop or a new start is about the old run: ignored
   try {
     const r = await fetch(cam.mode === "look" ? "/look/frame" : "/camera/frame", { method: "POST", headers: { "Content-Type": blob.type || "image/jpeg" }, body: blob });
+    if (gen !== cam.gen) return;
     if (r.status === 401) { location.reload(); return; }
     if (r.ok) { cam.n++; cam.bytes += blob.size; cam.msg = ""; cam.lastSent = Date.now(); }
     else if (r.status !== 429 || manual) {   // a live frame that came too soon is just skipped; a photo says so
@@ -236,7 +242,7 @@ async function camSend(blob, manual) {
       cam.msg = t || "the Mac did not take the frame";
       if (r.status === 409) { camStopLocal(); refresh(); }
     }
-  } catch { cam.msg = "could not reach the Mac"; }
+  } catch { if (gen === cam.gen) cam.msg = "could not reach the Mac"; }
   finally { cam.busy = false; camPaint(); }
 }
 async function camGrab(force) {
@@ -253,6 +259,7 @@ async function camGrab(force) {
   return new Promise(done => c.toBlob(b => { (b ? camSend(b) : Promise.resolve()).finally(done); }, "image/jpeg", 0.7));
 }
 function camStopLocal() {
+  cam.gen++;
   if (cam.timer) clearInterval(cam.timer);
   cam.timer = null;
   if (cam.stream) cam.stream.getTracks().forEach(t => t.stop());
@@ -262,7 +269,7 @@ function camStopLocal() {
   camPaint();
 }
 async function camStart(mode) {
-  cam.msg = ""; cam.mode = mode || "meeting";
+  cam.gen++; cam.msg = ""; cam.mode = mode || "meeting";
   if (!camSecure) { camPaint(); return; }
   try {
     cam.stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
@@ -281,8 +288,6 @@ async function camStart(mode) {
 }
 async function camToggle() {
   const on = !((last.vision || {}).camera_on);
-  if (on && (last.look || {}).on) { await post("/look", { on: false }).catch(() => {}); camStopLocal(); }
-  cam.mode = "meeting";
   let r = null;
   try { r = await post("/camera", { on, meeting: last.meeting ? last.meeting.id : null }); } catch {}
   if (!r || !r.ok) {
@@ -290,7 +295,8 @@ async function camToggle() {
     cam.msg = (t && t !== "meeting changed") ? t : "did not work, try again";
     camPaint(); refresh(); return;
   }
-  if (on) { await camStart("meeting"); } else { camStopLocal(); }
+  // the Mac turned Look off when the camera went on (one camera use at a time)
+  if (on) { camStopLocal(); await camStart("meeting"); } else if (cam.mode === "meeting") { camStopLocal(); }
   refresh();
 }
 function cameraUI(e, v) {
@@ -300,7 +306,7 @@ function cameraUI(e, v) {
   b.textContent = v.camera_on ? "Camera on · stop" : "Camera";
   // the meeting ended or the Mac says it is off: stop the stream at once
   if (cam.stream && cam.mode === "meeting" && !(live && v.camera_on)) camStopLocal();
-  const lookOn = !!(e.look || {}).on;
+  const lookOn = !!(e.look || {}).on && !onMac;
   const showShot = ((live && v.camera_on) || lookOn) && !camSecure;
   camEl("camshot").hidden = !showShot;
   camEl("campanel").style.display = (live && v.camera_on) || lookOn || cam.stream || cam.msg ? "flex" : "none";
@@ -311,14 +317,14 @@ function cameraUI(e, v) {
 let lookMsg = "";
 function lookUI(e) {
   const lk = e.look || {}, b = camEl("look");
-  b.style.display = lk.enabled ? "inline-block" : "none";
+  b.style.display = lk.enabled && (lk.on || !onMac) ? "inline-block" : "none";   // the Mac: Stop only
   b.className = lk.on ? "on" : "";
   if (!lookMsg) b.textContent = lk.on ? "Look on · stop" : "Look";
   if (cam.stream && cam.mode === "look" && !lk.on) camStopLocal();   // stopped elsewhere (the Mac page)
   const items = lk.items || [];
   const sec = camEl("looksec");
   sec.style.display = lk.enabled && (lk.on || items.length) ? "block" : "none";
-  camEl("lookask").style.display = lk.on ? "flex" : "none";
+  camEl("lookask").style.display = lk.on && !onMac ? "flex" : "none";
   camEl("lookstat").innerHTML = (lk.on ? (lk.busy || lk.pending ? "looking…" :
       `a new picture is looked at every ${lk.look_s || 10} s at most; or ask a question`) : "Look is off") +
     (lk.msg ? ` <span class="msg">${esc(lk.msg)}</span>` : "");
@@ -335,8 +341,7 @@ function lookUI(e) {
 }
 async function lookToggle() {
   const on = !((last.look || {}).on);
-  if (on && (last.vision || {}).camera_on) { await post("/camera", { on: false }).catch(() => {}); camStopLocal(); }
-  cam.mode = "look";
+  if (on && onMac) return;
   let r = null;
   try { r = await post("/look", { on }); } catch {}
   if (!r || !r.ok) {
@@ -346,8 +351,17 @@ async function lookToggle() {
     setTimeout(() => lookMsg = "", 4000);
     refresh(); return;
   }
-  if (on) { await camStart("look"); } else if (cam.mode === "look") { camStopLocal(); }
+  // only now the meeting camera goes: the Mac turned it off when Look went on (one camera use at a time);
+  // on a failure above nothing was touched
+  if (on) { camStopLocal(); await camStart("look"); } else if (cam.mode === "look") { camStopLocal(); }
   refresh();
+}
+let lookErrTimer = null;
+function lookErr(t) {   // its own line: refresh() rewrites #lookstat at once
+  const el = camEl("lookerr");
+  el.textContent = t; el.hidden = false;
+  clearTimeout(lookErrTimer);
+  lookErrTimer = setTimeout(() => { el.hidden = true; }, 6000);
 }
 camEl("look").onclick = lookToggle;
 camEl("lookask").onsubmit = async ev => {
@@ -363,7 +377,7 @@ camEl("lookask").onsubmit = async ev => {
     camEl("lookq").value = "";
   } else {
     let t = ""; try { t = r ? await r.text() : ""; } catch {}
-    camEl("lookstat").textContent = t || "not sent, try again";
+    lookErr(t || "not sent, try again");
   }
   refresh();
 };
