@@ -137,6 +137,7 @@ let editing = false;
 let last = {}, aiMsg = "", screenMsg = "";
 async function refresh() {
   let e;
+  const langAt = langSeq;   // a reply to a request sent before the last language pick has the old language
   try {
     const r = await fetch("/state");
     if (r.status === 401) { location.reload(); return; }   // logged out: the login page asks for a code
@@ -159,7 +160,7 @@ async function refresh() {
   if (!screenMsg) sb.textContent = v.screen_on ? "Screen shared with AI · stop" : "Share screen with AI";
   cameraUI(e, v);
   lookUI(e);
-  langUI(e.language);
+  langUI(e.language, langAt);
   document.getElementById("latency").textContent = lat.n ?
     `last answer ${lat.last} s · median ${lat.median} s` + (lat.n_image ? `, with image ${lat.median_image} s` : "") : "";
   const vis = document.getElementById("vision");
@@ -407,9 +408,11 @@ const camHide = () => { if (cam.stream) { const p = camOffPath(); camStopLocal()
 document.addEventListener("visibilitychange", () => { if (document.hidden) camHide(); });
 window.addEventListener("pagehide", camHide);
 
-// ---- language: the choices come from /state (the Mac's list), so every open page shows the same one
-let langBusy = false;
-function langUI(l) {
+// ---- language: the choices come from /state (the Mac's list), so every open page shows the same one.
+// langSeq goes up when a pick starts and again when the Mac has answered: a /state reply to a request sent
+// before that (maybe read on the Mac before the change) never puts the old value back in the menu.
+let langBusy = false, langSeq = 0;
+function langUI(l, at) {
   const sel = document.getElementById("lang");
   if (!l || !l.options) return;
   sel.style.display = "inline-block";
@@ -418,13 +421,15 @@ function langUI(l) {
     sel.dataset.key = key;
     sel.innerHTML = l.options.map(o => `<option value="${esc(o.value)}">${esc(o.label)}</option>`).join("");
   }
-  if (!langBusy && document.activeElement !== sel) sel.value = l.value;
+  if (!langBusy && at === langSeq && document.activeElement !== sel) sel.value = l.value;
 }
 document.getElementById("lang").onchange = async ev => {
   const sel = ev.target;
   langBusy = true;
+  langSeq++;
   let ok = false;
   try { ok = (await post("/language", { language: sel.value })).ok; } catch {}
+  langSeq++;
   langBusy = false;
   sel.classList.toggle("bad", !ok);
   sel.title = ok ? "Language of the suggestions, facts and Look answers (from the next round)" : "did not work, try again";

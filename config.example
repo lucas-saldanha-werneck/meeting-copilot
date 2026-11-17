@@ -44,7 +44,7 @@
 # Empty: the meeting's language. The language menu on the page changes it while
 # the copilot runs (Auto, English, Portuguese, Spanish, French, German, Italian,
 # or this value); that choice is kept in language.json in the data folder and
-# wins over this line until you pick again.
+# wins over this line until you pick again or change this line.
 #MEETING_COPILOT_LANGUAGE=
 
 # A text file that replaces the built-in suggestions prompt (the "Say this" /

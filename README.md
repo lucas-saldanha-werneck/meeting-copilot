@@ -98,11 +98,13 @@ meeting-copilot bench [N] --yes   time N real suggestion rounds, with and withou
 The menu at the top of the page (phone and Mac) picks the language of the suggestions, the
 facts and the Look answers: **Auto** (the language the meeting is using), English, Português
 (Brasil), Español, Français, Deutsch or Italiano. Your `MEETING_COPILOT_LANGUAGE` value shows up
-as one more choice when it is not one of these. The change counts from the next round on, for
+as one more choice when it is not one of these (`spanish`, `Español` or `português do Brasil` select
+the built-in choice, whatever the case). The change counts from the next round on, for
 every open page; the kept-open AI process (which has the language in its instructions) is replaced
 by a fresh one at once. The choice is saved in `language.json` in your data folder (only your user
 can read it), so a restart keeps it, and it wins over `MEETING_COPILOT_LANGUAGE` until you pick
-again; **Auto** saves "the meeting's language". Only the listed choices are accepted (`POST
+again or edit that line: a config value changed since the pick wins (one line in the log says so);
+**Auto** saves "the meeting's language". Only the listed choices are accepted (`POST
 /language` with `{"language": "English"}`, `""` for Auto): no typed text goes into the prompts.
 
 ### Logging in
