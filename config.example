@@ -82,6 +82,20 @@
 # The dns-sd command that publishes the name. Default: dns-sd (macOS only; elsewhere
 # no name is published).
 #MEETING_COPILOT_DNS_SD=dns-sd
+# 1: also https on the home network (needed for the phone camera: a phone's browser
+# only opens the camera on an https page). The copilot makes a small certificate
+# authority of its own that can vouch only for <LAN_NAME>.local and home network
+# addresses, signs one certificate with it and deletes the authority's key at once.
+# Each phone installs it once from http://<LAN_NAME>.local/setup (see README,
+# "Phone camera"). Default: 1 when both LAN and CAMERA are 1, else 0.
+#MEETING_COPILOT_LAN_HTTPS=
+# Port of the https listener (443 = no port in the URL; macOS lets your user use it).
+#MEETING_COPILOT_LAN_HTTPS_PORT=443
+# The openssl command that makes the certificate (empty: openssl on PATH; macOS has one).
+#MEETING_COPILOT_OPENSSL=
+# The command that keeps the certificate folder out of Time Machine backups
+# (empty: tmutil on PATH, macOS only; off: not used).
+#MEETING_COPILOT_TMUTIL=
 
 # The command that shows the pairing code as a notification on the Mac. Default:
 # osascript (macOS only; elsewhere no notification). off: no notification (the code
@@ -148,3 +162,12 @@
 # A command that prints the windows on screen as JSON (id, owner, name, layer, w, h).
 # Empty: a few lines of JXA run by osascript.
 #MEETING_COPILOT_WINDOW_LIST=
+
+# 1: the AI may also look through your phone's camera (a whiteboard, a paper, the room).
+# A live meeting gets a "Camera" button on the page; nothing is sent until you tap it on
+# the phone, and each meeting asks again. Live video needs https (LAN_HTTPS, or a tunnel
+# with https); on a plain http page the button takes one photo per tap. Default: 0.
+#MEETING_COPILOT_CAMERA=0
+# Seconds between two looks at the camera picture; a frame goes to the Mac only when the
+# picture changed (at least 2).
+#MEETING_COPILOT_CAMERA_S=5

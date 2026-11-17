@@ -7,6 +7,7 @@
 #   meeting-copilot devices [forget]                      list the paired browsers, or log them all out
 #   meeting-copilot log                                   show the end of the log
 #   meeting-copilot bench [N] [--yes]                     time N real suggestion rounds, with and without an image
+#   meeting-copilot cert [--renew]                        the https certificate for the phone camera (see README)
 #   A browser that is not logged in asks for the 6-digit code shown on the Mac (notification, status).
 set -u
 
@@ -33,6 +34,7 @@ LOG="${MEETING_COPILOT_LOG:-$DATA/meeting-copilot.log}"
 port="$(setting PORT)"
 port="${port:-4390}"
 lanport=""
+httpsport=""
 open_page=1
 args=()
 cmd=start
@@ -44,7 +46,8 @@ while [ $# -gt 0 ]; do
     --port) port="$2"; args+=("--port" "$2"); shift ;;
     --db) args+=("--db" "$2"); shift ;;
     bench) cmd=bench; shift; args=("$@"); break ;;
-    -h|--help) sed -n '2,10p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    cert) cmd=cert; shift; args=("$@"); break ;;
+    -h|--help) sed -n '2,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "meeting-copilot: unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
@@ -67,10 +70,11 @@ running_pid() {
 
 # The running copilot may have been started on another port: use the one it wrote down.
 use_running_port() {
-  local p="$1" fpid fport flan
-  read -r fpid fport flan < "$PORTFILE" 2>/dev/null || return 0
+  local p="$1" fpid fport flan fhttps
+  read -r fpid fport flan fhttps < "$PORTFILE" 2>/dev/null || return 0
   if [ "$fpid" = "$p" ] && [ -n "$fport" ]; then
     lanport="${flan:-}"
+    httpsport="${fhttps:-}"
     [ "$fport" != "$port" ] && echo "note: meeting-copilot is already running on port $fport; stop it first to use port $port" >&2
     port="$fport"
     URL="http://127.0.0.1:$port"
@@ -98,7 +102,7 @@ urllib.request.urlopen(req, timeout=1)" "$URL/state" 2>/dev/null
 page_url() { echo "$URL/"; }
 
 # The other addresses of the running page (LAN, extra hosts), one per line, no token in them.
-more_urls() { "$PY" "$APP" --urls "$port" "$lanport" 2>/dev/null; }
+more_urls() { "$PY" "$APP" --urls "$port" "$lanport" "$httpsport" 2>/dev/null; }
 
 # Commands of copilot.py that talk to the running copilot (pairing code, one-time login link, devices).
 cli() { "$PY" "$APP" --cli "$1" "$port"; }
@@ -151,6 +155,16 @@ case "$cmd" in
     if [ -n "$p" ]; then use_running_port "$p"; cli new-code; else echo "meeting-copilot is not running"; exit 1; fi ;;
   devices|forget-devices)
     cli "$cmd" ;;
+  cert)
+    # make the local CA + https certificate (first time), or show it; --renew replaces both
+    renew=()
+    for a in ${args[@]+"${args[@]}"}; do
+      case "$a" in
+        --renew) renew=(--renew) ;;
+        *) echo "meeting-copilot cert: unknown argument: $a" >&2; exit 2 ;;
+      esac
+    done
+    exec "$PY" "$APP" --cert ${renew[@]+"${renew[@]}"} ;;
   bench)
     # N rounds (default 3); without --yes it only says what it would do and cost
     n=3; yes=()

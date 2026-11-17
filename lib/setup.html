@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Set up this phone - Meeting Copilot</title>
+<style>
+  :root { --bg: #0f1218; --card: #181d27; --line: #2b3242; --txt: #e6e9ef; --dim: #8b93a5; --say: #6cb6ff; --ok: #5fd39a; --warn: #ff9a9a; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--txt); font: 16px/1.45 -apple-system, system-ui, sans-serif; padding: 16px; max-width: 640px; margin-inline: auto; }
+  h1 { font-size: 20px; } h2 { font-size: 16px; margin-top: 24px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px 16px; margin: 12px 0; }
+  a.btn, button { display: inline-block; background: var(--say); color: #0f1218; font-weight: 600; border: 0; border-radius: 8px; padding: 10px 16px; text-decoration: none; font-size: 16px; }
+  ol { padding-left: 20px; } li { margin: 4px 0; }
+  .dim { color: var(--dim); font-size: 14px; }
+  #res.ok { color: var(--ok); } #res.bad { color: var(--warn); }
+</style>
+</head>
+<body>
+<h1>Set up this phone</h1>
+<div class="card">This phone will trust a certificate authority that can vouch <b>only</b> for <b>__NAME__</b> and home network addresses (192.168.x.x, 10.x.x.x, 172.16-31.x.x). It cannot vouch for any other site.</div>
+
+<h2>iPhone or iPad</h2>
+<p><a class="btn" href="/ca.mobileconfig">Download the profile</a></p>
+<ol>
+  <li>Tap Allow when Safari asks to download a configuration profile.</li>
+  <li>Open Settings: tap <b>Profile Downloaded</b> (at the top; or General, <b>VPN &amp; Device Management</b>), then <b>Install</b>, and confirm. iOS says "Not Signed": that is expected.</li>
+  <li>Then Settings, General, About, <b>Certificate Trust Settings</b>: turn on "Meeting Copilot CA (__NAME__)".</li>
+</ol>
+
+<h2>Android</h2>
+<p><a class="btn" href="/ca.crt">Download the certificate</a></p>
+<ol>
+  <li>Settings, Security (or Security and privacy), Encryption and credentials (or More security settings).</li>
+  <li><b>Install a certificate</b>, then <b>CA certificate</b>, accept the warning, and pick the downloaded file.</li>
+</ol>
+<p class="dim">The exact menu names differ between phones.</p>
+
+<h2>Check it</h2>
+<p><button id="test">Test https</button></p>
+<p id="res" class="dim"></p>
+
+<script>
+const host = location.hostname, port = "__HTTPS_PORT__";   // the copilot's https port on this network
+document.getElementById("test").onclick = async () => {
+  const res = document.getElementById("res");
+  res.className = "dim"; res.textContent = "Testing...";
+  // https://<this host>/ping with no-cors: it only resolves when the TLS certificate is trusted
+  const base = "https://" + host + (port && port !== "443" ? ":" + port : "");
+  try {
+    await fetch(base + "/ping", { mode: "no-cors", cache: "no-store" });
+    document.cookie = "mc_https=1; Path=/; Max-Age=31536000; SameSite=Lax";
+    res.className = "ok";
+    res.innerHTML = 'It works. This phone now goes to https by itself: <a href="' + base + '/" style="color:var(--say)">open the copilot</a>.';
+  } catch {
+    document.cookie = "mc_https=; Path=/; Max-Age=0";
+    res.className = "bad";
+    res.textContent = "Not trusted yet. Finish the steps above (on an iPhone, the trust switch under Certificate Trust Settings), then test again.";
+  }
+};
+</script>
+</body>
+</html>
