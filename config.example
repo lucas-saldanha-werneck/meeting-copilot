@@ -87,7 +87,7 @@
 # authority of its own that can vouch only for <LAN_NAME>.local and home network
 # addresses, signs one certificate with it and deletes the authority's key at once.
 # Each phone installs it once from http://<LAN_NAME>.local/setup (see README,
-# "Phone camera"). Default: 1 when both LAN and CAMERA are 1, else 0.
+# "Phone camera"). Default: 1 when LAN is 1 and CAMERA or LOOK is 1, else 0.
 #MEETING_COPILOT_LAN_HTTPS=
 # Port of the https listener (443 = no port in the URL; macOS lets your user use it).
 #MEETING_COPILOT_LAN_HTTPS_PORT=443
@@ -171,3 +171,10 @@
 # Seconds between two looks at the camera picture; a frame goes to the Mac only when the
 # picture changed (at least 2).
 #MEETING_COPILOT_CAMERA_S=5
+# 1: Look mode: a "Look" button on the page, no meeting needed. Point the phone camera at
+# something (often the Mac screen) and get insights, answers and next steps; type a
+# question for an answer at once. Nothing is sent before you tap Look; frames are deleted
+# when it stops (see README, "Look mode"). Default: the same as CAMERA.
+#MEETING_COPILOT_LOOK=
+# Most often a changed picture is looked at by the AI in Look mode, seconds (at least 3).
+#MEETING_COPILOT_LOOK_S=10
