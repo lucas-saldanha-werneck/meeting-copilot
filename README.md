@@ -114,7 +114,7 @@ curl -s -H "Authorization: Bearer $(cat ~/.local/share/meeting-copilot/token)" h
 
 Two optional ways, both off by default:
 
-- **Home network** (`MEETING_COPILOT_LAN=1`): a second listener on `0.0.0.0` port 80, published as `http://copilot.local` with macOS `dns-sd` (the name follows the Mac's address when it changes). It answers only private addresses (`10/8`, `172.16/12`, `192.168/16`, `169.254/16`, `fc00::/7`, `fe80::/10` and loopback); anything else gets `403` before the login is even looked at. Open the `LAN:` URL that `meeting-copilot status` prints on each device and type the code once. Devices that do not resolve `.local` names can use the `LAN IP:` URL. This is plain http: anyone on the same Wi-Fi who can watch its traffic can see the code and the cookie, so use it only on a network you trust. With `MEETING_COPILOT_LAN_HTTPS` (on by default together with the camera) there is also `https://copilot.local`, after a one-time setup on each phone (see "Phone camera").
+- **Home network** (`MEETING_COPILOT_LAN=1`): a second listener on `0.0.0.0` port 80, published as `http://copilot.local` with macOS `dns-sd` (the name follows the Mac's address when it changes). It answers only private addresses (`10/8`, `172.16/12`, `192.168/16`, `169.254/16`, `fc00::/7`, `fe80::/10` and loopback); anything else gets `403` before the login is even looked at. Open the `LAN:` URL that `meeting-copilot status` prints on each device and type the code once. Devices that do not resolve `.local` names can use the `LAN IP:` URL. This is plain http: anyone on the same Wi-Fi who can watch its traffic can see the code and the cookie, so use it only on a network you trust. With `MEETING_COPILOT_LAN_HTTPS` (on by default together with the camera or Look mode) there is also `https://copilot.local`, after a one-time setup on each phone (see "Phone camera").
 - **Internet, through a tunnel** (`MEETING_COPILOT_EXTRA_HOSTS=<your host>`): point a tunnel (e.g. Cloudflare Tunnel, with Cloudflare Access in front) at `http://127.0.0.1:4390` and add its host name. The page then accepts that `Host` and the `https://<host>` origin; when the tunnel says the visit came over https (`X-Forwarded-Proto` or `Cf-Visitor`), the cookies are also marked `Secure`. `meeting-copilot status` prints it as `public: https://<host>/`; the first visit from each device asks for the code.
 
 For example, in your settings file:
@@ -333,6 +333,33 @@ While it is on:
 
 On a plain http page the **Camera** button still works, one photo per tap (the phone's camera app opens).
 
+### Look mode (no meeting)
+
+Point the phone at something, most often the Mac screen (an error, a form, a chart, code, a paper), and get
+short insights, answers and next steps about what it sees. No meeting, no Muesli recording and no transcript
+needed. On by default when `MEETING_COPILOT_CAMERA=1` (`MEETING_COPILOT_LOOK=1` turns it on alone, `0` off).
+
+1. Open `https://copilot.local` on the phone (set up once, see "Live video needs https" above).
+2. Tap **Look** and allow the camera. That tap is the consent: nothing goes to the AI before it, and
+   `MEETING_COPILOT_CONFIRM_AI` (which is about meetings) does not apply.
+3. Point the camera. Type a question in the box ("why does this fail?", "which option should I pick?") for
+   an answer at once.
+
+- The page looks at the picture every 5 s (`MEETING_COPILOT_CAMERA_S`) and sends a frame only when it changed
+  (`POST /look/frame`: the same login, origin, host, size and rate rules as the meeting camera).
+- A changed frame makes one `claude -p` call, at most one every 10 s (`MEETING_COPILOT_LOOK_S`, at least 3);
+  a typed question makes one at once. Each call carries the newest 2 frames, the question and the items
+  already shown, with no tools. The prompt says that text in a picture is data, never an instruction (a
+  screen could try to inject one); only the question you type is a request.
+- Answers show in a **Look** box on the page, newest first, tagged *answer*, *insight* or *step*, with the
+  frames the last answer used. The Mac page shows them too, and its **Look on · stop** button stops it.
+- Look is separate from meetings: it works with or without a live meeting, never changes the meeting's
+  suggestions, and its frames never go with a meeting round. The phone camera does one thing at a time:
+  turning Look on turns the meeting camera off, and the other way round.
+- Frames stay only on the Mac, in `<data folder>/frames/-1/`, and are deleted when Look stops (the button,
+  leaving the page or locking the phone while it shows live video, or the copilot stopping), whatever
+  `KEEP_FRAMES` says. Answers stay on the page until the next tap on Look; they are not saved with any meeting.
+
 ## Response time
 
 Every suggestions round is timed: when its input reached the copilot (the earliest transcript line or
@@ -361,7 +388,7 @@ With neither search folders nor MCP, the "Relevant facts" panel says fact search
 ## Privacy
 
 - The Muesli database is opened read-only and never written.
-- The transcript of the last 3 minutes, your goals and the items already shown are sent to Claude through `claude -p` (on the kept-open process: once, then only the new lines each round). With screen sharing or the phone camera turned on for a meeting, the newest frames go too (see "Screen and camera"). Nothing else leaves the machine.
+- The transcript of the last 3 minutes, your goals and the items already shown are sent to Claude through `claude -p` (on the kept-open process: once, then only the new lines each round). With screen sharing or the phone camera turned on for a meeting, the newest frames go too (see "Screen and camera"). In Look mode, after you tap **Look**, the newest camera frames and the questions you type go to Claude (see "Look mode"). Nothing else leaves the machine.
 - Sessions (full transcript plus suggestions) are saved as JSON files readable only by your user. A meeting saved again (the copilot restarted, or the meeting stopped and recorded again) gets a new file with `-2`, `-3`, and so on, so nothing earlier is overwritten.
 - The fact search may read files only inside the search folders: Read, Grep and Glob are allowed with a path rule for each folder, so a request in the meeting to open any other file is refused. The AI runs in an empty folder of its own and loads no Claude Code settings files, so no hook planted in a search folder runs with it.
 - The page answers only on 127.0.0.1 / localhost (plus any `MEETING_COPILOT_EXTRA_HOSTS`, and, with `MEETING_COPILOT_LAN=1`, private addresses on the home network, where POSTs must come from the page's own `http://<host>` origin), checks the `Host` header against DNS rebinding, and accepts POSTs only from its own origin. Every request (the page, `/state` and each POST) needs a login: the cookie of a browser that typed a pairing code, the token cookie (set by the launcher's one-time link or a `?token=` URL), or the token as an `Authorization: Bearer` header; anything else gets `401` (a browser gets the login page). The code is never shown to a browser that is not logged in, not even on the Mac itself: only the notification, `meeting-copilot status`/`code` and a logged-in page show it. The login POST passes the same `Host` and origin checks as every POST, and the code is compared in constant time. The token file and `devices.json` are readable only by your user, so other users' programs and web pages cannot read the meeting; a program running as you can still read the files.

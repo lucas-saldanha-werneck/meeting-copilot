@@ -3,7 +3,7 @@
 
 One-shot mode (`--output-format json`): appends one JSON line per call to $FAKE_CLAUDE_LOG (argv, stdin,
 cwd) and prints a reply in that shape: structured_output when --json-schema is given (the suggestions
-call), a plain result otherwise (the fact-search call).
+call; the Look call, whose schema has "insight", gets LOOK), a plain result otherwise (the fact-search call).
 
 Kept-open mode (`--input-format stream-json`, the suggestions process): logs {"spawn": true, argv, pid}
 when it starts, then reads one JSON user message per line and, for each, logs {argv, stdin: <the
@@ -36,6 +36,9 @@ SUGGESTIONS = {
     }],
     "goals_covered": [0],
 }
+
+LOOK = {"items": [{"kind": "answer", "text": "The error says the port 8443 is already in use."},
+                  {"kind": "step", "text": "Run lsof -i :8443 and stop the old process."}]}
 
 
 def log(entry):
@@ -115,7 +118,8 @@ if os.environ.get("FAKE_CLAUDE_STDERR"):
 time.sleep(float(os.environ.get("FAKE_CLAUDE_SLEEP", "0")))   # a slow or stuck call
 
 if "--json-schema" in argv:
-    res = {"type": "result", "subtype": "success", "result": "", "structured_output": SUGGESTIONS,
+    look = '"insight"' in argv[argv.index("--json-schema") + 1]    # the Look mode call
+    res = {"type": "result", "subtype": "success", "result": "", "structured_output": LOOK if look else SUGGESTIONS,
            "total_cost_usd": 0.0}
     if stream:
         print(json.dumps({"type": "system", "subtype": "init"}))
