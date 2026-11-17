@@ -156,6 +156,7 @@ LOGIN_MAX_WRONG = 20        # wrong tries since the last login: then locked unti
 LOGIN_LINK_TTL_S = 60       # the launcher's one-time link for the Mac's own browser
 NOTIFY_EVERY_S = 20         # "send the code again" shows the notification at most this often
 DEVICE_COOKIE = "meeting_copilot_device"
+SECURE_PREFIX = "__Host-"   # the name of a cookie set over https (Secure, Path=/, no Domain: what __Host- requires)
 DEVICES_FILE = "devices.json"
 # What you typed in the page (objective, goals) and the "Turn on AI" click, kept on disk so a restart in
 # the middle of a meeting (`meeting-copilot stop`, a config change, launchd) gives them back.
@@ -649,8 +650,6 @@ class Settings:
             name = ""
         self.lan_name = name
         self.lan_ip = g("LAN_IP").strip()   # empty: found by itself, and followed when it changes
-        names = ([f"{name}.local"] if name else []) + ["localhost"]
-        self.lan_hosts_ok = {f"{n}:{self.lan_port}" for n in names} | (set(names) if self.lan_port == 80 else set())
         # Optional: the phone camera as context (CAMERA=1, then a toggle per meeting on the page).
         self.camera = _on(g("CAMERA", "0"))
         try:
@@ -670,6 +669,11 @@ class Settings:
         if self.lan_https and self.lan_https_port == self.lan_port:
             self.notices.append("MEETING_COPILOT_LAN_HTTPS_PORT is the same as LAN_PORT: LAN https is off")
             self.lan_https = False
+        # the Host names each LAN listener answers (an IP literal is checked per request: see lan_host_ok)
+        names = ([f"{name}.local"] if name else []) + ["localhost"]
+        self.lan_hosts_ok = {f"{n}:{self.lan_port}" for n in names} | (set(names) if self.lan_port == 80 else set())
+        self.lan_https_hosts_ok = ({f"{n}:{self.lan_https_port}" for n in names}
+                                   | (set(names) if self.lan_https_port == 443 else set()))
         self.openssl = _expand(g("OPENSSL").strip()) or shutil.which("openssl")
         self.tmutil = _tool(g("TMUTIL"), "tmutil")
         dns_sd = g("DNS_SD").strip()
@@ -946,7 +950,7 @@ class State:
                     "camera": S.camera, "camera_s": S.camera_s,
                     "camera_on": S.camera and self.meeting is not None and self.camera_for == self.meeting["id"],
                     "camera_last": self.camera_last, "camera_msg": self.camera_msg,
-                    "https": S.lan_https,
+                    "https": bool(S.lan_https and HTTPS_UP["port"]),   # the /setup page leads somewhere
                     "used": self.vision_used, "used_at": self.vision_used_at,
                     "frames_used": dict(self.frames_used),
                 },
@@ -1952,6 +1956,7 @@ FRAMES_DIR = "frames"
 FRAMES_KEEP = 6            # per source and meeting, on disk
 FRAMES_PER_ROUND = 3       # newest frames that go with one suggestions call
 FRAME_MAX_PX = 1280        # longest side of a frame sent to the AI
+CAMERA_AI_OFF = "AI is off for this meeting: turn on AI first, then the camera"
 CAMERA_UPLOAD_MAX = 4_000_000   # a camera frame from the phone page, bytes (the page sends a ~200 KB JPEG)
 FRAME_STALE_S = 180        # a frame not seen again for this long no longer goes to the AI
 PNG_SIG = b"\x89PNG\r\n\x1a\n"
@@ -2794,8 +2799,7 @@ def lan_host_ok(host: str, s: Settings, https: bool = False) -> bool:
     An IP literal is safe against DNS rebinding, which needs a host name the attacker controls."""
     host = host.strip().lower()
     lport, default = (s.lan_https_port, 443) if https else (s.lan_port, 80)
-    names = ([f"{s.lan_name}.local"] if s.lan_name else []) + ["localhost"]
-    if host in {f"{n}:{lport}" for n in names} | (set(names) if lport == default else set()):
+    if host in (s.lan_https_hosts_ok if https else s.lan_hosts_ok):
         return True
     if not host or any(c in host for c in "/?#@\\ "):
         return False
@@ -2809,11 +2813,10 @@ def lan_host_ok(host: str, s: Settings, https: bool = False) -> bool:
     return lan_client_ok(u.hostname)
 
 
-def _no_default_port(hostport: str) -> str:
-    for suffix in (":80", ":443"):
-        if hostport.endswith(suffix):
-            return hostport[:-len(suffix)]
-    return hostport
+def _no_default_port(hostport: str, https: bool) -> str:
+    """Drops the scheme's own default port (:443 for https, :80 for http), never the other one."""
+    suffix = ":443" if https else ":80"
+    return hostport[:-len(suffix)] if hostport.endswith(suffix) else hostport
 
 
 def lan_origin_ok(origin: str | None, host: str, https: bool = False) -> bool:
@@ -2823,7 +2826,7 @@ def lan_origin_ok(origin: str | None, host: str, https: bool = False) -> bool:
         return False
     scheme = "https://" if https else "http://"
     o, want = origin.strip().lower(), (scheme + host.strip().lower())
-    return o.startswith(scheme) and _no_default_port(o) == _no_default_port(want)
+    return o.startswith(scheme) and _no_default_port(o, https) == _no_default_port(want, https)
 
 
 def lan_ip() -> str | None:
@@ -2856,10 +2859,20 @@ TLS_DIR = "tls"
 SETUP_PAGE = HERE / "setup.html"
 HTTPS_UP = {"port": 0}     # the port of the running TLS listener (0: none), for the redirect and `status`
 SETUP_PATHS = ("/setup", "/ca.crt", "/ca.mobileconfig", "/ping")
+HTTPS_COOKIE = "mc_https"  # set by the /setup page (JavaScript) to ca_tag() once https works on that phone
 
 
 def tls_dir() -> Path:
     return S.data_dir / TLS_DIR
+
+
+def ca_tag() -> str:
+    """A short fingerprint of the current CA certificate ("" when there is none): the value of the
+    mc_https cookie, so a phone set up for an older CA is not sent to https any more."""
+    try:
+        return hashlib.sha256((tls_dir() / "ca.crt").read_bytes()).hexdigest()[:16]
+    except OSError:
+        return ""
 
 
 def _exclude_from_backup(d: Path) -> None:
@@ -3081,13 +3094,16 @@ class Page(BaseHTTPRequestHandler):
 
     def _authed(self) -> bool:
         """The token cookie, a paired device's cookie, or the token as `Authorization: Bearer` (scripts)."""
-        return (any(self._token_ok(v) for v in self._cookies(TOKEN_COOKIE))
-                or any(DEVICES.ok(v) for v in self._cookies(DEVICE_COOKIE))
+        return (any(self._token_ok(v) for n in (TOKEN_COOKIE, SECURE_PREFIX + TOKEN_COOKIE) for v in self._cookies(n))
+                or any(DEVICES.ok(v) for n in (DEVICE_COOKIE, SECURE_PREFIX + DEVICE_COOKIE) for v in self._cookies(n))
                 or self._token_ok(self._bearer()))
 
     def _cookie(self, name: str, value: str) -> str:
+        """Over https the cookie is Secure and has its own name (__Host-<name>): a browser never lets an http
+        page overwrite a Secure cookie of the same name, so with one name, a phone that once logged in over
+        https could never log in again over http (https turned off, or the certificate gone): a login loop."""
         cookie = f"{name}={value}; Path=/; Max-Age={DEVICE_MAX_AGE_S}; HttpOnly; SameSite=Strict"
-        return cookie + "; Secure" if self._https() else cookie
+        return f"{SECURE_PREFIX}{cookie}; Secure" if self._https() else cookie
 
     def _navigation(self) -> bool:
         """A browser opening a page (not a script, not the page's own fetch of /state)."""
@@ -3171,6 +3187,7 @@ class Page(BaseHTTPRequestHandler):
                 name = f"{S.lan_name}.local"
                 body = SETUP_PAGE.read_text(encoding="utf-8")
                 body = body.replace("__NAME__", name).replace("__HTTPS_PORT__", str(S.lan_https_port))
+                body = body.replace("__CA_TAG__", ca_tag())
                 self._send(200, body.encode(), "text/html; charset=utf-8")
             elif path == "/ca.crt":
                 self._send(200, (d / "ca.crt").read_bytes(), "application/x-x509-ca-cert",
@@ -3184,9 +3201,17 @@ class Page(BaseHTTPRequestHandler):
 
     def _to_https(self, path: str) -> bool:
         """On the http LAN listener, a browser that proved it trusts the CA (the /setup page sets the
-        mc_https cookie after a successful https probe) goes on to https. Never for a script or a POST."""
-        if not (HTTPS_UP["port"] and self._navigation() and "1" in self._cookies("mc_https")):
+        mc_https cookie to the CA's tag after a successful https probe) goes on to https. Never for a script
+        or a POST. A cookie for another CA (`cert --renew` made a new one) is cleared and the phone is sent
+        to /setup to install the new CA, instead of to an https page it no longer trusts."""
+        got = self._cookies(HTTPS_COOKIE)
+        if not (HTTPS_UP["port"] and got and self._navigation()):
             return False
+        tag = ca_tag()
+        if not tag or tag not in got:
+            self._send(302, b"", "text/plain",
+                       {"Location": "/setup", "Set-Cookie": f"{HTTPS_COOKIE}=; Path=/; Max-Age=0; SameSite=Lax"})
+            return True
         try:
             host = urlsplit("//" + self.headers.get("Host", "")).hostname or ""
         except ValueError:
@@ -3204,7 +3229,7 @@ class Page(BaseHTTPRequestHandler):
         try:
             body = json.loads(raw or b"{}")
             code = str(body.get("code", "")) if isinstance(body, dict) else ""
-        except json.JSONDecodeError:
+        except ValueError:   # bad JSON, or bytes that are not UTF-8/16/32 (UnicodeDecodeError)
             code = ""
         result, n = PAIR.try_code(code[:20])
         if result == "ok":
@@ -3231,18 +3256,20 @@ class Page(BaseHTTPRequestHandler):
         Kept only while the camera is on for the live meeting and the AI is allowed for it."""
         if declared > CAMERA_UPLOAD_MAX:
             return self._json(413, {"error": f"frame over {CAMERA_UPLOAD_MAX // 1_000_000} MB"})
+        if not raw or image_kind(raw) is None:   # before the rate slot: a bad upload does not use it up
+            return self._json(415, {"error": "not a JPEG or PNG image"})
         t = now()
         with E.lock:
             mid = (E.meeting or {}).get("id")
             if not S.camera or mid is None or E.camera_for != mid:
                 return self._json(409, {"error": "the camera is not on for this meeting"})
             if not E.ai_allowed(mid):
-                return self._json(409, {"error": "AI is off for this meeting: nothing is kept"})
+                # the page stops its stream on a 409: the Mac turns the camera off too, so both agree
+                E.camera_for, E.camera_msg = None, CAMERA_AI_OFF
+                return self._json(409, {"error": CAMERA_AI_OFF})
             if t - E.camera_last < S.camera_s / 2:
-                return self._json(429, {"error": "too many frames"})
+                return self._json(429, {"error": "too soon after the last frame: try again in a few seconds"})
             E.camera_last = t
-        if not raw or image_kind(raw) is None:
-            return self._json(415, {"error": "not a JPEG or PNG image"})
         try:
             kept = FRAMES.add(mid, "camera", raw, t)   # None: looks like the previous one (only kept current)
         except ValueError as ex:
@@ -3271,34 +3298,40 @@ class Page(BaseHTTPRequestHandler):
     def do_POST(self):
         # The body is read before any answer, refusals included: closing a connection with unread
         # bytes resets it, and the client may never see the 403/401.
+        # The checks need only the headers, so they run first: only a logged-in camera upload that passed
+        # them may send a body up to CAMERA_UPLOAD_MAX; everything else is read up to 100 KB.
         try:
             n = max(0, int(self.headers.get("Content-Length", "0") or 0))
         except ValueError:
             n = 0
-        upload = urlsplit(self.path).path == "/camera/frame"
-        cap = CAMERA_UPLOAD_MAX if upload else 100_000
+        path, given, _ = self._route()
+        upload = path == "/camera/frame"
+        client_ok = self._client_ok()
+        # no CORS headers: another site can neither read this nor send JSON here
+        want_type = "image/" if upload else "application/json"
+        page_ok = client_ok and self._host_ok() and self._origin_ok() \
+            and self.headers.get("Content-Type", "").startswith(want_type)
+        open_path = path in ("/login", "/login/code")
+        authed = page_ok and not open_path and (self._token_ok(given) if given is not None else self._authed())
+        cap = CAMERA_UPLOAD_MAX if upload and authed else 100_000
         if n > cap:
             self.close_connection = True
         raw = self.rfile.read(min(n, cap)) if n else b""
-        if not self._client_ok():
+        if not client_ok:
             return self._send(403, b"network", "text/plain")
-        # no CORS headers: another site can neither read this nor send JSON here
-        want_type = "image/" if upload else "application/json"
-        if not self._host_ok() or not self._origin_ok() \
-                or not self.headers.get("Content-Type", "").startswith(want_type):
+        if not page_ok:
             return self._send(403, b"origin", "text/plain")
-        path, given, _ = self._route()
         if path == "/login":
             return self._login(raw)
         if path == "/login/code":
             return self._send_code()
-        if not (self._token_ok(given) if given is not None else self._authed()):
+        if not authed:
             return self._deny()
         if upload:
             return self._camera_frame(raw, n)
         try:
             body = json.loads(raw or b"{}")
-        except json.JSONDecodeError:
+        except ValueError:   # bad JSON, or bytes that are not UTF-8/16/32 (UnicodeDecodeError)
             return self._send(400, b"json", "text/plain")
         if not isinstance(body, dict):
             return self._send(400, b"json", "text/plain")
@@ -3334,15 +3367,19 @@ class Page(BaseHTTPRequestHandler):
                                       "text/plain")
                 if body.get("on") is not True:
                     E.camera_for, E.camera_msg = None, ""
-                elif isinstance(mid, int) and not isinstance(mid, bool) and E.meeting and mid == E.meeting["id"]:
-                    E.camera_for, E.camera_msg = mid, ""
-                else:
+                elif not (isinstance(mid, int) and not isinstance(mid, bool) and E.meeting and mid == E.meeting["id"]):
                     return self._send(409, b"meeting changed", "text/plain")
+                elif not E.ai_allowed(mid):   # CONFIRM_AI: no frame would be kept, so the camera stays off
+                    return self._send(409, CAMERA_AI_OFF.encode(), "text/plain; charset=utf-8")
+                else:
+                    E.camera_for, E.camera_msg = mid, ""
             elif path == "/ai":
                 # {"on": true, "meeting": <id shown on the page> | null (= the next meeting)}
                 mid = body.get("meeting")
                 if body.get("on") is not True:
                     E.ai_for = None
+                    if S.confirm_ai:   # no frame would be kept any more: the camera goes off with the AI
+                        E.camera_for = None
                 elif mid is None and E.meeting is None:
                     E.ai_for, E.ai_next_at = "next", now()
                 elif isinstance(mid, int) and not isinstance(mid, bool) and E.meeting and mid == E.meeting["id"]:

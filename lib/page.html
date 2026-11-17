@@ -196,19 +196,21 @@ function camPaint() {
   const kb = Math.round(cam.bytes / 1024);
   camEl("camstat").innerHTML = (on ? `<span class="on">Camera on</span> · a frame every ${(last.vision || {}).camera_s || 5} s when the picture changed · sent ${cam.n} (${kb} KB)` : "") +
     (cam.msg ? `<div style="color:var(--corr)">${esc(cam.msg)}</div>` : "") +
-    (!camSecure && (last.vision || {}).camera_on ? `<div>Live video needs https: set this phone up once at <a href="/setup" style="color:var(--say)">/setup</a>. Until then: one photo per tap.</div>` : "");
+    (!camSecure && (last.vision || {}).camera_on ? ((last.vision || {}).https
+      ? `<div>Live video needs https: set this phone up once at <a href="/setup" style="color:var(--say)">/setup</a>. Until then: one photo per tap.</div>`
+      : `<div>Live video needs https (off on this Mac): one photo per tap.</div>`) : "");
 }
-async function camSend(blob) {
+async function camSend(blob, manual) {
   if (cam.busy) return;
   cam.busy = true;
   try {
     const r = await fetch("/camera/frame", { method: "POST", headers: { "Content-Type": blob.type || "image/jpeg" }, body: blob });
     if (r.status === 401) { location.reload(); return; }
     if (r.ok) { cam.n++; cam.bytes += blob.size; cam.msg = ""; cam.lastSent = Date.now(); }
-    else if (r.status !== 429) {
+    else if (r.status !== 429 || manual) {   // a live frame that came too soon is just skipped; a photo says so
       let t = ""; try { t = (await r.json()).error || ""; } catch {}
       cam.msg = t || "the Mac did not take the frame";
-      if (r.status === 409) { camStopLocal(); }
+      if (r.status === 409) { camStopLocal(); refresh(); }
     }
   } catch { cam.msg = "could not reach the Mac"; }
   finally { cam.busy = false; camPaint(); }
@@ -255,9 +257,13 @@ async function camStart() {
 }
 async function camToggle() {
   const on = !((last.vision || {}).camera_on);
-  let ok = false;
-  try { ok = (await post("/camera", { on, meeting: last.meeting ? last.meeting.id : null })).ok; } catch {}
-  if (!ok) { cam.msg = "did not work, try again"; camPaint(); return; }
+  let r = null;
+  try { r = await post("/camera", { on, meeting: last.meeting ? last.meeting.id : null }); } catch {}
+  if (!r || !r.ok) {
+    let t = ""; if (r && r.status === 409) { try { t = await r.text(); } catch {} }
+    cam.msg = (t && t !== "meeting changed") ? t : "did not work, try again";
+    camPaint(); refresh(); return;
+  }
   if (on) { await camStart(); } else { camStopLocal(); }
   refresh();
 }
@@ -284,16 +290,17 @@ camEl("camfile").onchange = async ev => {
     const k = Math.min(1, 1280 / Math.max(bmp.width, bmp.height));
     const c = document.createElement("canvas"); c.width = Math.round(bmp.width * k); c.height = Math.round(bmp.height * k);
     c.getContext("2d").drawImage(bmp, 0, 0, c.width, c.height);
-    c.toBlob(b => { if (b) camSend(b); }, "image/jpeg", 0.7);
+    c.toBlob(b => { if (b) camSend(b, true); }, "image/jpeg", 0.7);
   } catch { cam.msg = "could not read that photo"; camPaint(); }
 };
-// leaving the page (or the phone locking) turns the camera off, on the Mac too
-const camHide = () => { if (cam.stream) { camStopLocal(); post("/camera", { on: false }).catch(() => {}); } };
+// leaving the page (or the phone locking) turns the camera off, on the Mac too (keepalive: the request
+// still goes out while the page is being frozen or closed)
+const camHide = () => { if (cam.stream) { camStopLocal(); post("/camera", { on: false }, true).catch(() => {}); } };
 document.addEventListener("visibilitychange", () => { if (document.hidden) camHide(); });
 window.addEventListener("pagehide", camHide);
 
-const post = (path, body) =>
-  fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+const post = (path, body, keepalive) =>
+  fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), keepalive: !!keepalive });
 
 document.getElementById("ai").onclick = async () => {
   const body = { on: !(last.ai_on || last.ai_next), meeting: last.live && last.meeting ? last.meeting.id : null };

@@ -42,6 +42,7 @@
 
 <script>
 const host = location.hostname, port = "__HTTPS_PORT__";   // the copilot's https port on this network
+const caTag = "__CA_TAG__";   // which CA this phone trusts: a new CA (cert --renew) needs the set-up again
 document.getElementById("test").onclick = async () => {
   const res = document.getElementById("res");
   res.className = "dim"; res.textContent = "Testing...";
@@ -49,7 +50,7 @@ document.getElementById("test").onclick = async () => {
   const base = "https://" + host + (port && port !== "443" ? ":" + port : "");
   try {
     await fetch(base + "/ping", { mode: "no-cors", cache: "no-store" });
-    document.cookie = "mc_https=1; Path=/; Max-Age=31536000; SameSite=Lax";
+    document.cookie = "mc_https=" + caTag + "; Path=/; Max-Age=31536000; SameSite=Lax";
     res.className = "ok";
     res.innerHTML = 'It works. This phone now goes to https by itself: <a href="' + base + '/" style="color:var(--say)">open the copilot</a>.';
   } catch {

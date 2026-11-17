@@ -1057,6 +1057,7 @@ class Lan(unittest.TestCase):
             code, hdrs, _ = self.req(port, f"/?token={self.TOK}", "copilot.example.com", extra, auth=False)
             self.assertEqual(code, 303)
             self.assertEqual("; Secure" in hdrs["Set-Cookie"], secure, extra)
+            self.assertEqual(hdrs["Set-Cookie"].startswith("__Host-"), secure, extra)
         self.assertEqual(self.req(port, "/", "copilot.example.com")[0], 200)
 
     @unittest.skipIf(WIN, NO_BASH_WHY)
@@ -1298,7 +1299,7 @@ class LanHttps(unittest.TestCase):
 
     def test_settings(self):
         s = copilot.S
-        self.assertTrue((s.camera, s.lan_https), (True, True))
+        self.assertEqual((s.camera, s.lan_https), (True, True))
         self.assertEqual((s.camera_s, s.lan_https_port), (2.0, 8443))
         self.assertFalse(copilot.Settings({"MEETING_COPILOT_CAMERA": "1"}).lan_https)   # no LAN: no https listener
         self.assertFalse(copilot.Settings({"MEETING_COPILOT_LAN": "1"}).lan_https)      # no camera: off by default
@@ -1321,6 +1322,20 @@ class LanHttps(unittest.TestCase):
         self.assertTrue(copilot.lan_origin_ok("https://copilot.local:8443", "copilot.local:8443", https=True))
         self.assertFalse(copilot.lan_origin_ok("http://copilot.local:8443", "copilot.local:8443", https=True))
         self.assertFalse(copilot.lan_origin_ok("https://copilot.local:8080", "copilot.local:8080"))
+        # only the scheme's own default port is the same as no port
+        self.assertTrue(copilot.lan_origin_ok("https://copilot.local:443", "copilot.local", https=True))
+        self.assertTrue(copilot.lan_origin_ok("http://copilot.local:80", "copilot.local"))
+        self.assertFalse(copilot.lan_origin_ok("https://copilot.local:80", "copilot.local", https=True))
+        self.assertFalse(copilot.lan_origin_ok("https://copilot.local", "copilot.local:80", https=True))
+        self.assertFalse(copilot.lan_origin_ok("http://copilot.local:443", "copilot.local"))
+        self.assertFalse(copilot.lan_origin_ok("http://copilot.local", "copilot.local:443"))
+        # the Host sets are made once, per listener
+        self.assertEqual(S.lan_https_hosts_ok, {"copilot.local:8443", "localhost:8443"})
+        self.assertEqual(S.lan_hosts_ok, {"copilot.local:8080", "localhost:8080"})
+        s443 = copilot.Settings({"MEETING_COPILOT_LAN": "1", "MEETING_COPILOT_CAMERA": "1"})
+        self.assertEqual(s443.lan_https_hosts_ok, {"copilot.local:443", "localhost:443", "copilot.local", "localhost"})
+        self.assertTrue(copilot.lan_host_ok("copilot.local", s443, https=True))
+        self.assertFalse(copilot.lan_host_ok("copilot.local:80", s443, https=True))
 
     def test_https_listener_needs_the_login_and_serves_setup_without_it(self):
         port = self.serve()
@@ -1344,14 +1359,68 @@ class LanHttps(unittest.TestCase):
         copilot.HTTPS_UP["port"] = 8443
         port = self.serve(tls=False)
         nav = {"Sec-Fetch-Mode": "navigate", "Accept": "text/html"}
-        code, hdrs, _ = self.req(port, "/?x=1", "copilot.local:8080", {**nav, "Cookie": "mc_https=1"},
+        tag = copilot.ca_tag()
+        self.assertRegex(tag, r"^[0-9a-f]{16}$")
+        # the /setup page sets the cookie to the current CA's tag
+        code, _, body = self.req(port, "/setup", "copilot.local:8080", auth=False, tls=False)
+        self.assertEqual(code, 200)
+        self.assertIn(f'const caTag = "{tag}"'.encode(), body)
+        self.assertNotIn(b"__CA_TAG__", body)
+        code, hdrs, _ = self.req(port, "/?x=1", "copilot.local:8080", {**nav, "Cookie": f"mc_https={tag}"},
                                  auth=False, tls=False)
         self.assertEqual((code, hdrs["Location"]), (302, "https://copilot.local:8443/?x=1"))
         # not set up yet (no cookie), or a script: no redirect
         self.assertEqual(self.req(port, "/", "copilot.local:8080", nav, tls=False)[0], 200)
-        code, _, body = self.req(port, "/setup", "copilot.local:8080", auth=False, tls=False)
-        self.assertEqual(code, 200)
+        self.assertEqual(self.req(port, "/state", "copilot.local:8080", {"Cookie": f"mc_https={tag}; "
+                                  f"meeting_copilot_token={self.TOK}"}, tls=False)[0], 200)
+        # a new CA (cert --renew): the old cookie no longer goes to https; the phone goes to /setup, cookie cleared
+        copilot.tls_issue()
+        self.assertNotEqual(copilot.ca_tag(), tag)
+        for old in (tag, "1"):
+            code, hdrs, _ = self.req(port, "/", "copilot.local:8080", {**nav, "Cookie": f"mc_https={old}"},
+                                     auth=False, tls=False)
+            self.assertEqual((code, hdrs["Location"]), (302, "/setup"), old)
+            self.assertIn("mc_https=;", hdrs["Set-Cookie"])
+            self.assertIn("Max-Age=0", hdrs["Set-Cookie"])
+        # https listener not running: never a redirect
         copilot.HTTPS_UP["port"] = 0
+        self.assertEqual(self.req(port, "/", "copilot.local:8080",
+                                  {**nav, "Cookie": f"mc_https={tag}; meeting_copilot_token={self.TOK}"},
+                                  tls=False)[0], 200)
+
+    def test_https_cookies_have_their_own_name(self):
+        """A Secure cookie set over https would block the same name over http (a login loop once https stops):
+        over https the cookies are __Host-<name>, over http the plain name, and both log in."""
+        tls, plain = self.serve(), self.serve(tls=False)
+        code, hdrs, _ = self.req(tls, f"/?token={self.TOK}", "copilot.local:8443", auth=False)
+        self.assertEqual(code, 303)
+        self.assertTrue(hdrs["Set-Cookie"].startswith(f"__Host-meeting_copilot_token={self.TOK};"), hdrs["Set-Cookie"])
+        self.assertIn("; Secure", hdrs["Set-Cookie"])
+        self.assertIn("Path=/;", hdrs["Set-Cookie"])
+        self.assertNotIn("Domain", hdrs["Set-Cookie"])
+        code, hdrs, _ = self.req(plain, f"/?token={self.TOK}", "copilot.local:8080", auth=False, tls=False)
+        self.assertTrue(hdrs["Set-Cookie"].startswith(f"meeting_copilot_token={self.TOK};"), hdrs["Set-Cookie"])
+        self.assertNotIn("Secure", hdrs["Set-Cookie"])
+        # either name logs in, on either listener; a wrong value under the https name does not
+        self.assertEqual(self.req(tls, "/state", "copilot.local:8443",
+                                  {"Cookie": f"__Host-meeting_copilot_token={self.TOK}"})[0], 200)
+        self.assertEqual(self.req(plain, "/state", "copilot.local:8080",
+                                  {"Cookie": f"meeting_copilot_token={self.TOK}"}, tls=False)[0], 200)
+        self.assertEqual(self.req(tls, "/state", "copilot.local:8443",
+                                  {"Cookie": "__Host-meeting_copilot_token=wrong"})[0], 401)
+        # a paired device over https gets the __Host- device cookie, and it works
+        old = (copilot.PAIR, copilot.DEVICES)
+        self.addCleanup(lambda: (setattr(copilot, "PAIR", old[0]), setattr(copilot, "DEVICES", old[1])))
+        copilot.PAIR = copilot.Pairing()
+        copilot.DEVICES = copilot.Devices(copilot.Path(self.t) / "devices.json")
+        code_, _, _ = copilot.PAIR.get_or_create()
+        h = {"Content-Type": "application/json", "Origin": "https://copilot.local:8443"}
+        code, hdrs, _ = self.req(tls, "/login", "copilot.local:8443", h, "POST",
+                                 json.dumps({"code": code_}).encode(), auth=False)
+        self.assertEqual(code, 200)
+        dev = hdrs["Set-Cookie"].split(";")[0]
+        self.assertTrue(dev.startswith("__Host-meeting_copilot_device="), dev)
+        self.assertEqual(self.req(tls, "/state", "copilot.local:8443", {"Cookie": dev})[0], 200)
 
     def test_camera_upload_rules(self):
         port = self.serve()
@@ -1386,10 +1455,21 @@ class LanHttps(unittest.TestCase):
                               {"Content-Type": "image/png", "Origin": "https://copilot.local:8443"}, "POST", img)
         self.assertEqual(code, 429)
         copilot.E.camera_last = 0.0
-        # CONFIRM_AI and the AI not on: nothing kept
+        # a refused upload (not an image) does not use up the rate slot
+        h = {"Content-Type": "image/png", "Origin": "https://copilot.local:8443"}
+        self.assertEqual(self.req(port, "/camera/frame", "copilot.local:8443", h, "POST", b"<x>")[0], 415)
+        self.assertEqual(self.req(port, "/camera/frame", "copilot.local:8443", h, "POST",
+                                  png_bytes(64, 48, (9, 9, 9)))[0], 200)
+        copilot.E.camera_last = 0.0
+        # CONFIRM_AI and the AI not on: nothing kept, and the camera goes off on the Mac too (the page stops)
         self.use(CONFIRM_AI="1")
-        self.assertEqual(self.upload(port, png_bytes(64, 48, (1, 2, 3)))[0], 409)
-        self.assertEqual(len(copilot.FRAMES.items), 2)
+        code, r = self.upload(port, png_bytes(64, 48, (1, 2, 3)))
+        self.assertEqual(code, 409)
+        self.assertIn("turn on AI", r["error"])
+        self.assertEqual(len(copilot.FRAMES.items), 3)
+        self.assertIsNone(copilot.E.camera_for)
+        self.assertFalse(copilot.E.public()["vision"]["camera_on"])
+        copilot.E.camera_for = 7
         # CAMERA off in the settings: refused even when the toggle says on
         self.use(CAMERA="0")
         self.assertEqual(self.upload(port, img)[0], 409)
@@ -1408,8 +1488,40 @@ class LanHttps(unittest.TestCase):
         self.assertTrue(copilot.E.public()["vision"]["camera_on"])
         self.assertEqual(toggle({"on": False}), 200)
         self.assertIsNone(copilot.E.camera_for)
+        # CONFIRM_AI: no camera while the AI is off for the meeting (nothing would be kept)
+        self.use(CONFIRM_AI="1")
+        code, _, body = self.req(port, "/camera", "copilot.local:8443", h, "POST",
+                                 json.dumps({"on": True, "meeting": 7}).encode())
+        self.assertEqual(code, 409)
+        self.assertIn(b"turn on AI", body)
+        self.assertIsNone(copilot.E.camera_for)
+        copilot.E.ai_for = 7
+        self.assertEqual(toggle({"on": True, "meeting": 7}), 200)
+        self.assertEqual(copilot.E.camera_for, 7)
+        ai = self.req(port, "/ai", "copilot.local:8443", h, "POST", json.dumps({"on": False}).encode())[0]
+        self.assertEqual(ai, 200)
+        self.assertIsNone(copilot.E.camera_for)                        # the AI off takes the camera with it
         self.use(CAMERA="0")
         self.assertEqual(toggle({"on": True, "meeting": 7}), 409)
+
+    def test_large_body_only_after_the_checks(self):
+        """Host, Origin, type and login are checked from the headers before the body is read: only a logged-in
+        camera upload may send more than 100 KB. (With the old order the server waited for all 2 MB.)"""
+        port = self.serve()
+        copilot.E.camera_for = 7
+        part = b"\xff\xd8\xff" + b"\0" * 99_997                                # 100 KB sent, 2 MB declared
+        self.assertEqual(self.upload(port, part, ctype="image/jpeg", auth=False, length=2_000_000)[0], 401)
+        self.assertEqual(self.upload(port, part, ctype="image/jpeg", origin="https://evil.example",
+                                     length=2_000_000)[0], 403)
+        self.assertEqual(self.upload(port, part, ctype="image/jpeg", host="evil.example:8443",
+                                     length=2_000_000)[0], 403)
+        h = {"Content-Type": "application/json", "Origin": "https://copilot.local:8443",
+             "Content-Length": "2000000"}
+        self.assertEqual(self.req(port, "/mute", "copilot.local:8443", h, "POST", part)[0], 400)   # not UTF-8
+        self.assertEqual(self.req(port, "/mute", "copilot.local:8443", h, "POST", b"x" * 100_000)[0], 400)
+        # a logged-in upload still may be large (up to CAMERA_UPLOAD_MAX)
+        big = png_bytes(64, 48, (40, 40, 40)) + b"\0" * 1_500_000
+        self.assertEqual(self.upload(port, big)[0], 200)
 
     def test_tls_ready_and_start_listener(self):
         ok, why = copilot.tls_ready()
