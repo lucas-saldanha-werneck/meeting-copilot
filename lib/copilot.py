@@ -37,6 +37,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import ssl
 import threading
 import time
 import traceback
@@ -47,7 +48,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
-__version__ = "0.10.0"
+import tlscert
+
+__version__ = "0.11.0"
 
 HERE = Path(__file__).resolve().parent
 PAGE = HERE / "page.html"
@@ -648,6 +651,23 @@ class Settings:
         self.lan_ip = g("LAN_IP").strip()   # empty: found by itself, and followed when it changes
         names = ([f"{name}.local"] if name else []) + ["localhost"]
         self.lan_hosts_ok = {f"{n}:{self.lan_port}" for n in names} | (set(names) if self.lan_port == 80 else set())
+        # Optional: https on the LAN listener, with a certificate from a local CA (see lib/tlscert.py), so a
+        # phone's camera can be used (a page at http://copilot.local is not a secure context).
+        self.lan_https = _on(g("LAN_HTTPS", "0"))
+        try:
+            self.lan_https_port = int(g("LAN_HTTPS_PORT", "443"))
+        except ValueError:
+            self.notices.append(f"MEETING_COPILOT_LAN_HTTPS_PORT is not a number, using 443: {g('LAN_HTTPS_PORT')}")
+            self.lan_https_port = 443
+        self.openssl = _expand(g("OPENSSL").strip()) or shutil.which("openssl")
+        self.tmutil = _tool(g("TMUTIL"), "tmutil")
+        # Optional: the phone camera as context (CAMERA=1, then a toggle per meeting on the page).
+        self.camera = _on(g("CAMERA", "0"))
+        try:
+            self.camera_s = max(2.0, float(g("CAMERA_S", "5")))
+        except ValueError:
+            self.notices.append(f"MEETING_COPILOT_CAMERA_S is not a number, using 5: {g('CAMERA_S')}")
+            self.camera_s = 5.0
         dns_sd = g("DNS_SD").strip()
         self.dns_sd = _expand(dns_sd) if dns_sd else (shutil.which("dns-sd") if sys.platform == "darwin" else None)
         # the pairing code notification: osascript on macOS; OSASCRIPT=off turns it off
@@ -849,6 +869,9 @@ class State:
         # result, total, attempts, turn, seeded, ok}; shown in /state as ai_rounds
         self.rounds: list[dict] = []
         self.screen_for: int | None = None   # SCREEN: the meeting id the user shares the screen with the AI for
+        self.camera_for: int | None = None   # CAMERA: the meeting id the phone camera is on for
+        self.camera_last = 0.0               # when the last camera frame arrived
+        self.camera_msg = ""
         self.reset(None)
 
     def reset(self, meeting: dict | None) -> None:
@@ -916,6 +939,10 @@ class State:
                     "screen_on": S.screen and self.meeting is not None and self.screen_for == self.meeting["id"],
                     "screen_msg": self.screen_msg,
                     "screen_last": self.screen_last,
+                    "camera": S.camera, "camera_s": S.camera_s,
+                    "camera_on": S.camera and self.meeting is not None and self.camera_for == self.meeting["id"],
+                    "camera_last": self.camera_last, "camera_msg": self.camera_msg,
+                    "https": S.lan_https,
                     "used": self.vision_used, "used_at": self.vision_used_at,
                     "frames_used": dict(self.frames_used),
                 },
@@ -1921,6 +1948,7 @@ FRAMES_DIR = "frames"
 FRAMES_KEEP = 6            # per source and meeting, on disk
 FRAMES_PER_ROUND = 3       # newest frames that go with one suggestions call
 FRAME_MAX_PX = 1280        # longest side of a frame sent to the AI
+CAMERA_UPLOAD_MAX = 8_000_000   # a camera frame from the phone page, bytes
 FRAME_STALE_S = 180        # a frame not seen again for this long no longer goes to the AI
 PNG_SIG = b"\x89PNG\r\n\x1a\n"
 
@@ -2148,7 +2176,7 @@ def _write_private_bytes(path: Path, data: bytes) -> None:
 
 def vision_configured() -> bool:
     """Is any picture source switched on in the config (the AI process is told how to treat images)?"""
-    return bool(S.screen)
+    return bool(S.screen or S.camera)
 
 
 def vision_sources() -> set[str]:
@@ -2157,6 +2185,8 @@ def vision_sources() -> set[str]:
     out = set()
     if mid is not None and S.screen and E.screen_for == mid:
         out.add("screen")
+    if mid is not None and S.camera and E.camera_for == mid:
+        out.add("camera")
     return out
 
 
@@ -2753,12 +2783,15 @@ def lan_client_ok(ip: str) -> bool:
     return a is not None and (a.is_loopback or any(a.version == n.version and a in n for n in LAN_NETS))
 
 
-def lan_host_ok(host: str, s: Settings) -> bool:
-    """Host header check of the LAN listener: <name>.local / localhost, or a LAN IP literal, on our port.
+def lan_host_ok(host: str, s: Settings, https: bool = False) -> bool:
+    """Host header check of the LAN listener (https: the TLS one): <name>.local / localhost, or a LAN IP
+    literal, on that listener's port.
 
     An IP literal is safe against DNS rebinding, which needs a host name the attacker controls."""
     host = host.strip().lower()
-    if host in s.lan_hosts_ok:
+    lport, default = (s.lan_https_port, 443) if https else (s.lan_port, 80)
+    names = ([f"{s.lan_name}.local"] if s.lan_name else []) + ["localhost"]
+    if host in {f"{n}:{lport}" for n in names} | (set(names) if lport == default else set()):
         return True
     if not host or any(c in host for c in "/?#@\\ "):
         return False
@@ -2767,18 +2800,26 @@ def lan_host_ok(host: str, s: Settings) -> bool:
         port = u.port
     except ValueError:
         return False
-    if (port or 80) != s.lan_port or not u.hostname:
+    if (port or default) != lport or not u.hostname:
         return False
     return lan_client_ok(u.hostname)
 
 
-def _no80(hostport: str) -> str:
-    return hostport[:-3] if hostport.endswith(":80") else hostport
+def _no_default_port(hostport: str) -> str:
+    for suffix in (":80", ":443"):
+        if hostport.endswith(suffix):
+            return hostport[:-len(suffix)]
+    return hostport
 
 
-def lan_origin_ok(origin: str | None, host: str) -> bool:
-    """A POST on the LAN listener must come from the page itself: Origin http://<the Host it was sent to>."""
-    return bool(origin and host) and _no80(origin.strip().lower()) == _no80("http://" + host.strip().lower())
+def lan_origin_ok(origin: str | None, host: str, https: bool = False) -> bool:
+    """A POST on the LAN listener must come from the page itself: Origin <scheme>://<the Host it was sent
+    to>, the scheme of the listener it reached (an http page may not post to the https listener, nor back)."""
+    if not (origin and host):
+        return False
+    scheme = "https://" if https else "http://"
+    o, want = origin.strip().lower(), (scheme + host.strip().lower())
+    return o.startswith(scheme) and _no_default_port(o) == _no_default_port(want)
 
 
 def lan_ip() -> str | None:
@@ -2803,6 +2844,98 @@ def lan_ip() -> str | None:
             if out and lan_client_ok(out):
                 return out
     return None
+
+
+# ---------------------------------------------------------------- https on the LAN (local CA)
+
+TLS_DIR = "tls"
+SETUP_PAGE = HERE / "setup.html"
+HTTPS_UP = {"port": 0}     # the port of the running TLS listener (0: none), for the redirect and `status`
+SETUP_PATHS = ("/setup", "/ca.crt", "/ca.mobileconfig", "/ping")
+
+
+def tls_dir() -> Path:
+    return S.data_dir / TLS_DIR
+
+
+def _exclude_from_backup(d: Path) -> None:
+    """Time Machine: no copy of the server key (no sudo needed; a no-op without tmutil)."""
+    if S.tmutil:
+        try:
+            subprocess.run([S.tmutil, "addexclusion", str(d)], capture_output=True, timeout=15,
+                           stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
+def tls_issue(why: str = "") -> str:
+    """A new CA and server certificate (the CA key is deleted at once). Returns a line for the user."""
+    if not S.lan_name:
+        raise tlscert.CertError("MEETING_COPILOT_LAN_NAME is off: the certificate needs the <name>.local name")
+    if not S.openssl:
+        raise tlscert.CertError("openssl not found (macOS has /usr/bin/openssl; or set MEETING_COPILOT_OPENSSL)")
+    ips = [ip for ip in [S.lan_ip or lan_ip()] if ip]
+    tlscert.issue(tls_dir(), f"{S.lan_name}.local", ips, S.openssl, exclude=_exclude_from_backup)
+    return (f"made a new CA and a server certificate for {S.lan_name}.local ({', '.join(ips) or 'no IP'}); "
+            f"the CA key was deleted. Phones must install the new CA from http://{S.lan_name}.local/setup")
+
+
+def tls_ready() -> tuple[bool, str]:
+    """(True, "") when the https listener can start: first start makes the certificate by itself; later a
+    missing or old one is a note (a renewal needs the phones to install a new CA: `meeting-copilot cert --renew`)."""
+    d = tls_dir()
+    if not S.lan or not S.lan_name:
+        return False, "LAN_HTTPS needs LAN=1 and a LAN_NAME (the certificate is for <name>.local)"
+    if not S.openssl:
+        return False, "openssl not found"
+    if not any((d / n).exists() for n in ("ca.crt", "server.crt", "server.key")):
+        try:
+            print(f"{clock(now())} https: first start, {tls_issue()}", flush=True)
+        except (tlscert.CertError, OSError) as ex:
+            return False, f"could not make the certificate: {ex}"
+    info = tlscert.cert_info(d, S.openssl)
+    if not info:
+        return False, "the certificate files are incomplete: run `meeting-copilot cert --renew`"
+    if f"{S.lan_name}.local" not in info["names"]:
+        return False, f"the certificate is not for {S.lan_name}.local: run `meeting-copilot cert --renew`"
+    left = tlscert.days_left(info)
+    if left < 0:
+        return False, "the certificate expired: run `meeting-copilot cert --renew` (phones then install the new CA)"
+    if left < tlscert.RENEW_WITHIN_DAYS:
+        print(f"note: the https certificate ends in {left} days: run `meeting-copilot cert --renew` "
+              "(then each phone installs the new CA again)", flush=True)
+    return True, ""
+
+
+def tls_context() -> ssl.SSLContext:
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.load_cert_chain(str(tls_dir() / "server.crt"), str(tls_dir() / "server.key"))
+    return ctx
+
+
+def cert_cli(renew: bool) -> int:
+    """`meeting-copilot cert [--renew]`: makes the certificate when there is none, or replaces it."""
+    d = tls_dir()
+    exists = any((d / n).exists() for n in ("ca.crt", "server.crt", "server.key"))
+    if exists and not renew:
+        info = tlscert.cert_info(d, S.openssl) if S.openssl else None
+        if info:
+            print(f"certificate for {', '.join(info['names'])}, ends {info['expires']:%Y-%m-%d} "
+                  f"({tlscert.days_left(info)} days). `meeting-copilot cert --renew` makes a new CA and certificate; "
+                  "every phone then installs the new CA again.")
+        else:
+            print("the certificate folder is incomplete: `meeting-copilot cert --renew`")
+        print(f"files: {d}")
+        return 0
+    try:
+        print(tls_issue())
+    except (tlscert.CertError, OSError) as ex:
+        print(f"meeting-copilot: {ex}", file=sys.stderr)
+        return 1
+    print(f"files: {d} (server.key is mode 0600 and excluded from Time Machine)")
+    print("restart the copilot (`meeting-copilot stop`, then start) to use it")
+    return 0
 
 
 class Mdns:
@@ -2877,6 +3010,10 @@ class Page(BaseHTTPRequestHandler):
     def _lan(self) -> bool:
         return getattr(self.server, "lan", False)
 
+    @property
+    def _tls(self) -> bool:
+        return getattr(self.server, "tls", False)
+
     def _client_ok(self) -> bool:
         # the LAN listener (0.0.0.0) never answers an address from outside the local network
         return not self._lan or lan_client_ok(str(self.client_address[0]))
@@ -2884,14 +3021,19 @@ class Page(BaseHTTPRequestHandler):
     def _host_ok(self) -> bool:
         # blocks DNS rebinding: only our own host names are answered
         host = self.headers.get("Host", "")
-        return lan_host_ok(host, S) if self._lan else host in S.hosts_ok
+        return lan_host_ok(host, S, self._tls) if self._lan else host in S.hosts_ok
 
     def _origin_ok(self) -> bool:
         origin = self.headers.get("Origin")
-        return lan_origin_ok(origin, self.headers.get("Host", "")) if self._lan else origin in S.origins_ok
+        return lan_origin_ok(origin, self.headers.get("Host", ""), self._tls) if self._lan else origin in S.origins_ok
 
     def _https(self) -> bool:
-        """The browser reached us over https (a tunnel such as Cloudflare's says so in these headers)."""
+        """The browser reached us over https: our own TLS listener, or a tunnel such as Cloudflare's (it
+        says so in these headers; only trusted on the loopback listener, never on the LAN one)."""
+        if self._tls:
+            return True
+        if self._lan:
+            return False
         if self.headers.get("X-Forwarded-Proto", "").split(",")[0].strip().lower() == "https":
             return True
         try:
@@ -2976,6 +3118,10 @@ class Page(BaseHTTPRequestHandler):
         if not self._host_ok():
             return self._send(403, b"host", "text/plain")
         path, given, once = self._route()
+        if self._lan and S.lan_https and path in SETUP_PATHS and self._setup(path):
+            return
+        if self._lan and not self._tls and self._to_https(path):
+            return
         if given is not None:
             return self._clean_redirect(path) if self._token_ok(given) else self._deny()
         if once is not None:
@@ -3007,6 +3153,45 @@ class Page(BaseHTTPRequestHandler):
             return self._json(200, {"path": "/?once=" + PAIR.new_link()})
         self._send(404, b"", "text/plain")
 
+    def _setup(self, path: str) -> bool:
+        """The pages a phone needs before it trusts the certificate: no login, public files only. The CA
+        certificate and its iOS profile (both public); the CA's private key is deleted when it is made, so
+        there is nothing else here to serve. True when answered."""
+        d = tls_dir()
+        try:
+            if path == "/ping":
+                self._send(200, b"ok", "text/plain")
+            elif path == "/setup":
+                name = f"{S.lan_name}.local"
+                body = SETUP_PAGE.read_text(encoding="utf-8").replace("__NAME__", name)
+                self._send(200, body.encode(), "text/html; charset=utf-8")
+            elif path == "/ca.crt":
+                self._send(200, (d / "ca.crt").read_bytes(), "application/x-x509-ca-cert",
+                           {"Content-Disposition": 'attachment; filename="meeting-copilot-ca.crt"'})
+            else:
+                self._send(200, (d / "ca.mobileconfig").read_bytes(), "application/x-apple-aspen-config",
+                           {"Content-Disposition": 'attachment; filename="meeting-copilot.mobileconfig"'})
+        except OSError:
+            self._send(404, b"no certificate yet: see `meeting-copilot cert`", "text/plain")
+        return True
+
+    def _to_https(self, path: str) -> bool:
+        """On the http LAN listener, a browser that proved it trusts the CA (the /setup page sets the
+        mc_https cookie after a successful https probe) goes on to https. Never for a script or a POST."""
+        if not (HTTPS_UP["port"] and self._navigation() and "1" in self._cookies("mc_https")):
+            return False
+        try:
+            host = urlsplit("//" + self.headers.get("Host", "")).hostname or ""
+        except ValueError:
+            return False
+        if not host or ":" in host:
+            return False
+        port = HTTPS_UP["port"]
+        loc = f"https://{host}{'' if port == 443 else f':{port}'}/" + path.lstrip("/")
+        q = urlsplit(self.path).query
+        self._send(302, b"", "text/plain", {"Location": loc + (f"?{q}" if q else "")})
+        return True
+
     def _login(self, raw: bytes) -> None:
         """POST /login {"code": "123456"}: a right code gives this browser its own device cookie."""
         try:
@@ -3034,6 +3219,36 @@ class Page(BaseHTTPRequestHandler):
             return self._json(410, {"error": "No valid code: it expired or was used. Ask for a new code."})
         return self._json(401, {"error": f"Wrong code. {n} {'try' if n == 1 else 'tries'} left.", "left": n})
 
+    def _camera_frame(self, raw: bytes, declared: int) -> None:
+        """POST /camera/frame: one JPEG or PNG from the phone page (login, Origin and Host already checked).
+        Kept only while the camera is on for the live meeting and the AI is allowed for it."""
+        if declared > CAMERA_UPLOAD_MAX:
+            return self._json(413, {"error": f"frame over {CAMERA_UPLOAD_MAX // 1_000_000} MB"})
+        t = now()
+        with E.lock:
+            mid = (E.meeting or {}).get("id")
+            if not S.camera or mid is None or E.camera_for != mid:
+                return self._json(409, {"error": "the camera is not on for this meeting"})
+            if not E.ai_allowed(mid):
+                return self._json(409, {"error": "AI is off for this meeting: nothing is kept"})
+            if t - E.camera_last < S.camera_s / 2:
+                return self._json(429, {"error": "too many frames"})
+            E.camera_last = t
+        if not raw or image_kind(raw) is None:
+            return self._json(415, {"error": "not a JPEG or PNG image"})
+        try:
+            FRAMES.add(mid, "camera", raw, t)
+        except ValueError as ex:
+            return self._json(415, {"error": str(ex)})
+        except OSError as ex:
+            error(f"saving a camera frame: {ex}")
+            return self._json(500, {"error": "could not save the frame on the Mac"})
+        with E.lock:
+            gone = (E.meeting or {}).get("id") != mid
+        if gone:   # the meeting ended while it was being stored
+            FRAMES.drop(mid)
+        self._json(200, {"ok": True})
+
     def _send_code(self) -> None:
         """POST /login/code: shows the code on the Mac again (a new one when it expired). Never returns it."""
         code, left, made = PAIR.get_or_create()
@@ -3050,14 +3265,17 @@ class Page(BaseHTTPRequestHandler):
             n = max(0, int(self.headers.get("Content-Length", "0") or 0))
         except ValueError:
             n = 0
-        if n > 100_000:
+        upload = urlsplit(self.path).path == "/camera/frame"
+        cap = CAMERA_UPLOAD_MAX if upload else 100_000
+        if n > cap:
             self.close_connection = True
-        raw = self.rfile.read(min(n, 100_000)) if n else b""
+        raw = self.rfile.read(min(n, cap)) if n else b""
         if not self._client_ok():
             return self._send(403, b"network", "text/plain")
         # no CORS headers: another site can neither read this nor send JSON here
+        want_type = "image/" if upload else "application/json"
         if not self._host_ok() or not self._origin_ok() \
-                or not self.headers.get("Content-Type", "").startswith("application/json"):
+                or not self.headers.get("Content-Type", "").startswith(want_type):
             return self._send(403, b"origin", "text/plain")
         path, given, _ = self._route()
         if path == "/login":
@@ -3066,6 +3284,8 @@ class Page(BaseHTTPRequestHandler):
             return self._send_code()
         if not (self._token_ok(given) if given is not None else self._authed()):
             return self._deny()
+        if upload:
+            return self._camera_frame(raw, n)
         try:
             body = json.loads(raw or b"{}")
         except json.JSONDecodeError:
@@ -3094,6 +3314,18 @@ class Page(BaseHTTPRequestHandler):
                     E.screen_for, E.screen_msg = None, ""
                 elif isinstance(mid, int) and not isinstance(mid, bool) and E.meeting and mid == E.meeting["id"]:
                     E.screen_for, E.screen_msg = mid, ""
+                else:
+                    return self._send(409, b"meeting changed", "text/plain")
+            elif path == "/camera":
+                # {"on": true, "meeting": <id shown on the page>}: the phone camera sends frames for this meeting
+                mid = body.get("meeting")
+                if not S.camera:
+                    return self._send(409, b"the camera is off in the settings (MEETING_COPILOT_CAMERA=1)",
+                                      "text/plain")
+                if body.get("on") is not True:
+                    E.camera_for, E.camera_msg = None, ""
+                elif isinstance(mid, int) and not isinstance(mid, bool) and E.meeting and mid == E.meeting["id"]:
+                    E.camera_for, E.camera_msg = mid, ""
                 else:
                     return self._send(409, b"meeting changed", "text/plain")
             elif path == "/ai":
@@ -3125,10 +3357,11 @@ def _stop(*_):
 PID_FILE, PORT_FILE = "meeting-copilot.pid", "meeting-copilot.port"
 
 
-def write_port_file(port: int, lan_port: int | None = None) -> None:
+def write_port_file(port: int, lan_port: int | None = None, https_port: int | None = None) -> None:
     try:
         S.data_dir.mkdir(parents=True, exist_ok=True)
         lan = f" {lan_port}" if lan_port else ""
+        lan += f" {https_port}" if lan_port and https_port else ""
         _write_private(S.data_dir / PORT_FILE, f"{os.getpid()} {port}{lan}\n")
     except OSError as ex:
         print(f"note: could not write {S.data_dir / PORT_FILE}: {ex}", flush=True)
@@ -3165,7 +3398,33 @@ class _LanPage(Page):
     timeout = 30   # seconds a LAN connection may sit idle: a slow client cannot hold a thread forever
 
 
-def print_urls(port: str, lan_port: str) -> None:
+class _TlsServer(_LanServer):
+    """The LAN listener over TLS. The handshake runs in the connection's own thread (see _TlsPage.setup), so
+    a phone that does not trust the certificate yet cannot hold up the accept loop."""
+    tls = True
+
+    def __init__(self, addr, handler, ctx: ssl.SSLContext) -> None:
+        self.ctx = ctx
+        super().__init__(addr, handler)
+
+    def get_request(self):
+        sock, addr = self.socket.accept()
+        return self.ctx.wrap_socket(sock, server_side=True, do_handshake_on_connect=False), addr
+
+    def handle_error(self, request, client_address) -> None:
+        if isinstance(sys.exc_info()[1], (ssl.SSLError, OSError)):
+            return   # a failed handshake (the phone does not trust the CA yet) or a dropped connection
+        super().handle_error(request, client_address)
+
+
+class _TlsPage(_LanPage):
+    def setup(self) -> None:
+        self.request.settimeout(10)
+        self.request.do_handshake()
+        super().setup()
+
+
+def print_urls(port: str, lan_port: str, https_port: str = "") -> None:
     """For `meeting-copilot status` and start: the other addresses of the page (LAN, extra hosts), with no
     token in them (a browser that is not logged in gets the pairing-code login page)."""
     if S.lan:
@@ -3176,6 +3435,11 @@ def print_urls(port: str, lan_port: str) -> None:
             ip = S.lan_ip or lan_ip()
             if ip:
                 print(f"  LAN IP: http://{ip}{sfx}/")
+            if https_port and S.lan_name:
+                print(f"  HTTPS:  https://{S.lan_name}.local{'' if https_port == '443' else ':' + https_port}/"
+                      f"  (phone setup: http://{S.lan_name}.local{sfx}/setup)")
+            elif S.lan_https:
+                print("  HTTPS:  on in the settings but not listening (see `meeting-copilot log`)")
         else:
             print("  LAN:    on in the settings but not listening (see `meeting-copilot log`)")
     for h in S.extra_hosts:
@@ -3324,6 +3588,24 @@ def bench(cfg: dict, rounds: int, image: Path, yes: bool) -> int:
     return 0 if rows["text"] or rows["image"] else 1
 
 
+def start_tls() -> bool:
+    """LAN_HTTPS=1: the TLS listener on 0.0.0.0:LAN_HTTPS_PORT. A failure is a note: http goes on."""
+    ok, why = tls_ready()
+    if ok:
+        try:
+            srv = _TlsServer(("0.0.0.0", S.lan_https_port), _TlsPage, tls_context())
+        except (OSError, ssl.SSLError) as ex:
+            ok, why = False, f"cannot listen on 0.0.0.0:{S.lan_https_port}: {ex}"
+    if not ok:
+        print(f"note: LAN https off: {why}", flush=True)
+        return False
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    HTTPS_UP["port"] = S.lan_https_port
+    print(f"LAN https on port {S.lan_https_port} (https://{S.lan_name}.local; set the phone up at "
+          f"http://{S.lan_name}.local/setup)", flush=True)
+    return True
+
+
 def start_lan() -> bool:
     """LAN=1: the second listener on 0.0.0.0:LAN_PORT, and its .local name. A failure is a note, not an exit."""
     if not S.lan:
@@ -3335,6 +3617,8 @@ def start_lan() -> bool:
         return False
     threading.Thread(target=lan.serve_forever, daemon=True).start()
     print(f"LAN page on port {S.lan_port} (private addresses only)", flush=True)
+    if S.lan_https:
+        start_tls()
     if S.lan_name and S.dns_sd:
         mdns = Mdns(S.dns_sd, S.lan_name, S.lan_port, lambda: S.lan_ip or lan_ip()).start()
         atexit.register(mdns.stop)
@@ -3350,7 +3634,7 @@ def main(argv=None) -> None:
     ap.add_argument("--port", type=int, help="local port (default 4390)")
     ap.add_argument("--version", action="version", version=f"meeting-copilot {__version__}")
     ap.add_argument("--get", metavar="KEY", help=argparse.SUPPRESS)  # for bin/meeting-copilot: PORT, OPEN_CMD
-    ap.add_argument("--urls", nargs=2, metavar=("PORT", "LAN_PORT"), help=argparse.SUPPRESS)  # for `status`
+    ap.add_argument("--urls", nargs="+", metavar="PORT", help=argparse.SUPPRESS)  # for `status`
     ap.add_argument("--token", action="store_true",
                     help="print the page token (created on first use) and exit")
     ap.add_argument("--cli", nargs=2, metavar=("ACTION", "PORT"), help=argparse.SUPPRESS)  # launcher commands
@@ -3358,6 +3642,8 @@ def main(argv=None) -> None:
                     help="time N suggestion rounds with and without an image on the fake meeting (real claude)")
     ap.add_argument("--bench-image", type=Path, default=BENCH_IMAGE, help=argparse.SUPPRESS)
     ap.add_argument("--yes", action="store_true", help="with --bench: really call claude")
+    ap.add_argument("--cert", action="store_true", help="make the local CA and the https certificate, or show them")
+    ap.add_argument("--renew", action="store_true", help="with --cert: a new CA and certificate (phones reinstall)")
     args = ap.parse_args(argv)
     seed_config()   # bin/meeting-copilot calls --get first, so any first command creates it
     cfg = load_config()
@@ -3372,6 +3658,9 @@ def main(argv=None) -> None:
         S = Settings(cfg)
         print_urls(*args.urls)
         return
+    if args.cert:
+        S = Settings(cfg)
+        raise SystemExit(cert_cli(args.renew))
     if args.bench is not None:
         raise SystemExit(bench(cfg, max(1, min(args.bench, 50)), args.bench_image, args.yes))
     if args.cli:
@@ -3413,7 +3702,7 @@ def main(argv=None) -> None:
     srv = _Server(("127.0.0.1", S.port), Page)
     atexit.register(remove_run_files)
     lan_up = start_lan()
-    write_port_file(S.port, S.lan_port if lan_up else None)
+    write_port_file(S.port, S.lan_port if lan_up else None, HTTPS_UP["port"] or None)
     print(f"meeting-copilot on http://127.0.0.1:{S.port}  (database: {S.db})", flush=True)
     atexit.register(SESSION.close, "copilot exit", True)
     try:
