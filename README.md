@@ -93,6 +93,20 @@ meeting-copilot stop        stop it (the session is saved)
 meeting-copilot bench [N] --yes   time N real suggestion rounds, with and without an image (see "Response time")
 ```
 
+### Language
+
+The menu at the top of the page (phone and Mac) picks the language of the suggestions, the
+facts and the Look answers: **Auto** (the language the meeting is using), English, Português
+(Brasil), Español, Français, Deutsch or Italiano. Your `MEETING_COPILOT_LANGUAGE` value shows up
+as one more choice when it is not one of these (`spanish`, `Español` or `português do Brasil` select
+the built-in choice, whatever the case). The change counts from the next round on, for
+every open page; the kept-open AI process (which has the language in its instructions) is replaced
+by a fresh one at once. The choice is saved in `language.json` in your data folder (only your user
+can read it), so a restart keeps it, and it wins over `MEETING_COPILOT_LANGUAGE` until you pick
+again or edit that line: a config value changed since the pick wins (one line in the log says so);
+**Auto** saves "the meeting's language". Only the listed choices are accepted (`POST
+/language` with `{"language": "English"}`, `""` for Auto): no typed text goes into the prompts.
+
 ### Logging in
 
 The page is private. `meeting-copilot` logs the Mac's own browser in by itself when it opens the page. Any other browser (another browser on the Mac, your phone, a tablet) shows a login page the first time:
@@ -182,7 +196,7 @@ Every key:
 | `MEETING_COPILOT_PERSISTENT_AI` | `1` | `1`: one kept-open `claude` process per meeting for the suggestions (see "The kept-open AI process"). `0`: a new `claude -p` per round |
 | `MEETING_COPILOT_AI_FIRST_BYTE_S`, `_AI_ROUND_S` | `6`, `10` | Watchdog of a suggestions round on the kept-open process: seconds to the API's first byte, and to the answer |
 | `MEETING_COPILOT_CONTEXT_FILE` | empty | A text file about you that both AI calls read: your name and role, your projects, what your notes folders and MCP tools hold, words the transcript tends to get wrong. The first 8000 characters are used |
-| `MEETING_COPILOT_LANGUAGE` | empty (the meeting's language) | Language for every suggestion and fact, e.g. `Brazilian Portuguese` |
+| `MEETING_COPILOT_LANGUAGE` | empty (the meeting's language) | Language for every suggestion, fact and Look answer, e.g. `Brazilian Portuguese`. The language menu on the page overrides it (see [Language](#language)) |
 | `MEETING_COPILOT_PROMPT_FILE` | empty (the built-in prompt) | A text file that replaces the built-in suggestions prompt. See [Your own prompt](#your-own-prompt) |
 | `MEETING_COPILOT_DATA_PROMPT_FILE` | empty (the built-in prompt) | A text file that replaces the built-in fact-search prompt. See [Your own prompt](#your-own-prompt) |
 | `MEETING_COPILOT_OPEN_CMD` | `open` (macOS) or `xdg-open` | Command that opens the page. The URL is passed as one argument wherever `{url}` is (no quotes around it), or at the end, e.g. `open -g -a "Firefox"` |
@@ -223,7 +237,7 @@ Placeholders (written as is, with the braces):
 
 | Placeholder | Prompt | Becomes |
 |---|---|---|
-| `{language}` | both | The language name from `MEETING_COPILOT_LANGUAGE` (e.g. `answer in {language}`), or `the language the meeting is using` when that is empty |
+| `{language}` | both | The language name from the page's language menu or `MEETING_COPILOT_LANGUAGE` (e.g. `answer in {language}`), or `the language the meeting is using` when that is empty |
 | `{context}` | both | Your `MEETING_COPILOT_CONTEXT_FILE` text under a heading, or nothing when that is empty |
 | `{sources}` | fact search | The folders (`MEETING_COPILOT_SEARCH_DIRS`) and tools (`MEETING_COPILOT_MCP_TOOLS`) it may search, one line each |
 

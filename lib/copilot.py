@@ -50,7 +50,7 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
 import tlscert
 
-__version__ = "0.12.0"
+__version__ = "0.13.0"
 
 HERE = Path(__file__).resolve().parent
 PAGE = HERE / "page.html"
@@ -161,12 +161,36 @@ DEVICES_FILE = "devices.json"
 # What you typed in the page (objective, goals) and the "Turn on AI" click, kept on disk so a restart in
 # the middle of a meeting (`meeting-copilot stop`, a config change, launchd) gives them back.
 CONTEXT_FILE = "context.json"
+# The language picked on the page, kept on disk so a restart keeps it; it wins over MEETING_COPILOT_LANGUAGE.
+LANGUAGE_FILE = "language.json"
+# The page's language choices: (value written into the prompts, label on the page). "" = the meeting's own
+# language. Only these, plus your MEETING_COPILOT_LANGUAGE value, are accepted: no free text into a prompt.
+LANGUAGES = (("", "Auto (the meeting's language)"), ("English", "English"),
+             ("Brazilian Portuguese", "Português (Brasil)"), ("Spanish", "Español"), ("French", "Français"),
+             ("German", "Deutsch"), ("Italian", "Italiano"))
+# Other spellings of the built-in choices: a MEETING_COPILOT_LANGUAGE value that matches one of these (or a
+# value or label above), whatever the case, selects that built-in choice instead of adding a near-duplicate.
+LANGUAGE_ALIASES = {"English": ("Inglês", "Inglés"),
+                    "Brazilian Portuguese": ("Português do Brasil", "Portuguese (Brazil)", "Português brasileiro",
+                                             "pt-BR"),
+                    "Spanish": ("Espanhol",), "French": ("Francês",), "German": ("Alemão",)}
+LANGUAGE_LOCK = threading.Lock()   # the language file and S.language change together
 CONTEXT_KEEP_S = 6 * 3600   # an older file is from another day: ignored
 CONTEXT_ON = False          # set by main(): code imported by the tests never writes the real file
 DEVICE_MAX_AGE_S = 365 * 24 * 3600
 DEVICES_MAX = 50            # the oldest paired device is dropped beyond this
 _CODE_OK = re.compile(r"^[0-9]{6}$")
 _HASH_OK = re.compile(r"^[0-9a-f]{64}$")
+
+
+def builtin_language(value: str) -> str:
+    """The built-in choice a config value means ("spanish", "Español" -> "Spanish"), compared without case;
+    the value itself when it is none of them."""
+    key = value.casefold()
+    for v, label in LANGUAGES:
+        if v and key in {n.casefold() for n in (v, label, *LANGUAGE_ALIASES.get(v, ()))}:
+            return v
+    return value
 
 
 class Pairing:
@@ -620,7 +644,8 @@ class Settings:
                 self.notices.append(f"context file not found or unreadable, ignored: {p}")
             except UnicodeDecodeError:
                 self.notices.append(f"context file is not UTF-8 text, ignored: {p}")
-        self.language = g("LANGUAGE").strip()
+        self.language = builtin_language(g("LANGUAGE").strip())
+        self.config_language = self.language   # the page's choice (LANGUAGE_FILE) may replace self.language
 
         # Optional: your own text in place of the built-in prompts (PROMPT_ASSIST, PROMPT_DATA).
         # Missing, unreadable, not UTF-8 or empty: one note, and the built-in prompt.
@@ -859,6 +884,58 @@ def language_text() -> str:
             "(keep the word EMPTY as is).")
 
 
+def language_options() -> list[dict]:
+    """The page's language choices; your MEETING_COPILOT_LANGUAGE value too when it is not one of them."""
+    opts = [{"value": v, "label": label} for v, label in LANGUAGES]
+    if S.config_language and S.config_language not in {v for v, _ in LANGUAGES}:
+        opts.append({"value": S.config_language, "label": S.config_language})
+    return opts
+
+
+def language_allowed(value) -> bool:
+    return isinstance(value, str) and value in {o["value"] for o in language_options()}
+
+
+def load_language() -> None:
+    """Gives back the language picked on the page (LANGUAGE_FILE), when it is still one of the choices and
+    MEETING_COPILOT_LANGUAGE is the same as when it was picked. A missing, bad or no longer allowed file
+    leaves the config in place; a config changed since the pick wins (one line, and the file is removed)."""
+    path = Path(S.data_dir) / LANGUAGE_FILE
+    try:
+        d = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not (isinstance(d, dict) and language_allowed(d.get("language"))):
+        return
+    if "config" in d and d["config"] != S.config_language:
+        print(f"{clock(now())} MEETING_COPILOT_LANGUAGE changed since the language was picked on the page "
+              f"({d['config'] or 'empty'} -> {S.config_language or 'empty'}): the config wins", flush=True)
+        if CONTEXT_ON:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        return
+    S.language = d["language"]
+
+
+def set_language(value: str) -> bool:
+    """The page's choice: saved first (raises OSError when it could not be), then used by every AI call
+    from the next round on. False, with nothing written, when it is already the language. The kept-open
+    suggestions process has the language in its system prompt, so it is replaced by a fresh one (see
+    AssistSession.relanguage). The file keeps the config value of the moment, so a later config edit wins."""
+    with LANGUAGE_LOCK:
+        if value == S.language:
+            return False
+        if CONTEXT_ON:   # code imported by the tests never writes the real data folder
+            Path(S.data_dir).mkdir(parents=True, exist_ok=True, mode=0o700)
+            _write_private(Path(S.data_dir) / LANGUAGE_FILE, json.dumps(
+                {"saved": now(), "language": value, "config": S.config_language}, ensure_ascii=False))
+        S.language = value
+    print(f"{clock(now())} language set on the page: {value or 'Auto (the meeting language)'}", flush=True)
+    return True
+
+
 def context_text() -> str:
     return "## About the user (from their context file)\n" + S.context if S.context else ""
 
@@ -994,6 +1071,7 @@ class State:
                 "corrections": last(self.corrections, 10),
                 "data": last(self.data, 10),
                 "data_enabled": S.data_enabled,
+                "language": {"value": S.language, "options": language_options()},
                 "confirm_ai": S.confirm_ai,
                 "ai_on": self.meeting is not None and self.ai_allowed(),
                 "ai_next": S.confirm_ai and self.ai_armed(),
@@ -1531,15 +1609,20 @@ class AssistSession:
         self.spawns = 0
         self.mode = ""                       # "api credit" or "subscription (...)"
         self.pause: Path | None = None       # the API credit pause file to write if the API refuses
+        self.prompt = ""                     # the system prompt it was started with
 
-    def cmd(self) -> list[str]:
+    @staticmethod
+    def system_prompt() -> str:
+        """The system prompt a process started now gets (your language, context, prompt and picture setup)."""
+        return assist_prompt() + (IMAGES_NOTE if vision_configured() else "") + ASSIST_FORMAT
+
+    def cmd(self, prompt: str) -> list[str]:
         return [S.claude, "-p", "--model", S.model,
                 # no settings file from anywhere, as in run_claude; no tools at all
                 "--no-session-persistence", "--setting-sources", "",
                 "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
                 "--include-partial-messages",   # message_start = the API's first byte, for the watchdog
-                "--max-turns", "2", "--append-system-prompt",
-                assist_prompt() + (IMAGES_NOTE if vision_configured() else "") + ASSIST_FORMAT,
+                "--max-turns", "2", "--append-system-prompt", prompt,
                 "--strict-mcp-config", "--tools", ""]
 
     def alive(self) -> bool:
@@ -1552,7 +1635,8 @@ class AssistSession:
         # with the API-credit wrapper installed: the plan's API credit first (its key in the child's
         # environment only), the subscription while that key is paused
         env, mode, pause = CREDIT.choose() if S.credit else (None, "subscription", None)
-        p = subprocess.Popen(self.cmd(), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        prompt = self.system_prompt()   # read once: what it runs with is what self.prompt says
+        p = subprocess.Popen(self.cmd(prompt), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              text=True, encoding="utf-8", errors="replace", bufsize=1, cwd=str(cwd), env=env)
         self.mode, self.pause = mode, pause
         q: queue.Queue = queue.Queue()
@@ -1560,6 +1644,7 @@ class AssistSession:
         threading.Thread(target=self._read, args=(p, q), daemon=True).start()
         threading.Thread(target=self._read_err, args=(p, err), daemon=True).start()
         self.proc, self.events, self.stderr, self.owner, self.started = p, q, err, owner, _mono()
+        self.prompt = prompt
         self.seeded, self.sent_upto, self.goals_sent, self.turns, self.tokens = False, 0, None, 0, 0
         self.spawns += 1
 
@@ -1607,6 +1692,26 @@ class AssistSession:
         else:
             threading.Thread(target=run, daemon=True).start()
 
+    def _replace(self, owner, must: bool = False) -> bool:
+        """Ends the current process, if any, and starts a fresh one for `owner`. Call with self.lock held.
+        When it cannot start: no process left, and the OSError is raised (must=True) or printed (False)."""
+        if self.proc:
+            self._end(self.proc)
+        self.proc = self.events = None
+        try:
+            self._spawn(owner)
+        except OSError as ex:
+            self.owner = None
+            if must:
+                raise
+            print(f"{clock(now())} could not start the AI process: {ex}", flush=True)
+            return False
+        return True
+
+    def stale(self) -> bool:
+        """Was it started with another system prompt than a fresh one gets now (the language changed)?"""
+        return self.prompt != self.system_prompt()
+
     def warm(self, owner, why: str = "") -> None:
         """Starts the process ahead of the first round, so that round has no start-up cost. A process armed
         for the "next" meeting goes on with that meeting when it starts."""
@@ -1616,16 +1721,30 @@ class AssistSession:
             if self.alive() and (self.owner == owner or (self.owner == "next" and owner != "next")):
                 self.owner = owner
                 return
-            if self.proc:
-                self._end(self.proc)
-            try:
-                self._spawn(owner)
-            except OSError as ex:
-                self.proc = self.events = self.owner = None
-                print(f"{clock(now())} could not start the AI process: {ex}", flush=True)
+            if not self._replace(owner):
                 return
         print(f"{clock(now())} AI process started for {'the next meeting' if owner == 'next' else f'meeting {owner}'}"
               f" on {self.mode}" + (f" ({why})" if why else ""), flush=True)
+
+    def relanguage(self) -> None:
+        """The language changed on the page: a process started with another system prompt is replaced by a
+        fresh one (seeded at its first round), after any round in progress, so the next round has no start-up
+        cost and answers in the new language. Only while it is still wanted (wanted_owner): for a meeting
+        that has ended or with the AI turned off meanwhile, it is only ended."""
+        with self.round_lock:
+            want = wanted_owner()   # takes E.lock: never while holding self.lock
+            with self.lock:
+                if not (self.alive() and self.stale()):
+                    return
+                if want is None or not (self.owner == want or self.owner == "next"):
+                    p, self.proc, self.events, self.owner, self.seeded = self.proc, None, None, None, False
+                    self._end(p)
+                    why = "AI not allowed now" if want is None else "it served another meeting"
+                    print(f"{clock(now())} AI process closed ({why}; language changed)", flush=True)
+                    return
+                if not self._replace(want):
+                    return
+        print(f"{clock(now())} AI process replaced by a fresh one (language changed)", flush=True)
 
     def close(self, why: str, wait: bool = False) -> None:
         with self.lock:
@@ -1675,8 +1794,7 @@ class AssistSession:
         if not (m and self.pause is not None and self.proc is p):
             return False
         CREDIT.refused(self.pause, m.group(0))
-        self._end(p)
-        self._spawn(self.owner)
+        self._replace(self.owner, must=True)
         print(f"{clock(now())} API credit refused ({m.group(0)}): the suggestions go on the {self.mode}; "
               f"the round is sent again", flush=True)
         return True
@@ -1696,10 +1814,9 @@ class AssistSession:
             while True:
                 attempt += 1
                 with self.lock:
-                    if not (self.alive() and self.owner in (mid, "next")):
-                        if self.proc:
-                            self._end(self.proc)
-                        self._spawn(mid)
+                    # a process from before a language change has the old language in its system prompt
+                    if not (self.alive() and self.owner in (mid, "next") and not self.stale()):
+                        self._replace(mid, must=True)
                     self.owner = mid
                     p, q = self.proc, self.events
                     seed = not self.seeded
@@ -1727,13 +1844,11 @@ class AssistSession:
                         if refusals == 0 and self._refusal(p, " ".join(self.stderr[-5:])):
                             refusals, attempt = 1, attempt - 1
                             continue
-                        self._end(p)
-                        self.proc = self.events = None
                         if attempt >= 2:
-                            try:
-                                self._spawn(mid)     # warm again for the next round
-                            except OSError:
-                                pass
+                            self._replace(mid)       # warm again for the next round
+                        else:
+                            self._end(p)
+                            self.proc = self.events = None
                     if attempt >= 2:
                         raise RuntimeError(f"{ex} (twice; a fresh AI process is ready for the next round)") from None
                     print(f"{clock(now())} assist: {ex}; trying once more on a fresh AI process", flush=True)
@@ -1758,8 +1873,7 @@ class AssistSession:
                     tokens = self.tokens
                     rotate = tokens >= ROTATE_TOKENS or self.turns >= ROTATE_TURNS
                     if rotate:
-                        self._end(p)
-                        self._spawn(mid)
+                        self._replace(mid)
                 if rotate:
                     print(f"{clock(now())} AI process replaced by a fresh one after {turn} rounds and "
                           f"{tokens} tokens of context", flush=True)
@@ -3622,6 +3736,20 @@ class Page(BaseHTTPRequestHandler):
                 E.look_question = q if not E.look_question else f"{E.look_question}\n{q}"[-LOOK_QUESTION_MAX:]
             LOOK_WAKE.set()
             return self._send(200, b'{"ok":true}', "application/json")
+        if path == "/language":
+            # {"language": one of /state's language.options values ("" = Auto)}: every AI call from the
+            # next round on; saved on the Mac. Anything else is refused: no free text goes into a prompt.
+            value = body.get("language")
+            if not language_allowed(value):
+                return self._send(400, b"unknown language", "text/plain")
+            try:
+                changed = set_language(value)
+            except OSError as ex:
+                error(f"saving the language: {ex}")
+                return self._json(500, {"error": "could not save the language on the Mac"})
+            if changed:
+                threading.Thread(target=SESSION.relanguage, daemon=True).start()
+            return self._json(200, {"ok": True, "language": value})
         if path == "/pair":
             code, left, _ = PAIR.get_or_create(owner=True)   # someone logged in: no notification, lifts the lock
             return self._json(200, {"code": code, "expires_in": left})
@@ -4017,6 +4145,7 @@ def main(argv=None) -> None:
     global CONTEXT_ON
     load_context()
     CONTEXT_ON = True
+    load_language()   # may remove a file the config has overridden
     if not S.db.exists():
         raise SystemExit(f"Muesli database not found: {S.db}\n"
                          "Install and run Muesli, or point MEETING_COPILOT_DB / --db at its muesli.db.")
