@@ -40,8 +40,11 @@
 # notes are, words the transcript gets wrong). The first 8000 characters are used.
 #MEETING_COPILOT_CONTEXT_FILE=
 
-# Language for every suggestion and fact, e.g. Brazilian Portuguese.
-# Empty: the meeting's language.
+# Language for every suggestion, fact and Look answer, e.g. Brazilian Portuguese.
+# Empty: the meeting's language. The language menu on the page changes it while
+# the copilot runs (Auto, English, Portuguese, Spanish, French, German, Italian,
+# or this value); that choice is kept in language.json in the data folder and
+# wins over this line until you pick again.
 #MEETING_COPILOT_LANGUAGE=
 
 # A text file that replaces the built-in suggestions prompt (the "Say this" /
