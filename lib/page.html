@@ -39,7 +39,10 @@
   .x { float: right; background: none; color: var(--dim); padding: 0 4px; }
   #ai { display: none; }
   #ai.ask { background: var(--say); color: var(--bg); font-weight: 600; }
-  #screen { display: none; }
+  #screen, #camera { display: none; }
+  #campanel { display: none; gap: 12px; align-items: flex-start; flex-wrap: wrap; padding: 0 16px 8px; color: var(--dim); font-size: 12px; }
+  #camv { max-width: 220px; max-height: 140px; border: 2px solid #ff9a9a; border-radius: 6px; background: #000; }
+  #campanel .on { color: #ff9a9a; font-weight: 600; }
   #screen.on, #camera.on { background: #3a1214; color: #ff9a9a; font-weight: 600; }
   #latency { color: var(--dim); font-size: 12px; }
   #vision { display: none; gap: 12px; align-items: flex-start; flex-wrap: wrap; padding: 0 16px 8px; color: var(--dim); font-size: 12px; }
@@ -57,8 +60,18 @@
   <span id="latency" title="From the speech or frame reaching the copilot to the answer being ready (the page checks every 2 s)"></span>
   <button id="ai"></button>
   <button id="screen" title="Send the meeting window to the AI every 30 s or so, for this meeting only"></button>
+  <button id="camera" title="Send frames from this phone's camera to the AI for this meeting, until you stop it"></button>
   <button id="pair" title="Show a code to log in another browser or device">Pair a device</button>
 </header>
+
+<div id="campanel">
+  <video id="camv" playsinline muted hidden></video>
+  <div>
+    <div id="camstat"></div>
+    <input type="file" id="camfile" accept="image/*" capture="environment" hidden>
+    <button id="camshot" hidden>Take a photo</button>
+  </div>
+</div>
 
 <details id="ctx">
   <summary>Objective and goals for this meeting</summary>
@@ -118,6 +131,7 @@ async function refresh() {
   sb.style.display = v.screen && e.live ? "inline-block" : "none";
   sb.className = v.screen_on ? "on" : "";
   if (!screenMsg) sb.textContent = v.screen_on ? "Screen shared with AI · stop" : "Share screen with AI";
+  cameraUI(e, v);
   document.getElementById("latency").textContent = lat.n ?
     `last answer ${lat.last} s · median ${lat.median} s` + (lat.n_image ? `, with image ${lat.median_image} s` : "") : "";
   const vis = document.getElementById("vision");
@@ -159,8 +173,134 @@ async function refresh() {
     (e.errors || []).map(x => `<div style="color:var(--warn)">${esc(x)}</div>`).join("");
 }
 
-const post = (path, body) =>
-  fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+// ---- phone camera: a live preview, one frame every camera_s seconds (only when it changed), upload as JPEG
+const cam = { stream: null, timer: null, wake: null, prev: null, lastSent: 0, n: 0, bytes: 0, msg: "", busy: false };
+const camSecure = !!(window.isSecureContext && navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+const camEl = id => document.getElementById(id);
+const camChanged = (a, b) => {
+  if (!a || a.length !== b.length) return true;
+  let sum = 0, big = 0;
+  for (let i = 0; i < a.length; i++) { const d = Math.abs(a[i] - b[i]); sum += d; if (d > 40) big++; }
+  return sum / a.length >= 2 || big >= 2;
+};
+function camThumb(src, w, h) {
+  const c = document.createElement("canvas"); c.width = 32; c.height = 24;
+  const x = c.getContext("2d", { willReadFrequently: true });
+  x.drawImage(src, 0, 0, 32, 24);
+  const px = x.getImageData(0, 0, 32, 24).data, g = [];
+  for (let i = 0; i < px.length; i += 4) g.push((px[i] * 299 + px[i + 1] * 587 + px[i + 2] * 114) / 1000);
+  return g;
+}
+function camPaint() {
+  const on = !!cam.stream;
+  const kb = Math.round(cam.bytes / 1024);
+  camEl("camstat").innerHTML = (on ? `<span class="on">Camera on</span> · a frame every ${(last.vision || {}).camera_s || 5} s when the picture changed · sent ${cam.n} (${kb} KB)` : "") +
+    (cam.msg ? `<div style="color:var(--corr)">${esc(cam.msg)}</div>` : "") +
+    (!camSecure && (last.vision || {}).camera_on ? ((last.vision || {}).https
+      ? `<div>Live video needs https: set this phone up once at <a href="/setup" style="color:var(--say)">/setup</a>. Until then: one photo per tap.</div>`
+      : `<div>Live video needs https (off on this Mac): one photo per tap.</div>`) : "");
+}
+async function camSend(blob, manual) {
+  if (cam.busy) return;
+  cam.busy = true;
+  try {
+    const r = await fetch("/camera/frame", { method: "POST", headers: { "Content-Type": blob.type || "image/jpeg" }, body: blob });
+    if (r.status === 401) { location.reload(); return; }
+    if (r.ok) { cam.n++; cam.bytes += blob.size; cam.msg = ""; cam.lastSent = Date.now(); }
+    else if (r.status !== 429 || manual) {   // a live frame that came too soon is just skipped; a photo says so
+      let t = ""; try { t = (await r.json()).error || ""; } catch {}
+      cam.msg = t || "the Mac did not take the frame";
+      if (r.status === 409) { camStopLocal(); refresh(); }
+    }
+  } catch { cam.msg = "could not reach the Mac"; }
+  finally { cam.busy = false; camPaint(); }
+}
+async function camGrab(force) {
+  const v = camEl("camv");
+  if (!cam.stream || !v.videoWidth) return;
+  const k = Math.min(1, 1280 / Math.max(v.videoWidth, v.videoHeight));
+  const c = document.createElement("canvas");
+  c.width = Math.round(v.videoWidth * k); c.height = Math.round(v.videoHeight * k);
+  c.getContext("2d").drawImage(v, 0, 0, c.width, c.height);
+  const t = camThumb(c);
+  const keepalive = Date.now() - cam.lastSent >= 60000;   // an unchanged scene is re-announced once a minute so it stays current
+  if (!force && !keepalive && !camChanged(cam.prev, t)) return;
+  cam.prev = t;
+  c.toBlob(b => { if (b) camSend(b); }, "image/jpeg", 0.7);
+}
+function camStopLocal() {
+  if (cam.timer) clearInterval(cam.timer);
+  cam.timer = null;
+  if (cam.stream) cam.stream.getTracks().forEach(t => t.stop());
+  cam.stream = null; cam.prev = null;
+  if (cam.wake) { try { cam.wake.release(); } catch {} cam.wake = null; }
+  const v = camEl("camv"); v.srcObject = null; v.hidden = true;
+  camPaint();
+}
+async function camStart() {
+  cam.msg = "";
+  if (!camSecure) { camPaint(); return; }
+  try {
+    cam.stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+  } catch (ex) {
+    cam.msg = "the camera was not allowed: " + (ex && ex.name || "error");
+    await post("/camera", { on: false }).catch(() => {});
+    camPaint(); return;
+  }
+  const v = camEl("camv"); v.srcObject = cam.stream; v.hidden = false;
+  try { await v.play(); } catch {}
+  try { if (navigator.wakeLock) cam.wake = await navigator.wakeLock.request("screen"); } catch {}
+  cam.n = 0; cam.bytes = 0; cam.lastSent = 0;
+  cam.timer = setInterval(() => camGrab(false), ((last.vision || {}).camera_s || 5) * 1000);
+  setTimeout(() => camGrab(true), 600);
+  camPaint();
+}
+async function camToggle() {
+  const on = !((last.vision || {}).camera_on);
+  let r = null;
+  try { r = await post("/camera", { on, meeting: last.meeting ? last.meeting.id : null }); } catch {}
+  if (!r || !r.ok) {
+    let t = ""; if (r && r.status === 409) { try { t = await r.text(); } catch {} }
+    cam.msg = (t && t !== "meeting changed") ? t : "did not work, try again";
+    camPaint(); refresh(); return;
+  }
+  if (on) { await camStart(); } else { camStopLocal(); }
+  refresh();
+}
+function cameraUI(e, v) {
+  const b = camEl("camera"), live = !!(v.camera && e.live);
+  b.style.display = live ? "inline-block" : "none";
+  b.className = v.camera_on ? "on" : "";
+  b.textContent = v.camera_on ? "Camera on · stop" : "Camera";
+  // the meeting ended or the Mac says it is off: stop the stream at once
+  if (cam.stream && !(live && v.camera_on)) camStopLocal();
+  const showShot = live && v.camera_on && !camSecure;
+  camEl("camshot").hidden = !showShot;
+  camEl("campanel").style.display = live && (v.camera_on || cam.msg) ? "flex" : "none";
+  camPaint();
+}
+camEl("camera").onclick = camToggle;
+camEl("camshot").onclick = () => camEl("camfile").click();
+camEl("camfile").onchange = async ev => {
+  const f = ev.target.files && ev.target.files[0];
+  ev.target.value = "";
+  if (!f) return;
+  try {
+    const bmp = await createImageBitmap(f);
+    const k = Math.min(1, 1280 / Math.max(bmp.width, bmp.height));
+    const c = document.createElement("canvas"); c.width = Math.round(bmp.width * k); c.height = Math.round(bmp.height * k);
+    c.getContext("2d").drawImage(bmp, 0, 0, c.width, c.height);
+    c.toBlob(b => { if (b) camSend(b, true); }, "image/jpeg", 0.7);
+  } catch { cam.msg = "could not read that photo"; camPaint(); }
+};
+// leaving the page (or the phone locking) turns the camera off, on the Mac too (keepalive: the request
+// still goes out while the page is being frozen or closed)
+const camHide = () => { if (cam.stream) { camStopLocal(); post("/camera", { on: false }, true).catch(() => {}); } };
+document.addEventListener("visibilitychange", () => { if (document.hidden) camHide(); });
+window.addEventListener("pagehide", camHide);
+
+const post = (path, body, keepalive) =>
+  fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), keepalive: !!keepalive });
 
 document.getElementById("ai").onclick = async () => {
   const body = { on: !(last.ai_on || last.ai_next), meeting: last.live && last.meeting ? last.meeting.id : null };

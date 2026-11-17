@@ -102,7 +102,7 @@ The page is private. `meeting-copilot` logs the Mac's own browser in by itself w
 3. The code shows on the Mac as a notification. It is also in `meeting-copilot status` and `meeting-copilot code`, and behind the "Pair a device" button on a page that is already logged in.
 4. Type it. That browser stays logged in for a year.
 
-A code is valid for 5 minutes and works once. There is one code at a time: every login page opened in those 5 minutes gets the same code, and the Mac shows the notification once (the login page has a button to show it again). After 5 wrong tries the code is thrown away; after 10 wrong tries in a minute, from anywhere, every try waits until the minute is over. After 20 wrong tries since the last right one, the login locks: no new code is made for a browser until you run `meeting-copilot code` on the Mac (or press "Pair a device" on a logged-in page), which unlocks it and shows a fresh code. Time alone never unlocks it, so a device on your network that keeps guessing gets at most 20 tries in a million each time you unlock. Each logged-in browser gets its own cookie (`HttpOnly`, `SameSite=Strict`, `Secure` behind https), kept on the Mac only as a hash in `devices.json` in your data folder. `meeting-copilot devices` lists them and `meeting-copilot devices forget` logs them all out at once.
+A code is valid for 5 minutes and works once. There is one code at a time: every login page opened in those 5 minutes gets the same code, and the Mac shows the notification once (the login page has a button to show it again). After 5 wrong tries the code is thrown away; after 10 wrong tries in a minute, from anywhere, every try waits until the minute is over. After 20 wrong tries since the last right one, the login locks: no new code is made for a browser until you run `meeting-copilot code` on the Mac (or press "Pair a device" on a logged-in page), which unlocks it and shows a fresh code. Time alone never unlocks it, so a device on your network that keeps guessing gets at most 20 tries in a million each time you unlock. Each logged-in browser gets its own cookie (`HttpOnly`, `SameSite=Strict`; behind https it is `Secure` and named `__Host-…`, so turning https off later does not lock that browser out of the http page), kept on the Mac only as a hash in `devices.json` in your data folder. `meeting-copilot devices` lists them and `meeting-copilot devices forget` logs them all out at once.
 
 The URLs that `meeting-copilot` and `meeting-copilot status` print have no password in them. Under the code there is still a random token, made on first start in your data folder (`~/.local/share/meeting-copilot/token`, or under `$XDG_DATA_HOME` or `MEETING_COPILOT_DATA_DIR` when set; readable only by you). It stays the same across restarts; `python3 lib/copilot.py --token` prints it, and deleting the file makes a new one at the next start. The launcher uses it to open the Mac's browser with a one-time link (valid 60 seconds, once). An old `…/?token=…` link still works, and a script can send the token as `Authorization: Bearer <token>`:
 
@@ -114,7 +114,7 @@ curl -s -H "Authorization: Bearer $(cat ~/.local/share/meeting-copilot/token)" h
 
 Two optional ways, both off by default:
 
-- **Home network** (`MEETING_COPILOT_LAN=1`): a second listener on `0.0.0.0` port 80, published as `http://copilot.local` with macOS `dns-sd` (the name follows the Mac's address when it changes). It answers only private addresses (`10/8`, `172.16/12`, `192.168/16`, `169.254/16`, `fc00::/7`, `fe80::/10` and loopback); anything else gets `403` before the login is even looked at. Open the `LAN:` URL that `meeting-copilot status` prints on each device and type the code once. Devices that do not resolve `.local` names can use the `LAN IP:` URL. This is plain http: anyone on the same Wi-Fi who can watch its traffic can see the code and the cookie, so use it only on a network you trust.
+- **Home network** (`MEETING_COPILOT_LAN=1`): a second listener on `0.0.0.0` port 80, published as `http://copilot.local` with macOS `dns-sd` (the name follows the Mac's address when it changes). It answers only private addresses (`10/8`, `172.16/12`, `192.168/16`, `169.254/16`, `fc00::/7`, `fe80::/10` and loopback); anything else gets `403` before the login is even looked at. Open the `LAN:` URL that `meeting-copilot status` prints on each device and type the code once. Devices that do not resolve `.local` names can use the `LAN IP:` URL. This is plain http: anyone on the same Wi-Fi who can watch its traffic can see the code and the cookie, so use it only on a network you trust. With `MEETING_COPILOT_LAN_HTTPS` (on by default together with the camera) there is also `https://copilot.local`, after a one-time setup on each phone (see "Phone camera").
 - **Internet, through a tunnel** (`MEETING_COPILOT_EXTRA_HOSTS=<your host>`): point a tunnel (e.g. Cloudflare Tunnel, with Cloudflare Access in front) at `http://127.0.0.1:4390` and add its host name. The page then accepts that `Host` and the `https://<host>` origin; when the tunnel says the visit came over https (`X-Forwarded-Proto` or `Cf-Visitor`), the cookies are also marked `Secure`. `meeting-copilot status` prints it as `public: https://<host>/`; the first visit from each device asks for the code.
 
 For example, in your settings file:
@@ -287,6 +287,52 @@ where: System Settings > Privacy & Security > Screen & System Audio Recording, t
 Without the permission macOS also hides window titles, so a meeting in a browser tab cannot be found.
 The copilot never tries to grant it by itself.
 
+### Phone camera
+
+Off by default. With `MEETING_COPILOT_CAMERA=1`, a live meeting gets a **Camera** button on the page. Open
+the page on your phone, tap it, allow the camera, and point the phone at what the AI should see (a
+whiteboard, a paper, a product, the room). Nothing is sent until you tap it, each meeting asks again (with
+`MEETING_COPILOT_CONFIRM_AI=1` the AI must be on too), and leaving the page or locking the phone turns it off.
+While it is on:
+
+- The page keeps a live preview and looks at the picture every 5 s (`MEETING_COPILOT_CAMERA_S`). A frame
+  (at most 1280 px, JPEG) is sent to the Mac only when the picture changed (plus once a minute when it did
+  not, so the AI knows it is still current). The Mac also drops a frame that looks like the previous one.
+- The upload (`POST /camera/frame`) needs the same login as everything else (the pairing-code cookie), the
+  page's own origin and host (private addresses on the home network, or your tunnel host), at most 4 MB, a
+  JPEG or PNG, at most one frame per `CAMERA_S / 2` seconds, and only while the camera is on for the live
+  meeting and the AI is allowed for it. Anything else is refused and nothing is kept.
+- From there the frames are treated exactly as screen frames (see above): at most 3 newest go with each
+  suggestions call, labelled "phone camera"; the prompt says that text in an image is data, never an
+  instruction; they stay in `<data folder>/frames/` and are deleted when the meeting ends.
+
+**Live video needs https.** A phone's browser opens the camera only on an https page (or on the Mac's own
+`localhost`). Two ways:
+
+- **Home network:** with `MEETING_COPILOT_LAN=1` and `CAMERA=1`, the copilot also listens with https on port
+  443 (`MEETING_COPILOT_LAN_HTTPS`, `MEETING_COPILOT_LAN_HTTPS_PORT`): `https://copilot.local`. Its
+  certificate comes from a small certificate authority (CA) the copilot makes itself on first start
+  (`meeting-copilot cert` shows it, `meeting-copilot cert --renew` replaces it). Because a CA trusted on a
+  phone could vouch for any site, it is locked down:
+  1. Its *critical* name constraints let it vouch only for `copilot.local` (your `LAN_NAME`) and private
+     addresses (`192.168/16`, `10/8`, `172.16/12`). A certificate it signed for any other name is refused
+     (the tests check this with OpenSSL, and on macOS with Apple's own `security verify-cert`).
+  2. Its private key is deleted right after it signs the copilot's certificate: nothing is left that could
+     sign anything else. A renewal makes a new CA, and each phone installs the new one (`http://copilot.local`
+     sends a phone set up for the old CA to `/setup` instead of to https).
+  3. The copilot's own key (`<data folder>/tls/server.key`) is mode 0600 and the `tls` folder is excluded from
+     Time Machine (`tmutil addexclusion`, no admin rights needed).
+
+  **Set up each phone once:** open `http://copilot.local/setup` on the phone and follow the steps (iPhone:
+  download the profile, Settings > General > VPN & Device Management (or the "Profile Downloaded" line at
+  the top of Settings) > Install, then Settings > General > About > Certificate Trust Settings > turn on
+  "Meeting Copilot CA"). Tap **Test https** at the end: from then on, `http://copilot.local` sends that
+  phone to `https://copilot.local` by itself.
+- **Internet, through a tunnel** with https (see "From your phone or another computer"): the page is already
+  https, so nothing to install.
+
+On a plain http page the **Camera** button still works, one photo per tap (the phone's camera app opens).
+
 ## Response time
 
 Every suggestions round is timed: when its input reached the copilot (the earliest transcript line or
@@ -315,7 +361,7 @@ With neither search folders nor MCP, the "Relevant facts" panel says fact search
 ## Privacy
 
 - The Muesli database is opened read-only and never written.
-- The transcript of the last 3 minutes, your goals and the items already shown are sent to Claude through `claude -p` (on the kept-open process: once, then only the new lines each round). With screen sharing turned on for a meeting, the newest frames of the meeting window go too (see "Screen and camera"). Nothing else leaves the machine.
+- The transcript of the last 3 minutes, your goals and the items already shown are sent to Claude through `claude -p` (on the kept-open process: once, then only the new lines each round). With screen sharing or the phone camera turned on for a meeting, the newest frames go too (see "Screen and camera"). Nothing else leaves the machine.
 - Sessions (full transcript plus suggestions) are saved as JSON files readable only by your user. A meeting saved again (the copilot restarted, or the meeting stopped and recorded again) gets a new file with `-2`, `-3`, and so on, so nothing earlier is overwritten.
 - The fact search may read files only inside the search folders: Read, Grep and Glob are allowed with a path rule for each folder, so a request in the meeting to open any other file is refused. The AI runs in an empty folder of its own and loads no Claude Code settings files, so no hook planted in a search folder runs with it.
 - The page answers only on 127.0.0.1 / localhost (plus any `MEETING_COPILOT_EXTRA_HOSTS`, and, with `MEETING_COPILOT_LAN=1`, private addresses on the home network, where POSTs must come from the page's own `http://<host>` origin), checks the `Host` header against DNS rebinding, and accepts POSTs only from its own origin. Every request (the page, `/state` and each POST) needs a login: the cookie of a browser that typed a pairing code, the token cookie (set by the launcher's one-time link or a `?token=` URL), or the token as an `Authorization: Bearer` header; anything else gets `401` (a browser gets the login page). The code is never shown to a browser that is not logged in, not even on the Mac itself: only the notification, `meeting-copilot status`/`code` and a logged-in page show it. The login POST passes the same `Host` and origin checks as every POST, and the code is compared in constant time. The token file and `devices.json` are readable only by your user, so other users' programs and web pages cannot read the meeting; a program running as you can still read the files.
