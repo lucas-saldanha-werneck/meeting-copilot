@@ -3596,6 +3596,7 @@ class Live(unittest.TestCase):
         time.sleep(1.1)
         self.assertEqual(frame(png_bytes(64, 48, (1, 2, 3)))[0], 409)   # off: refused
 
+    @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
     def test_look_from_the_page_with_no_meeting_talk(self):
         """Look answers about the camera picture although nobody speaks (meeting rounds need a new line)."""
         self.start(MEETING_COPILOT_CAMERA="1", MEETING_COPILOT_CAMERA_S="2", MEETING_COPILOT_SIPS="off",
