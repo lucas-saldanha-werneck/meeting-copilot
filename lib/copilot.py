@@ -50,7 +50,7 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
 import tlscert
 
-__version__ = "0.13.0"
+__version__ = "0.13.1"
 
 HERE = Path(__file__).resolve().parent
 PAGE = HERE / "page.html"
@@ -62,6 +62,8 @@ REPEAT_WARNING_S = 300     # before the same kind of warning shows again
 WINDOW_S = 180             # how much of the conversation the AI sees
 AI_TIMEOUT_S = 30          # one spawned `claude -p` suggestions call (start-up under load took up to 12 s)
 DATA_TIMEOUT_S = 40        # one fact search with tools (usually 10-15 s); it has its own queue
+LOOK_TIMEOUT_S = 90        # one Look call (6-9 s on a quiet Mac; a Mac out of memory needed more than 30 s
+                           # only to start `claude`); MEETING_COPILOT_LOOK_TIMEOUT_S sets another value
 ROTATE_TOKENS = 40000      # the kept-open suggestions process starts fresh past this context size
 ROTATE_TURNS = 150         # ... or after this many rounds
 SEED_KEEP_S = WINDOW_S     # a fresh process is seeded with this much of the transcript
@@ -690,6 +692,10 @@ class Settings:
         except ValueError:
             self.notices.append(f"MEETING_COPILOT_LOOK_S is not a number, using 10: {g('LOOK_S')}")
             self.look_s = 10.0
+        # The longest one Look call may take. Its own limit, longer than a suggestions call: each Look round
+        # starts a new `claude -p`, and on a Mac short of memory that start alone can pass 30 s. Nothing
+        # waits behind a Look call but the next Look round, so a late answer costs less than no answer.
+        self.look_timeout_s = self._num(g, "LOOK_TIMEOUT_S", float(LOOK_TIMEOUT_S))
         # https on the LAN listener, with a certificate from a local CA (see lib/tlscert.py), so a phone's
         # camera can be used (a page at http://copilot.local is not a secure context). Default: on when
         # LAN is on and CAMERA or LOOK is on.
@@ -1300,6 +1306,37 @@ def structured(out: dict) -> dict:
     return r
 
 
+class ClaudeTimeout(RuntimeError):
+    """`claude -p` did not answer inside its time limit (timeout_s) and was stopped."""
+
+    def __init__(self, timeout_s: float, stderr: str = "") -> None:
+        self.timeout_s = timeout_s
+        super().__init__(f"claude did not answer in {timeout_s:g}s; its stderr: "
+                         f"{(stderr or '').strip()[-500:] or '(empty)'}")
+
+
+def load_now() -> tuple[float, int] | None:
+    """The machine's 1-minute load average and its CPU count; None where the system has no load average
+    (Windows). A load well above the CPU count means programs are waiting for the processor or for memory."""
+    try:
+        return os.getloadavg()[0], os.cpu_count() or 1
+    except (AttributeError, OSError):
+        return None
+
+
+def slow_note(timeout_s: float) -> str:
+    """What to show when an AI call ran out of time: is this machine overloaded, or is the cause elsewhere?"""
+    took = f"the AI did not answer in {timeout_s:g} s"
+    load = load_now()
+    if load is None:
+        return took
+    one, cpus = load
+    if one > 2 * cpus:
+        return (f"this Mac is overloaded (load {one:.0f} on {cpus} CPUs), so {took}. Close heavy apps, or "
+                "set a longer MEETING_COPILOT_LOOK_TIMEOUT_S")
+    return f"{took} (this Mac's load is fine: {one:.1f} on {cpus} CPUs; check the network or the AI service)"
+
+
 def run_claude(system_prompt: str, message: str, model: str, *, schema: dict | None = None,
                tools: list[str] | None = None, mcp_tools: list[str] | None = None,
                dirs: list[Path] | None = None, max_turns: int = 2, timeout: float | None = None,
@@ -1358,8 +1395,7 @@ def run_claude(system_prompt: str, message: str, model: str, *, schema: dict | N
                 break
             except subprocess.TimeoutExpired:
                 err = ""
-        raise RuntimeError(f"claude did not answer in {timeout:g}s; its stderr: "
-                           f"{(err or '').strip()[-500:] or '(empty)'}") from None
+        raise ClaudeTimeout(timeout, err or "") from None
     if p.returncode != 0 and not out.strip():
         raise RuntimeError(f"claude exited {p.returncode}: {err.strip()[:300]}")
     return stream_result(out) if images else json.loads(out)
@@ -2479,7 +2515,7 @@ def look_round(queued: float | None = None) -> None:
                                      "that a picture is needed.)"))
         t0 = _mono()
         r = structured(run_claude(personalize(PROMPT_LOOK), msg, S.model, schema=SCHEMA_LOOK,
-                                  images=frames or None))
+                                  images=frames or None, timeout=S.look_timeout_s))
         items = []
         for it in r.get("items") or []:
             if not isinstance(it, dict):
@@ -2514,8 +2550,12 @@ def look_round(queued: float | None = None) -> None:
                 # seen, so the next try waits for a new picture (else a failing call repeats every LOOK_S)
                 if frames:
                     E.look_seen = max(E.look_seen, max(fr["id"] for fr in frames))
-                E.look_msg = (f"the AI call failed{' (ask again)' if question else ''}: {str(ex)[:200]}")
-        print(f"{clock(now())} look: {ex}", flush=True)
+                # out of time: say whether this machine is the cause, with its load, not only "no answer"
+                why = slow_note(ex.timeout_s) if isinstance(ex, ClaudeTimeout) else str(ex)[:200]
+                E.look_msg = f"the AI call failed{' (ask again)' if question else ''}: {why}"
+        load = load_now() if isinstance(ex, ClaudeTimeout) else None
+        print(f"{clock(now())} look: {ex}" + (f" (load {load[0]:.1f} on {load[1]} CPUs)" if load else ""),
+              flush=True)
 
 
 LOOK_WAKE = threading.Event()

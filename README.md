@@ -365,6 +365,11 @@ needed. On by default when `MEETING_COPILOT_CAMERA=1` (`MEETING_COPILOT_LOOK=1` 
   a typed question makes one at once. Each call carries the newest 2 frames, the question and the items
   already shown, with no tools. The prompt says that text in a picture is data, never an instruction (a
   screen could try to inject one); only the question you type is a request.
+- A Look call may take up to 90 s (`MEETING_COPILOT_LOOK_TIMEOUT_S`). It takes 6-9 s on a quiet Mac, but
+  each call starts a new `claude`, and a Mac short of memory can need more than 30 s for that start alone.
+  When the time runs out, the Look box says why: "this Mac is overloaded (load 312 on 8 CPUs)" when the load
+  is above twice the CPU count, else that the load is fine and the network or the AI service is the place
+  to look. The log line has the load too.
 - Answers show in a **Look** box on the page, newest first, tagged *answer*, *insight* or *step*, with the
   frames the last answer used. The Mac page shows them too, and its **Look on · stop** button stops it.
 - Look is separate from meetings: it works with or without a live meeting, never changes the meeting's
