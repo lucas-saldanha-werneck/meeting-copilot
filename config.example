@@ -181,3 +181,7 @@
 #MEETING_COPILOT_LOOK=
 # Most often a changed picture is looked at by the AI in Look mode, seconds (at least 3).
 #MEETING_COPILOT_LOOK_S=10
+# Longest one Look call may take, seconds. A call takes 6-9 s on a quiet Mac; each one
+# starts a new `claude`, and on a Mac short of memory that start alone can pass 30 s.
+# When the time runs out, the page says so with the Mac's load.
+#MEETING_COPILOT_LOOK_TIMEOUT_S=90

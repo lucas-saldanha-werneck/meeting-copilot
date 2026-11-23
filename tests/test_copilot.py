@@ -1482,6 +1482,14 @@ class LanHttps(unittest.TestCase):
         bad = copilot.Settings({"MEETING_COPILOT_LOOK_S": "soon"})
         self.assertEqual(bad.look_s, 10.0)
         self.assertTrue(any("LOOK_S" in n for n in bad.notices))
+        # Look has its own time limit, longer than a suggestions call
+        self.assertEqual(copilot.Settings({}).look_timeout_s, 90.0)
+        self.assertGreater(copilot.Settings({}).look_timeout_s, copilot.AI_TIMEOUT_S)
+        self.assertEqual(copilot.Settings({"MEETING_COPILOT_LOOK_TIMEOUT_S": "45"}).look_timeout_s, 45.0)
+        for value in ("soon", "0", "-5"):
+            bad = copilot.Settings({"MEETING_COPILOT_LOOK_TIMEOUT_S": value})
+            self.assertEqual(bad.look_timeout_s, 90.0)
+            self.assertTrue(any("LOOK_TIMEOUT_S" in n for n in bad.notices))
 
     def test_host_and_origin_rules_per_scheme(self):
         S = copilot.S
@@ -2665,6 +2673,79 @@ class Vision(unittest.TestCase):
         copilot.FRAMES.add(copilot.LOOK_MID, "camera", png_bytes(64, 48, (5, 5, 5)), copilot.now())
         with copilot.E.lock:                                          # a new picture tries again
             self.assertTrue(copilot.look_due(copilot.now() + 11))
+
+    def look_with_slow_ai(self, sleep_s, **settings):
+        """One Look round with a question, against the fake claude that answers after sleep_s seconds."""
+        self.settings(PERSISTENT_AI="off", SCREEN="0", CAMERA="1", LOOK_S="10", **settings)
+        os.environ["FAKE_CLAUDE_SLEEP"] = str(sleep_s)
+        copilot.look_start()
+        copilot.E.look_question = "Why does it fail?"
+        copilot.look_round()
+        return copilot.E.public()["look"]
+
+    def test_look_has_its_own_longer_time_limit(self):
+        # the suggestions limit (AI_TIMEOUT_S) is shorter than this call takes: Look must not use it
+        self.addCleanup(setattr, copilot, "AI_TIMEOUT_S", copilot.AI_TIMEOUT_S)
+        copilot.AI_TIMEOUT_S = 0.5
+        st = self.look_with_slow_ai(2, LOOK_TIMEOUT_S="120")
+        self.assertEqual(st["msg"], "")
+        self.assertEqual(st["items"][0]["kind"], "answer")
+        self.assertEqual(st["items"][0]["q"], "Why does it fail?")
+
+    def test_look_time_limit_goes_to_the_claude_call(self):
+        self.settings(PERSISTENT_AI="off", SCREEN="0", CAMERA="1")
+        seen, real = [], copilot.run_claude
+        self.addCleanup(setattr, copilot, "run_claude", real)
+
+        def fake(system, msg, model, **kw):
+            seen.append(kw.get("timeout"))
+            return {"structured_output": {"items": []}}
+        copilot.run_claude = fake
+        copilot.look_start()
+        copilot.E.look_question = "Hi?"
+        copilot.look_round()
+        self.assertEqual(seen, [90.0])                       # the default
+        self.settings(PERSISTENT_AI="off", SCREEN="0", CAMERA="1", LOOK_TIMEOUT_S="45")
+        copilot.E.look_question = "Hi?"
+        copilot.look_round()
+        self.assertEqual(seen, [90.0, 45.0])                 # MEETING_COPILOT_LOOK_TIMEOUT_S
+
+    def test_look_out_of_time_shows_the_load_of_the_mac(self):
+        self.addCleanup(setattr, copilot, "load_now", copilot.load_now)
+        copilot.load_now = lambda: (312.4, 8)                # a Mac out of memory: load far above its CPUs
+        st = self.look_with_slow_ai(30, LOOK_TIMEOUT_S="1")  # the fake is stopped after 1 s
+        self.assertIn("the AI call failed (ask again): this Mac is overloaded (load 312 on 8 CPUs)", st["msg"])
+        self.assertIn("did not answer in 1 s", st["msg"])
+        self.assertIn("MEETING_COPILOT_LOOK_TIMEOUT_S", st["msg"])
+        self.assertNotIn("stderr", st["msg"])
+        self.assertEqual(st["items"], [])
+
+    def test_look_out_of_time_on_a_quiet_mac_does_not_blame_it(self):
+        self.settings(PERSISTENT_AI="off", SCREEN="0", CAMERA="1")
+        self.addCleanup(setattr, copilot, "run_claude", copilot.run_claude)
+        self.addCleanup(setattr, copilot, "load_now", copilot.load_now)
+
+        def fake(system, msg, model, **kw):
+            raise copilot.ClaudeTimeout(kw["timeout"])
+        copilot.run_claude = fake
+        copilot.look_start()
+        for load, want, never in (((1.5, 8), "this Mac's load is fine: 1.5 on 8 CPUs", "overloaded"),
+                                  (None, "the AI did not answer in 90 s", "load")):   # None: no load average
+            copilot.load_now = lambda load=load: load
+            copilot.FRAMES.add(copilot.LOOK_MID, "camera", png_bytes(64, 48, (9, 9, 9)), copilot.now())
+            copilot.look_round()
+            msg = copilot.E.public()["look"]["msg"]
+            self.assertIn("the AI call failed: ", msg)
+            self.assertIn("did not answer in 90 s", msg)
+            self.assertIn(want, msg)
+            self.assertNotIn(never, msg)
+
+    def test_claude_timeout_is_a_runtime_error_with_the_limit(self):
+        ex = copilot.ClaudeTimeout(30, "API Error: overloaded\n")
+        self.assertIsInstance(ex, RuntimeError)
+        self.assertEqual(ex.timeout_s, 30)
+        self.assertEqual(str(ex), "claude did not answer in 30s; its stderr: API Error: overloaded")
+        self.assertIn("(empty)", str(copilot.ClaudeTimeout(30)))
 
     def test_look_stale_frames_never_make_a_call(self):
         self.settings(PERSISTENT_AI="off", SCREEN="0", CAMERA="1", LOOK_S="10")
