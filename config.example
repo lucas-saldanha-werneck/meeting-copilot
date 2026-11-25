@@ -196,3 +196,22 @@
 # starts a new `claude`, and on a Mac short of memory that start alone can pass 30 s.
 # When the time runs out, the page says so with the Mac's load.
 #MEETING_COPILOT_LOOK_TIMEOUT_S=90
+# Look in two passes. A fast model answers every round (empty: MODEL).
+#MEETING_COPILOT_LOOK_FAST_MODEL=haiku
+# A deep model re-checks in the background and adds items only to correct or complete the
+# fast answer (shown with a "deep check" label; a corrected item is struck through). It runs
+# when the gate says a question is on the screen, or when you type a question. Empty or
+# off: no deep pass (Look is then the fast model alone). Default: opus.
+#MEETING_COPILOT_LOOK_DEEP_MODEL=opus
+# jev: ask TypeSafe's Jev (a typed yes/no model, about US$0.0001 per call, 1-3 s, in
+# parallel with the fast model) whether the newest picture shows a question or task waiting
+# for an answer. off: no gate; the deep pass then runs only for a typed question.
+# Default: jev when a TypeSafe key is set (below), else off. Needs a TypeSafe API key.
+#MEETING_COPILOT_LOOK_GATE=
+# The deep pass runs when Jev's probability is at least this (0 to 1).
+#MEETING_COPILOT_LOOK_GATE_MIN=0.8
+# The TypeSafe key for the gate: put it in the environment of the copilot as
+# MEETING_COPILOT_TYPESAFE_KEY, or in a file (first line, chmod 600; a file that others can
+# read is not used) and name the file here. The key is never written in this file's values,
+# the log, the page or the AI's command line or environment.
+#MEETING_COPILOT_TYPESAFE_KEY_FILE=

@@ -381,6 +381,27 @@ needed. On by default when `MEETING_COPILOT_CAMERA=1` (`MEETING_COPILOT_LOOK=1` 
   When the time runs out, the Look box says why: "this Mac is overloaded (load 312 on 8 CPUs)" when the load
   is above twice the CPU count, else that the load is fine and the network or the AI service is the place
   to look. The log line has the load too.
+- **Two passes** (`MEETING_COPILOT_LOOK_FAST_MODEL`, default `haiku`; `MEETING_COPILOT_LOOK_DEEP_MODEL`, default
+  `opus`, empty or `off` = no deep pass). The fast model answers every round, as before. A **deep** pass with the
+  deep model starts in the background after it, with the same pictures and the fast answer as ALREADY SHOWN, and
+  adds items only when it corrects or completes something. It runs when you typed a question, or when the
+  **gate** says the newest picture shows a question or task waiting for an answer. The gate
+  (`MEETING_COPILOT_LOOK_GATE=jev`, on by default when a TypeSafe key is set, else off) is one call to
+  [TypeSafe's Jev](https://typesafe.ai) (a typed yes/no model, about US$0.0001 and 1-3 s, sent in parallel with the fast
+  model, 4 s limit; any failure counts as "no" and is logged at most once a minute). The deep pass runs at a
+  probability of `MEETING_COPILOT_LOOK_GATE_MIN` (0.8) or more. At most one deep pass runs; a changed screen
+  (or Look stopping) cancels it and its answer is dropped. On the page its items come after the fast ones with a
+  "deep check" label; one that corrects a fast item marks that item struck through "(corrected below)". Without
+  a key and with no settings Look is the fast model plus an Opus pass on typed questions only; to keep the old
+  single-model behaviour set `MEETING_COPILOT_LOOK_FAST_MODEL=sonnet` (or your `MODEL`) and
+  `MEETING_COPILOT_LOOK_DEEP_MODEL=off`. The log's `look: stages` line ends with `gate=<probability or ->/<seconds>`
+  and `deep=<run or ->` (`run`: started; its time comes in a `look: deep done deep=<seconds>` line).
+- **The Jev key** goes to the copilot only through its environment (`MEETING_COPILOT_TYPESAFE_KEY`, set by whatever
+  starts `meeting-copilot`, for example a secrets manager's run wrapper or the LaunchAgent's environment) or through
+  a file (`MEETING_COPILOT_TYPESAFE_KEY_FILE`, first line, `chmod 600`). It is read when a gate call is made and sent
+  only to `api.typesafe.ai`; it is not in a setting, the log, `/state`, the page, or the `claude` command line and
+  environment (the variable is removed from the AI's environment). The gate sends the newest camera frame to
+  TypeSafe; with no key, no frame goes there.
 - Answers show in a **Look** box on the page, newest first, tagged *answer*, *insight* or *step*, with the
   frames the last answer used. The Mac page shows them too, and its **Look on · stop** button stops it.
 - Look is separate from meetings: it works with or without a live meeting, never changes the meeting's
@@ -418,7 +439,7 @@ With neither search folders nor MCP, the "Relevant facts" panel says fact search
 ## Privacy
 
 - The Muesli database is opened read-only and never written.
-- The transcript of the last 3 minutes, your goals and the items already shown are sent to Claude through `claude -p` (on the kept-open process: once, then only the new lines each round). With screen sharing or the phone camera turned on for a meeting, the newest frames go too (see "Screen and camera"). In Look mode, after you tap **Look**, the newest camera frames and the questions you type go to Claude (see "Look mode"). Nothing else leaves the machine.
+- The transcript of the last 3 minutes, your goals and the items already shown are sent to Claude through `claude -p` (on the kept-open process: once, then only the new lines each round). With screen sharing or the phone camera turned on for a meeting, the newest frames go too (see "Screen and camera"). In Look mode, after you tap **Look**, the newest camera frames and the questions you type go to Claude (see "Look mode"). With a TypeSafe key set, the newest Look frame also goes to TypeSafe (Jev) for the gate. Nothing else leaves the machine.
 - Sessions (full transcript plus suggestions) are saved as JSON files readable only by your user. A meeting saved again (the copilot restarted, or the meeting stopped and recorded again) gets a new file with `-2`, `-3`, and so on, so nothing earlier is overwritten.
 - The fact search may read files only inside the search folders: Read, Grep and Glob are allowed with a path rule for each folder, so a request in the meeting to open any other file is refused. The AI runs in an empty folder of its own and loads no Claude Code settings files, so no hook planted in a search folder runs with it.
 - The page answers only on 127.0.0.1 / localhost (plus any `MEETING_COPILOT_EXTRA_HOSTS`, and, with `MEETING_COPILOT_LAN=1`, private addresses on the home network, where POSTs must come from the page's own `http://<host>` origin), checks the `Host` header against DNS rebinding, and accepts POSTs only from its own origin. Every request (the page, `/state` and each POST) needs a login: the cookie of a browser that typed a pairing code, the token cookie (set by the launcher's one-time link or a `?token=` URL), or the token as an `Authorization: Bearer` header; anything else gets `401` (a browser gets the login page). The code is never shown to a browser that is not logged in, not even on the Mac itself: only the notification, `meeting-copilot status`/`code` and a logged-in page show it. The login POST passes the same `Host` and origin checks as every POST, and the code is compared in constant time. The token file and `devices.json` are readable only by your user, so other users' programs and web pages cannot read the meeting; a program running as you can still read the files.

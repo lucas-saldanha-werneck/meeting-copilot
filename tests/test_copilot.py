@@ -9,6 +9,7 @@ import filecmp
 import hashlib
 import http.client
 import io
+import http.server
 import json
 import os
 import re
@@ -2368,7 +2369,8 @@ class Vision(unittest.TestCase):
         cfg = {"MEETING_COPILOT_SCREEN": "1", "MEETING_COPILOT_DATA_DIR": os.path.join(self.t, "data"),
                "MEETING_COPILOT_SCREENCAPTURE": self.sc, "MEETING_COPILOT_WINDOW_LIST": f'"{self.wl}"',
                "MEETING_COPILOT_SIPS": "off", "MEETING_COPILOT_CLAUDE": self.claude,
-               "MEETING_COPILOT_API_CREDIT": "off", "MEETING_COPILOT_LOOK_WARM": "0"}   # its own tests
+               "MEETING_COPILOT_API_CREDIT": "off", "MEETING_COPILOT_LOOK_WARM": "0",
+               "MEETING_COPILOT_LOOK_DEEP_MODEL": ""}   # its own tests
         cfg.update({"MEETING_COPILOT_" + k: v for k, v in extra.items()})
         copilot.S = copilot.Settings(cfg)
         return copilot.S
@@ -2856,11 +2858,11 @@ class Vision(unittest.TestCase):
         self.assertIn("What is a PNG?", c["text"])
         # another model (or language): the spare is replaced, not used with the old prompt
         third = copilot.LOOK_SPARE.proc
-        copilot.S.model = "haiku"
+        copilot.S.look_fast_model = "sonnet"
         copilot.look_keep_warm()
         self.assertIsNot(copilot.LOOK_SPARE.proc, third)
         self.assertIsNotNone(third.poll())
-        self.assertIn("haiku", copilot.LOOK_SPARE.key[0])
+        self.assertIn("sonnet", copilot.LOOK_SPARE.key[0])
         # Look stops: the spare is stopped, and a round ending later starts none
         last = copilot.LOOK_SPARE.proc
         copilot.look_stop("test")
@@ -2885,7 +2887,7 @@ class Vision(unittest.TestCase):
         self.assertEqual(len(lines), 1, out.getvalue())
         print("EXAMPLE (warm):", lines[0])
         self.assertRegex(lines[0], r"look: stages enc=0\.12 up=0\.43 prep=\d+\.\d\d wait=\d+\.\d "
-                                   r"spawn=warm:\d+\.\d first=\d+\.\d ai=\d+\.\d$")
+                                   r"spawn=warm:\d+\.\d first=\d+\.\d ai=\d+\.\d gate=-/- deep=-$")
         self.assertGreaterEqual(float(re.search(r"spawn=warm:([\d.]+)", lines[0]).group(1)), 0.3)
         self.assertIn("look: round with 1 picture(s)", rows[0])        # the stages line comes right after it
         self.assertIs(rows[1], lines[0])
@@ -2900,7 +2902,238 @@ class Vision(unittest.TestCase):
         line = next(x for x in out.getvalue().splitlines() if "look: stages" in x)
         print("EXAMPLE (cold):", line)
         self.assertRegex(line, r"enc=- up=- prep=\d+\.\d\d wait=\d+\.\d spawn=cold:\d+\.\d "
-                               r"first=\d+\.\d ai=\d+\.\d$")
+                               r"first=\d+\.\d ai=\d+\.\d gate=-/- deep=-$")
+
+    # ---- Look in two passes: fast model, Jev gate, deep model
+    def jev_server(self, p_yes=0.95, status=200):
+        """A fake Jev on localhost; returns (url, hits); each hit is (headers, body)."""
+        hits = []
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_POST(h):
+                body = h.rfile.read(int(h.headers["Content-Length"]))
+                hits.append((dict(h.headers), json.loads(body)))
+                out = json.dumps({"answers": {"q": {"type": "noul", "noul": p_yes}}}).encode()
+                h.send_response(status)
+                h.send_header("Content-Type", "application/json")
+                h.end_headers()
+                h.wfile.write(out)
+
+            def log_message(h, *a):
+                pass
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        self.addCleanup(setattr, copilot, "GATE_URL", copilot.GATE_URL)
+        copilot.GATE_URL = f"http://127.0.0.1:{srv.server_address[1]}/v1/systemone"
+        return hits
+
+    def two_pass_ai(self, fast_items=None, deep_items=None, deep_gate=None):
+        """Replaces run_claude: the fast model (haiku) and the deep model (opus) answer differently; returns the
+        list of (model, message, schema is deep, kwargs)."""
+        calls, real = [], copilot.run_claude
+        self.addCleanup(setattr, copilot, "run_claude", real)
+
+        def fake(system, msg, model, **kw):
+            calls.append((model, msg, kw))
+            if model == "opus":
+                if deep_gate:
+                    deep_gate.wait(10)
+                if kw.get("holder", {}).get("stale"):
+                    raise RuntimeError("cancelled")
+                return {"structured_output": {"items": deep_items if deep_items is not None else []}}
+            return {"structured_output": {"items": fast_items or [{"kind": "answer", "text": "The answer is 4."}]}}
+        copilot.run_claude = fake
+        return calls
+
+    def wait_deep(self):
+        for _ in range(100):
+            if copilot.E.look_deep is None:
+                return
+            time.sleep(0.05)
+        self.fail("the deep pass did not end")
+
+    def look_two(self, question="", **settings):
+        key_env = {copilot.TYPESAFE_KEY_ENV: "sk-test-secret-123"}
+        self.addCleanup(os.environ.pop, copilot.TYPESAFE_KEY_ENV, None)
+        os.environ.update(key_env)
+        settings.setdefault("LOOK_DEEP_MODEL", "opus")
+        self.settings(PERSISTENT_AI="off", SCREEN="0", CAMERA="1", LOOK_S="10", **settings)
+        copilot.look_start()
+        self.addCleanup(copilot.look_stop, "test")
+        copilot.FRAMES.add(copilot.LOOK_MID, "camera", png_bytes(64, 48, (250, 250, 250)), copilot.now())
+        copilot.E.look_question = question
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            copilot.look_round()
+            self.wait_deep()
+        return out.getvalue()
+
+    def test_look_two_pass_settings(self):
+        d = copilot.Settings({})
+        self.assertEqual((d.look_fast_model, d.look_deep_model, d.look_gate, d.look_gate_min),
+                         ("haiku", "opus", "off", 0.8))                    # no key: gate off
+        self.assertEqual(copilot.Settings({"MEETING_COPILOT_LOOK_FAST_MODEL": "sonnet"}).look_fast_model, "sonnet")
+        for v in ("", "off"):
+            self.assertEqual(copilot.Settings({"MEETING_COPILOT_LOOK_DEEP_MODEL": v}).look_deep_model, "")
+        self.assertEqual(copilot.Settings({"MEETING_COPILOT_LOOK_GATE_MIN": "0.5"}).look_gate_min, 0.5)
+        self.assertEqual(copilot.Settings({"MEETING_COPILOT_LOOK_GATE_MIN": "x"}).look_gate_min, 0.8)
+        bad = copilot.Settings({"MEETING_COPILOT_LOOK_GATE": "jev"})       # asked for, but no key
+        self.assertEqual(bad.look_gate, "off")
+        self.assertTrue(any("TYPESAFE_KEY" in n for n in bad.notices))
+        self.addCleanup(os.environ.pop, copilot.TYPESAFE_KEY_ENV, None)
+        os.environ[copilot.TYPESAFE_KEY_ENV] = "sk-test-secret-123"
+        self.assertEqual(copilot.Settings({}).look_gate, "jev")             # a key makes it the default
+        self.assertEqual(copilot.Settings({"MEETING_COPILOT_LOOK_GATE": "off"}).look_gate, "off")
+        del os.environ[copilot.TYPESAFE_KEY_ENV]
+        kf = os.path.join(self.t, "key")
+        with open(kf, "w") as f:
+            f.write("sk-file-secret\n")
+        os.chmod(kf, 0o644)
+        s = copilot.Settings({"MEETING_COPILOT_TYPESAFE_KEY_FILE": kf, "MEETING_COPILOT_LOOK_GATE": "jev"})
+        self.assertEqual(s.look_gate, "off")                                # readable by others: refused
+        self.assertTrue(any("chmod 600" in n for n in s.notices))
+        os.chmod(kf, 0o600)
+        self.assertEqual(copilot.Settings({"MEETING_COPILOT_TYPESAFE_KEY_FILE": kf}).look_gate, "jev")
+        self.assertEqual(copilot.typesafe_key(kf), "sk-file-secret")
+
+    def test_look_gate_yes_runs_the_deep_pass_after_the_fast_one(self):
+        hits = self.jev_server(0.95)
+        calls = self.two_pass_ai(deep_items=[{"kind": "answer", "text": "Actually it is 5, not 4.",
+                                              "fixes": "The answer is 4."}])
+        log = self.look_two()
+        self.assertEqual([c[0] for c in calls], ["haiku", "opus"])
+        self.assertIn("The answer is 4.", calls[1][1])                        # the fast answer: ALREADY SHOWN
+        self.assertIn("## ALREADY SHOWN", calls[1][1])
+        self.assertEqual(len(calls[1][2]["images"]), 1)                       # the same picture
+        self.assertEqual(len(hits), 1)
+        h, body = hits[0]
+        self.assertEqual(h["Authorization"], "Bearer sk-test-secret-123")
+        self.assertEqual(body["questions"]["q"]["type"], "noul")
+        self.assertEqual(body["assets"]["img1"]["format"], "png")
+        self.assertTrue(body["assets"]["img1"]["data_base64"])
+        items = copilot.E.public()["look"]["items"]
+        self.assertEqual([(i["text"], bool(i.get("deep")), bool(i.get("superseded"))) for i in items],
+                         [("The answer is 4.", False, True), ("Actually it is 5, not 4.", True, False)])
+        self.assertEqual(items[1]["fixes"], "The answer is 4.")
+        st = next(x for x in log.splitlines() if "look: stages" in x)
+        print("EXAMPLE (gate yes):", st)
+        self.assertRegex(st, r"gate=0\.95/\d+\.\d deep=run$")
+        self.assertRegex(log, r"look: deep done deep=\d+\.\d first=\d+\.\d items=1 fixes=1")
+
+    def test_look_gate_no_keeps_the_deep_model_out(self):
+        self.jev_server(0.3)
+        calls = self.two_pass_ai()
+        log = self.look_two()
+        self.assertEqual([c[0] for c in calls], ["haiku"])
+        self.assertRegex(next(x for x in log.splitlines() if "look: stages" in x), r"gate=0\.30/\d+\.\d deep=-$")
+
+    def test_look_typed_question_runs_the_deep_pass_without_the_gate(self):
+        hits = self.jev_server(0.1)
+        calls = self.two_pass_ai(deep_items=[])
+        log = self.look_two("What is 2+2?")
+        self.assertEqual([c[0] for c in calls], ["haiku", "opus"])
+        self.assertEqual(hits, [])                                            # no Jev call for a typed question
+        self.assertIn("What is 2+2?", calls[1][1])
+        self.assertRegex(next(x for x in log.splitlines() if "look: stages" in x), r"gate=-/- deep=run$")
+        self.assertIn("items=0", log)                                         # nothing to correct: no item added
+        self.assertEqual(len(copilot.E.public()["look"]["items"]), 1)
+
+    def test_look_without_a_deep_model_or_gate_is_the_fast_pass_only(self):
+        hits = self.jev_server(0.99)
+        calls = self.two_pass_ai()
+        self.look_two(LOOK_DEEP_MODEL="")
+        self.assertEqual([c[0] for c in calls], ["haiku"])
+        self.assertEqual(hits, [])                                            # no deep pass: no need to ask Jev
+        calls.clear()
+        copilot.look_stop("t")
+        self.look_two("Q?", LOOK_GATE="off")                                  # a typed question still goes deep
+        self.assertEqual([c[0] for c in calls], ["haiku", "opus"])
+
+    def test_look_gate_failure_is_no_and_logged_once_a_minute_without_the_key(self):
+        self.jev_server(0.9, status=500)
+        self.two_pass_ai()
+        log = self.look_two()
+        copilot.FRAMES.add(copilot.LOOK_MID, "camera", png_bytes(64, 48, (5, 5, 5)), copilot.now())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            copilot.look_round()
+        log += out.getvalue()
+        self.assertEqual(log.count("look: gate failed (HTTP 500)"), 1)
+        self.assertEqual(log.count("deep=-"), 2)
+        self.assertNotIn("sk-test-secret-123", log)
+        self.assertNotIn("sk-test-secret-123", json.dumps(copilot.E.public()))
+
+    def test_look_gate_timeout_is_no(self):
+        hits = self.jev_server(0.9)
+        self.addCleanup(setattr, copilot, "GATE_TIMEOUT_S", copilot.GATE_TIMEOUT_S)
+        copilot.GATE_TIMEOUT_S = 0.2
+        copilot.GATE_URL = "http://127.0.0.1:9/v1/systemone"                  # nothing listens there
+        self.two_pass_ai()
+        log = self.look_two()
+        self.assertIn("look: gate failed (", log)
+        self.assertRegex(log, r"gate=-/\d+\.\d deep=-")
+        self.assertEqual(hits, [])
+
+    def test_look_one_deep_pass_in_flight_and_a_changed_screen_drops_it(self):
+        self.jev_server(0.95)
+        release = threading.Event()
+        self.addCleanup(release.set)
+        calls = self.two_pass_ai(deep_items=[{"kind": "insight", "text": "Old screen insight."}], deep_gate=release)
+        key_env = {copilot.TYPESAFE_KEY_ENV: "sk-test-secret-123"}
+        self.addCleanup(os.environ.pop, copilot.TYPESAFE_KEY_ENV, None)
+        os.environ.update(key_env)
+        self.settings(PERSISTENT_AI="off", SCREEN="0", CAMERA="1", LOOK_S="10", LOOK_DEEP_MODEL="opus")
+        copilot.look_start()
+        self.addCleanup(copilot.look_stop, "test")
+        copilot.FRAMES.add(copilot.LOOK_MID, "camera", png_bytes(64, 48, (250, 250, 250)), copilot.now())
+        copilot.look_round()                                                  # fast pass done, deep waits
+        self.assertIsNotNone(copilot.E.look_deep)
+        first = copilot.E.look_deep
+        self.assertTrue(copilot.E.public()["look"]["deep"])
+        out = io.StringIO()
+        copilot.FRAMES.add(copilot.LOOK_MID, "camera", png_bytes(64, 48, (5, 5, 5)), copilot.now())
+        with contextlib.redirect_stdout(out):
+            copilot.look_round()                                              # a changed screen: old one cancelled
+            release.set()
+            self.wait_deep()
+            time.sleep(0.2)
+        self.assertTrue(first["stale"])
+        self.assertIn("deep pass cancelled (the screen changed)", out.getvalue())
+        texts = [i["text"] for i in copilot.E.public()["look"]["items"] if i.get("deep")]
+        self.assertEqual(texts, ["Old screen insight."])                      # only the newest pass's answer
+        self.assertEqual(sum(1 for c in calls if c[0] == "opus"), 2)
+
+    def test_look_stop_cancels_the_deep_pass(self):
+        self.jev_server(0.95)
+        release = threading.Event()
+        self.addCleanup(release.set)
+        self.two_pass_ai(deep_items=[{"kind": "insight", "text": "Late."}], deep_gate=release)
+        os.environ[copilot.TYPESAFE_KEY_ENV] = "sk-test-secret-123"
+        self.addCleanup(os.environ.pop, copilot.TYPESAFE_KEY_ENV, None)
+        self.settings(PERSISTENT_AI="off", SCREEN="0", CAMERA="1", LOOK_S="10", LOOK_DEEP_MODEL="opus")
+        copilot.look_start()
+        copilot.FRAMES.add(copilot.LOOK_MID, "camera", png_bytes(64, 48, (250, 250, 250)), copilot.now())
+        copilot.look_round()
+        copilot.look_stop("test")
+        release.set()
+        time.sleep(0.3)
+        self.assertIsNone(copilot.E.look_deep)
+        self.assertEqual([i["text"] for i in copilot.E.look_items], ["The answer is 4."])   # no deep item
+
+    def test_look_key_stays_out_of_the_claude_command_and_environment(self):
+        os.environ[copilot.TYPESAFE_KEY_ENV] = "sk-test-secret-123"
+        self.addCleanup(os.environ.pop, copilot.TYPESAFE_KEY_ENV, None)
+        self.settings()
+        cmd, env, _ = copilot.claude_command("sys", "haiku")
+        self.assertNotIn("sk-test-secret-123", " ".join(cmd))
+        self.assertTrue(env is not None and copilot.TYPESAFE_KEY_ENV not in env)
+        self.settings(API_CREDIT="")
+        copilot.S.credit = "/bin/true"
+        _, env, _ = copilot.claude_command("sys", "haiku")
+        self.assertNotIn(copilot.TYPESAFE_KEY_ENV, env)
+        self.assertNotIn("TYPESAFE", json.dumps(copilot.E.public()))
 
     def test_a_spare_that_does_not_wait_pauses_the_spares(self):
         log = os.path.join(self.t, "starts.log")

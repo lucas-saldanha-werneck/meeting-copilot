@@ -42,6 +42,8 @@ import threading
 import time
 import traceback
 import unicodedata
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -50,7 +52,7 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
 import tlscert
 
-__version__ = "0.14.1"
+__version__ = "0.15.0"
 
 HERE = Path(__file__).resolve().parent
 PAGE = HERE / "page.html"
@@ -548,6 +550,32 @@ def _tool(value: str, name: str) -> str | None:
     return shutil.which(name) if sys.platform == "darwin" else None
 
 
+TYPESAFE_KEY_ENV = "MEETING_COPILOT_TYPESAFE_KEY"
+
+
+def typesafe_key(key_file: str = "", notices: list | None = None) -> str:
+    """The TypeSafe API key for the Look gate: the environment variable MEETING_COPILOT_TYPESAFE_KEY, else the
+    first line of the file MEETING_COPILOT_TYPESAFE_KEY_FILE names (refused when others can read it). Read
+    where it is used and never kept in a setting, a log line, /state or a command line."""
+    k = os.environ.get(TYPESAFE_KEY_ENV, "").strip()
+    if k:
+        return k
+    if not key_file:
+        return ""
+    try:
+        if os.name == "posix" and os.stat(key_file).st_mode & 0o077:
+            if notices is not None:
+                notices.append("MEETING_COPILOT_TYPESAFE_KEY_FILE is readable by others: run chmod 600 on it "
+                               "(the key is not used)")
+            return ""
+        with open(key_file, encoding="utf-8") as f:
+            return (f.readline() or "").strip()
+    except OSError:
+        if notices is not None:
+            notices.append("MEETING_COPILOT_TYPESAFE_KEY_FILE could not be read")
+        return ""
+
+
 class Settings:
     def __init__(self, cfg: dict) -> None:
         g = lambda k, d="": cfg.get("MEETING_COPILOT_" + k) or d  # noqa: E731  (KEY= with no value: the default)
@@ -712,6 +740,29 @@ class Settings:
         # starts a new `claude -p`, and on a Mac short of memory that start alone can pass 30 s. Nothing
         # waits behind a Look call but the next Look round, so a late answer costs less than no answer.
         self.look_timeout_s = self._num(g, "LOOK_TIMEOUT_S", float(LOOK_TIMEOUT_S))
+        # Look in two passes: a fast model answers every round; a deep model re-checks, in the background, when
+        # the gate says a question is on the screen or a question was typed. LOOK_FAST_MODEL empty: MODEL.
+        # LOOK_DEEP_MODEL empty (or off): no deep pass. The gate (Jev) needs a TypeSafe key, see typesafe_key().
+        self.look_fast_model = g("LOOK_FAST_MODEL", "haiku")
+        deep = cfg.get("MEETING_COPILOT_LOOK_DEEP_MODEL")      # "" is meaningful here: no deep pass
+        deep = "opus" if deep is None else deep.strip()
+        self.look_deep_model = "" if deep.lower() in ("0", "no", "false", "off") else deep
+        gate = g("LOOK_GATE").strip().lower()
+        if gate not in ("", "jev", "off"):
+            self.notices.append(f"MEETING_COPILOT_LOOK_GATE must be jev or off, got: {gate}")
+            gate = ""
+        kf = g("TYPESAFE_KEY_FILE").strip()
+        self.typesafe_key_file = _expand(kf) if kf else ""
+        has_key = bool(typesafe_key(self.typesafe_key_file, self.notices if gate == "jev" else None))
+        if gate == "jev" and not has_key:
+            self.notices.append("MEETING_COPILOT_LOOK_GATE=jev needs a TypeSafe key "
+                                "(MEETING_COPILOT_TYPESAFE_KEY or MEETING_COPILOT_TYPESAFE_KEY_FILE): gate is off")
+        self.look_gate = "jev" if gate != "off" and has_key else "off"
+        try:
+            self.look_gate_min = min(1.0, max(0.0, float(g("LOOK_GATE_MIN", "0.8"))))
+        except ValueError:
+            self.notices.append(f"MEETING_COPILOT_LOOK_GATE_MIN is not a number, using 0.8: {g('LOOK_GATE_MIN')}")
+            self.look_gate_min = 0.8
         # https on the LAN listener, with a certificate from a local CA (see lib/tlscert.py), so a phone's
         # camera can be used (a page at http://copilot.local is not a secure context). Default: on when
         # LAN is on and CAMERA or LOOK is on.
@@ -860,6 +911,51 @@ something NEW in a frame as well as to the NEW part of the transcript.
 """
 
 
+GATE_URL = "https://api.typesafe.ai/v1/systemone"    # a constant, never a setting: the key goes only here
+GATE_TIMEOUT_S = 4.0
+GATE_QUESTION = ("Does `photo` show a screen with a question or task waiting for the user's answer?")
+
+
+def jev_gate(frame: dict) -> tuple[float | None, float]:
+    """(probability that the picture shows a question or task waiting for an answer, seconds). None on any
+    problem (no key, a timeout, an HTTP error, a picture Jev refuses): the caller treats it as "no". Jev is
+    TypeSafe's typed-decision API: one yes/no question about the picture, about US$0.0001."""
+    t0 = _mono()
+    key = typesafe_key(S.typesafe_key_file)
+    if not key:
+        return None, 0.0
+    body = json.dumps({
+        "model": "jev-latest",
+        "state": {"photo": "img1"},
+        "assets": {"img1": {"type": "image", "format": "png" if frame["data"][:4] == b"\x89PNG" else "jpg",
+                            "data_base64": base64.b64encode(frame["data"]).decode("ascii")}},
+        "questions": {"q": {"type": "noul", "instructions": GATE_QUESTION}},
+    }).encode()
+    req = urllib.request.Request(GATE_URL, data=body, method="POST", headers={
+        "Authorization": "Bearer " + key, "Content-Type": "application/json",
+        "TypeSafe-Danger-Zone-Images": "true"})       # the API asks for this header with pictures
+    try:
+        with urllib.request.urlopen(req, timeout=GATE_TIMEOUT_S) as resp:
+            p = float(json.loads(resp.read().decode())["answers"]["q"]["noul"])
+        return min(1.0, max(0.0, p)), _mono() - t0
+    except urllib.error.HTTPError as ex:
+        why = f"HTTP {ex.code}"
+    except (OSError, ValueError, KeyError, TypeError) as ex:
+        why = type(ex).__name__                      # never the message: it could carry the request
+    gate_error(why)
+    return None, _mono() - t0
+
+
+def gate_error(why: str) -> None:
+    """One log line about a failed gate call, at most one a minute."""
+    t = _mono()
+    with E.lock:
+        if t - E.look_gate_err_at < 60:
+            return
+        E.look_gate_err_at = t
+    print(f"{clock(now())} look: gate failed ({why}), treated as no question", flush=True)
+
+
 # Look mode (no meeting): the user points the phone camera at something, often the Mac screen.
 PROMPT_LOOK = """You are a visual helper for the user. The message carries the newest picture(s) from the
 user's phone camera, oldest first, each with a label (time, NEWEST = the last one, NEW = arrived after your
@@ -894,6 +990,37 @@ SCHEMA_LOOK = {
                 "properties": {
                     "kind": {"type": "string", "enum": ["answer", "insight", "step"]},
                     "text": {"type": "string"},
+                },
+                "required": ["kind", "text"],
+            },
+        },
+    },
+    "required": ["items"],
+}
+
+# The second, slower pass of Look: it sees the same picture(s) and the fast model's answer.
+PROMPT_LOOK_DEEP = PROMPT_LOOK + """
+You are the SECOND, careful pass. A fast model already looked at the same picture(s) and its items are in the
+ALREADY SHOWN list (the user has read them). Think the screen and the QUESTION through properly, then return
+items ONLY when you correct something in ALREADY SHOWN or add something it missed that matters (a better or
+complete answer, a wrong number, a missed error, a safer step). When the fast items are right and enough,
+return no items.
+- A correction carries "fixes": the exact text of the ALREADY SHOWN item that is wrong or incomplete. Leave
+  "fixes" empty for an addition.
+- Never repeat what ALREADY SHOWN already says.
+"""
+
+SCHEMA_LOOK_DEEP = {
+    "type": "object",
+    "properties": {
+        "items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["answer", "insight", "step"]},
+                    "text": {"type": "string"},
+                    "fixes": {"type": "string"},
                 },
                 "required": ["kind", "text"],
             },
@@ -1035,6 +1162,8 @@ class State:
         self.look_gen = 0                    # a new number at each start: an answer for an older run is dropped
         self.look_last = 0.0                 # when the last Look frame arrived
         self.look_same_logged = 0.0          # when look_log_same last wrote a line
+        self.look_gate_err_at = -1e9         # when gate_error last wrote a line (monotonic)
+        self.look_deep = None                # the deep pass in flight (dict), at most one
         self.look_seen = 0                   # newest frame id a finished Look round has seen
         self.look_round_at = 0.0             # when the last Look round started
         self.look_question = ""              # typed on the page, waiting for the next round
@@ -1121,7 +1250,7 @@ class State:
                     "enabled": S.look, "on": S.look and self.look_on, "look_s": S.look_s,
                     "camera_s": S.look_camera_s, "busy": QL.busy, "msg": self.look_msg,
                     "items": last(self.look_items, 20), "used": self.look_used,
-                    "pending": bool(self.look_question),
+                    "pending": bool(self.look_question), "deep": self.look_deep is not None,
                 },
                 "latency": latency_summary(self.rounds),
                 "lines": last(self.lines, 8),
@@ -1368,6 +1497,8 @@ def claude_command(system_prompt: str, model: str, *, schema: dict | None = None
         raise RuntimeError("claude command not found (install Claude Code or set MEETING_COPILOT_CLAUDE)")
     # With the wrapper, it runs the same `claude` this tool would have run (CLAUDE_CREDITO_REAL).
     env = {**os.environ, "CLAUDE_CREDITO_REAL": S.claude} if S.credit else None
+    if TYPESAFE_KEY_ENV in os.environ:      # the Look gate's key is none of claude's business
+        env = {k: v for k, v in (env or os.environ).items() if k != TYPESAFE_KEY_ENV}
     # With frames, the message goes in as stream-json (the only input format of `claude -p` that carries
     # images; it requires stream-json output too, whose last line is the same result object as json).
     fmt = (["--input-format", "stream-json", "--output-format", "stream-json", "--verbose"] if stream
@@ -1510,8 +1641,9 @@ def run_claude(system_prompt: str, message: str, model: str, *, schema: dict | N
                tools: list[str] | None = None, mcp_tools: list[str] | None = None,
                dirs: list[Path] | None = None, max_turns: int = 2, timeout: float | None = None,
                images: list[dict] | None = None, spare: Spare | None = None,
-               timing: dict | None = None) -> dict:
-    """One `claude -p` call. With a spare: the call is stream-json (with or without images), runs on the
+               timing: dict | None = None, holder: dict | None = None) -> dict:
+    """One `claude -p` call. holder: a dict that gets the process as holder["proc"], so another thread can stop
+    it; with holder["stale"] set the call is cancelled (RuntimeError) before or while it runs. With a spare: the call is stream-json (with or without images), runs on the
     spare when it was started with this same command, and a new spare is started right away for the next."""
     timeout = AI_TIMEOUT_S if timeout is None else timeout
     stream = bool(images) or spare is not None
@@ -1524,6 +1656,11 @@ def run_claude(system_prompt: str, message: str, model: str, *, schema: dict | N
         p = spawn_claude(cmd, env, cwd)
     if spare:
         spare.fill(spare_key(cmd, env), cmd, env, cwd)
+    if holder is not None:
+        holder["proc"] = p
+        if holder.get("stale"):
+            stop_claude(p)
+            raise RuntimeError("cancelled")
     born = getattr(p, "born_m", None)
     if timing is not None:
         timing["spawn"] = "warm" if warm else "cold"
@@ -2754,6 +2891,7 @@ def look_stop(why: str = "") -> None:
         E.look_on, E.look_question, E.look_used = False, "", []
         E.look_gen += 1
     LOOK_SPARE.stop()
+    look_deep_cancel("Look stopped")
     FRAMES.drop(LOOK_MID)
     if was:
         print(f"{clock(now())} look: off{f' ({why})' if why else ''}", flush=True)
@@ -2782,7 +2920,7 @@ def look_keep_warm() -> None:
     if not (S.look_warm and S.claude):
         return
     try:
-        cmd, env, cwd = claude_command(personalize(PROMPT_LOOK), S.model, schema=SCHEMA_LOOK, stream=True)
+        cmd, env, cwd = claude_command(personalize(PROMPT_LOOK), S.look_fast_model or S.model, schema=SCHEMA_LOOK, stream=True)
     except (RuntimeError, OSError) as ex:
         error(f"look: no spare claude: {ex}")
         return
@@ -2814,11 +2952,14 @@ def look_due(t: float) -> bool:
     return FRAMES.newest_id(LOOK_MID, {"camera"}, t) > E.look_seen and t - E.look_round_at >= S.look_s
 
 
-def look_stages(frames: list[dict], timing: dict, t_round: float) -> str:
+def look_stages(frames: list[dict], timing: dict, t_round: float, gate: tuple = (None, 0.0),
+                deep: str = "-") -> str:
     """One short line with the seconds of each stage of a Look round, to grep:
     enc (page: capture+encode of the newest frame), up (page: the upload before it), prep (sips on the Mac),
     wait (newest frame kept until the call starts), spawn (warm: age of the spare; cold: start to first
-    output), first (message written until the first assistant event), ai (message written until the result).
+    output), first (message written until the first assistant event), ai (message written until the result),
+    gate (Jev's probability of a question on the screen / its seconds), deep ("-": no deep pass this round,
+    "run": started in the background; its seconds come on its own `look: deep` line).
     "-" is a stage that was not measured. The phone's clock is never compared with the Mac's (they differ), so
     enc and up are durations the page measured itself."""
     def f(v, nd=1):
@@ -2827,7 +2968,9 @@ def look_stages(frames: list[dict], timing: dict, t_round: float) -> str:
     wait = max(0.0, t_round - new["kept_m"]) if new.get("kept_m") else None
     return (f"enc={f(new.get('enc_s'), 2)} up={f(new.get('up_s'), 2)} prep={f(new.get('prep_s'), 2)} "
             f"wait={f(wait)} spawn={timing.get('spawn', '-')}:{f(timing.get('spawn_s'))} "
-            f"first={f(timing.get('first_s'))} ai={f(timing.get('ai_s'))}")
+            f"first={f(timing.get('first_s'))} ai={f(timing.get('ai_s'))} "
+            f"gate={'-' if gate[0] is None else format(gate[0], '.2f')}/{f(gate[1] if gate[1] else None)} "
+            f"deep={deep}")
 
 
 def look_round(queued: float | None = None) -> None:
@@ -2858,13 +3001,23 @@ def look_round(queued: float | None = None) -> None:
             if fr.get("forced"):
                 tags.append("re-sent after a quiet minute: may show the same screen as before")
             fr["label"] = f"Picture: phone camera at {clock(fr['ts'])} ({', '.join(tags)})"
-        msg = (now_line() + "\n\n## ALREADY SHOWN\n" + ("\n".join(f"- {j}" for j in shown) or "(nothing)")
-               + "\n\n## QUESTION\n" + (question or "(none: give insights or next steps only if useful)")
-               + ("" if frames else "\n\n(No picture yet: answer the question from the text alone, or say "
-                                     "that a picture is needed.)"))
+        def build_msg(already: list[str]) -> str:
+            return (now_line() + "\n\n## ALREADY SHOWN\n" + ("\n".join(f"- {j}" for j in already) or "(nothing)")
+                    + "\n\n## QUESTION\n" + (question or "(none: give insights or next steps only if useful)")
+                    + ("" if frames else "\n\n(No picture yet: answer the question from the text alone, or say "
+                                          "that a picture is needed.)"))
+        msg = build_msg(shown)
+        if any(f["id"] > seen for f in frames):
+            look_deep_cancel("the screen changed")        # a deep pass for the old screen is no use now
+        # the gate asks Jev about the newest picture while the fast model works; a typed question needs no gate
+        gate_res: list = [(None, 0.0)]
+        gth = None
+        if S.look_deep_model and S.look_gate == "jev" and frames and not question:
+            gth = threading.Thread(target=lambda: gate_res.__setitem__(0, jev_gate(frames[-1])), daemon=True)
+            gth.start()
         t0 = _mono()
         timing: dict = {}
-        r = structured(run_claude(personalize(PROMPT_LOOK), msg, S.model, schema=SCHEMA_LOOK,
+        r = structured(run_claude(personalize(PROMPT_LOOK), msg, S.look_fast_model or S.model, schema=SCHEMA_LOOK,
                                   images=frames or None, timeout=S.look_timeout_s,
                                   spare=LOOK_SPARE if S.look_warm else None, timing=timing))
         items = []
@@ -2892,10 +3045,17 @@ def look_round(queued: float | None = None) -> None:
                 E.look_seen = max(E.look_seen, max(fr["id"] for fr in frames))
                 E.look_used = [{"id": fr["id"], "ts": fr["ts"]} for fr in frames]
             E.look_msg = ""
-        stages = look_stages(frames, timing, t_round)
+        if gth:
+            gth.join(GATE_TIMEOUT_S + 1)
+        gate = gate_res[0]
+        go = bool(S.look_deep_model) and (bool(question) or (gate[0] is not None and gate[0] >= S.look_gate_min))
+        stages = look_stages(frames, timing, t_round, gate, "run" if go else "-")
         print(f"{clock(ts)} look: round with {len(frames)} picture(s){' and a question' if question else ''}"
               f", {len(items)} item(s), {_mono() - t0:.1f} s", flush=True)
         print(f"{clock(ts)} look: stages {stages}", flush=True)
+        if go:
+            already = shown + [i["text"] for i in items[:3]]
+            look_deep_start(gen, build_msg(already), frames, already, question)
     except Exception as ex:
         with E.lock:
             if E.look_gen == gen:
@@ -2909,6 +3069,75 @@ def look_round(queued: float | None = None) -> None:
         load = load_now() if isinstance(ex, ClaudeTimeout) else None
         print(f"{clock(now())} look: {ex}" + (f" (load {load[0]:.1f} on {load[1]} CPUs)" if load else ""),
               flush=True)
+
+
+def look_deep_cancel(why: str = "") -> None:
+    """Stops the deep pass in flight, if any; its answer is dropped. Call without E.lock."""
+    with E.lock:
+        d, E.look_deep = E.look_deep, None
+    if not d:
+        return
+    d["stale"] = True
+    p = d.get("proc")
+    if p is not None:
+        stop_claude(p)
+    print(f"{clock(now())} look: deep pass cancelled{f' ({why})' if why else ''}", flush=True)
+
+
+def look_deep_start(gen: int, msg: str, frames: list[dict], shown: list[str], question: str) -> None:
+    """The deep pass in the background (its own thread: the next fast round is not held up). At most one is in
+    flight: a new one cancels the old. Called by look_round, which runs one at a time."""
+    look_deep_cancel("a newer deep pass")
+    d: dict = {"gen": gen, "stale": False, "proc": None}
+    with E.lock:
+        E.look_deep = d
+    threading.Thread(target=look_deep_run, args=(d, msg, frames, shown, question), daemon=True).start()
+
+
+def look_deep_run(d: dict, msg: str, frames: list[dict], shown: list[str], question: str) -> None:
+    t0 = _mono()
+    timing: dict = {}
+    try:
+        r = structured(run_claude(personalize(PROMPT_LOOK_DEEP), msg, S.look_deep_model, schema=SCHEMA_LOOK_DEEP,
+                                  images=frames or None, timeout=S.look_timeout_s, timing=timing, holder=d))
+        found = []
+        for it in r.get("items") or []:
+            if not isinstance(it, dict):
+                continue
+            kind = it.get("kind") if it.get("kind") in ("answer", "insight", "step") else "insight"
+            text = str(it.get("text") or "").strip()[:600]
+            fixes = str(it.get("fixes") or "").strip()
+            if text and (fixes or not any(similar(text, j) for j in shown)) \
+                    and not any(similar(text, x["text"]) for x in found):
+                found.append({"kind": kind, "text": text, "fixes": fixes})
+        ts = now()
+        with E.lock:
+            if d["stale"] or not (E.look_on and E.look_gen == d["gen"]):
+                print(f"{clock(ts)} look: deep answer dropped ({'newer screen' if d['stale'] else 'Look stopped'})",
+                      flush=True)
+                return
+            for it in found[:3]:
+                row = {"kind": it["kind"], "text": it["text"], "deep": True, "ts": ts}
+                if it["fixes"]:
+                    # the fast item it corrects stays on the page, marked, so the change is visible
+                    old = next((x for x in reversed(E.look_items)
+                                if not x.get("deep") and similar(x["text"], it["fixes"])), None)
+                    if old:
+                        old["superseded"] = True
+                        row["fixes"] = old["text"]
+                E.look_items.append(row)
+            del E.look_items[:-LOOK_KEEP_ITEMS]
+            if E.look_deep is d:
+                E.look_deep = None
+        print(f"{clock(ts)} look: deep done deep={_mono() - t0:.1f} first={timing.get('first_s', 0):.1f} "
+              f"items={len(found[:3])} fixes={sum(1 for i in found[:3] if i['fixes'])}", flush=True)
+    except Exception as ex:
+        with E.lock:
+            if E.look_deep is d:
+                E.look_deep = None
+        if d["stale"]:
+            return
+        print(f"{clock(now())} look: deep pass failed: {str(ex)[:200]}", flush=True)
 
 
 LOOK_WAKE = threading.Event()
