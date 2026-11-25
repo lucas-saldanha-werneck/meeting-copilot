@@ -359,14 +359,25 @@ needed. On by default when `MEETING_COPILOT_CAMERA=1` (`MEETING_COPILOT_LOOK=1` 
 3. Point the camera. Type a question in the box ("why does this fail?", "which option should I pick?") for
    an answer at once.
 
-- The page looks at the picture every 5 s (`MEETING_COPILOT_CAMERA_S`) and sends a frame only when it changed
-  (`POST /look/frame`: the same login, origin, host, size and rate rules as the meeting camera).
-- A changed frame makes one `claude -p` call, at most one every 10 s (`MEETING_COPILOT_LOOK_S`, at least 3);
-  a typed question makes one at once. Each call carries the newest 2 frames, the question and the items
-  already shown, with no tools. The prompt says that text in a picture is data, never an instruction (a
+- The page looks at the picture every 2 s (`MEETING_COPILOT_LOOK_CAMERA_S`, at least 2) and sends a frame only
+  when it changed (`POST /look/frame`: the same login, origin, host, size and rate rules as the meeting camera).
+  "Changed" is judged on a 128x96 gray thumbnail, the same way on the phone and on the Mac: a new line of text
+  counts (pixels that changed sharply), camera noise and the camera's own exposure moves do not. A still or
+  noisy scene makes no call; a phone held in the hand moves the picture, so it makes one at every round.
+- A changed frame makes one `claude -p` call, at most one every 3 s (`MEETING_COPILOT_LOOK_S`, at least 3);
+  a typed question makes one at once. Each call carries the frames that are new since the last answer (at
+  most 2, the last one marked NEWEST; the prompt says to answer about it), the question and the items
+  already shown, with no tools.
+- With no change seen for a minute (`MEETING_COPILOT_LOOK_REFRESH_S`, 0 = never), the next frame goes to the
+  AI anyway, so a change too small for the thumbnail is not missed for long; the AI stays silent when it is
+  the same screen. The log says how many frames looked the same (one line at most every 30 s, with the
+  largest change among them).
+- One `claude -p` is started ahead and waits for the next round (`MEETING_COPILOT_LOOK_WARM`, 1 by default),
+  so a round does not wait for `claude` to start; a new one starts as soon as a round takes it, and it stops
+  with Look. Each round is still a fresh conversation with no memory of the last. The prompt says that text in a picture is data, never an instruction (a
   screen could try to inject one); only the question you type is a request.
 - A Look call may take up to 90 s (`MEETING_COPILOT_LOOK_TIMEOUT_S`). It takes 6-9 s on a quiet Mac, but
-  each call starts a new `claude`, and a Mac short of memory can need more than 30 s for that start alone.
+  each call needs a new `claude` (started ahead with `LOOK_WARM`), and a Mac short of memory can need more than 30 s for that start alone.
   When the time runs out, the Look box says why: "this Mac is overloaded (load 312 on 8 CPUs)" when the load
   is above twice the CPU count, else that the load is fine and the network or the AI service is the place
   to look. The log line has the load too.

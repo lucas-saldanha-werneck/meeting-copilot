@@ -180,7 +180,18 @@
 # when it stops (see README, "Look mode"). Default: the same as CAMERA.
 #MEETING_COPILOT_LOOK=
 # Most often a changed picture is looked at by the AI in Look mode, seconds (at least 3).
-#MEETING_COPILOT_LOOK_S=10
+#MEETING_COPILOT_LOOK_S=3
+# Seconds between two looks at the camera picture in Look mode (at least 2); as for
+# CAMERA_S, a frame goes to the Mac only when the picture changed, so a still or noisy
+# scene makes no AI call.
+#MEETING_COPILOT_LOOK_CAMERA_S=2
+# With no change seen for this many seconds, the next frame (the page re-sends an
+# unchanged picture once a minute) goes to the AI anyway, so a change too small to be
+# seen is not missed. 0: never.
+#MEETING_COPILOT_LOOK_REFRESH_S=60
+# 1: one `claude` is started ahead and waits for the next Look round, so a round does
+# not wait for its start (5-8 s on a busy Mac). Each round is still a new conversation.
+#MEETING_COPILOT_LOOK_WARM=1
 # Longest one Look call may take, seconds. A call takes 6-9 s on a quiet Mac; each one
 # starts a new `claude`, and on a Mac short of memory that start alone can pass 30 s.
 # When the time runs out, the page says so with the Mac's load.

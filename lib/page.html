@@ -211,24 +211,38 @@ const onMac = ["127.0.0.1", "localhost", "[::1]", "::1"].includes(location.hostn
 const camOffPath = () => cam.mode === "look" ? "/look" : "/camera";
 const camSecure = !!(window.isSecureContext && navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
 const camEl = id => document.getElementById(id);
+// the same rule as frame_changed in lib/copilot.py: with the picture's median change (exposure) taken out,
+// the whole picture moved (mean >= 6), or enough pixels of a 128x96 thumbnail changed sharply (a new line
+// of text; camera noise stays below 24)
 const camChanged = (a, b) => {
   if (!a || a.length !== b.length) return true;
-  let sum = 0, big = 0;
-  for (let i = 0; i < a.length; i++) { const d = Math.abs(a[i] - b[i]); sum += d; if (d > 40) big++; }
-  return sum / a.length >= 2 || big >= 2;
+  const d = new Float64Array(a.length);
+  for (let i = 0; i < a.length; i++) d[i] = a[i] - b[i];
+  const med = Float64Array.from(d).sort()[d.length >> 1];
+  let sum = 0, spots = 0;
+  for (let i = 0; i < d.length; i++) { const r = Math.abs(d[i] - med); sum += r; if (r > 24) spots++; }
+  return sum / d.length >= 6 || spots >= Math.max(2, Math.round(d.length / 2500));
 };
-function camThumb(src, w, h) {
-  const c = document.createElement("canvas"); c.width = 32; c.height = 24;
+function camThumb(src) {
+  // two steps with smoothing: one big step samples only a few source pixels each, and its noise and
+  // aliasing would look like change
+  const mid = document.createElement("canvas"); mid.width = 384; mid.height = 288;
+  const m = mid.getContext("2d");
+  m.imageSmoothingQuality = "high";
+  m.drawImage(src, 0, 0, 384, 288);
+  const c = document.createElement("canvas"); c.width = 128; c.height = 96;
   const x = c.getContext("2d", { willReadFrequently: true });
-  x.drawImage(src, 0, 0, 32, 24);
-  const px = x.getImageData(0, 0, 32, 24).data, g = [];
+  x.imageSmoothingQuality = "high";
+  x.drawImage(mid, 0, 0, 128, 96);
+  const px = x.getImageData(0, 0, 128, 96).data, g = [];
   for (let i = 0; i < px.length; i += 4) g.push((px[i] * 299 + px[i + 1] * 587 + px[i + 2] * 114) / 1000);
   return g;
 }
+const camEvery = () => (cam.mode === "look" ? (last.look || {}).camera_s : (last.vision || {}).camera_s) || 5;
 function camPaint() {
   const on = !!cam.stream;
   const kb = Math.round(cam.bytes / 1024);
-  camEl("camstat").innerHTML = (on ? `<span class="on">${cam.mode === "look" ? "Look on" : "Camera on"}</span> · a frame every ${(last.vision || {}).camera_s || 5} s when the picture changed · sent ${cam.n} (${kb} KB)` : "") +
+  camEl("camstat").innerHTML = (on ? `<span class="on">${cam.mode === "look" ? "Look on" : "Camera on"}</span> · a frame every ${camEvery()} s when the picture changed · sent ${cam.n} (${kb} KB)` : "") +
     (cam.msg ? `<div style="color:var(--corr)">${esc(cam.msg)}</div>` : "") +
     (!camSecure && ((last.vision || {}).camera_on || (last.look || {}).on) ? ((last.vision || {}).https
       ? `<div>Live video needs https: set this phone up once at <a href="/setup" style="color:var(--say)">/setup</a>. Until then: one photo per tap.</div>`
@@ -288,7 +302,7 @@ async function camStart(mode) {
   try { await v.play(); } catch {}
   try { if (navigator.wakeLock) cam.wake = await navigator.wakeLock.request("screen"); } catch {}
   cam.n = 0; cam.bytes = 0; cam.lastSent = 0;
-  cam.timer = setInterval(() => camGrab(false), ((last.vision || {}).camera_s || 5) * 1000);
+  cam.timer = setInterval(() => camGrab(false), camEvery() * 1000);
   setTimeout(() => camGrab(true), 600);
   camPaint();
 }

@@ -1477,11 +1477,20 @@ class LanHttps(unittest.TestCase):
         self.assertFalse(copilot.Settings({}).look)
         self.assertFalse(copilot.Settings({"MEETING_COPILOT_CAMERA": "1", "MEETING_COPILOT_LOOK": "0"}).look)
         self.assertTrue(copilot.Settings({"MEETING_COPILOT_LAN": "1", "MEETING_COPILOT_LOOK": "1"}).lan_https)
-        self.assertEqual(copilot.Settings({}).look_s, 10.0)
+        self.assertEqual(copilot.Settings({}).look_s, 3.0)
         self.assertEqual(copilot.Settings({"MEETING_COPILOT_LOOK_S": "1"}).look_s, 3.0)
-        bad = copilot.Settings({"MEETING_COPILOT_LOOK_S": "soon"})
-        self.assertEqual(bad.look_s, 10.0)
-        self.assertTrue(any("LOOK_S" in n for n in bad.notices))
+        self.assertEqual(copilot.Settings({"MEETING_COPILOT_LOOK_S": "12"}).look_s, 12.0)
+        bad = copilot.Settings({"MEETING_COPILOT_LOOK_S": "soon", "MEETING_COPILOT_LOOK_CAMERA_S": "x",
+                                "MEETING_COPILOT_LOOK_REFRESH_S": "y"})
+        self.assertEqual((bad.look_s, bad.look_camera_s, bad.look_refresh_s), (3.0, 2.0, 60.0))
+        for k in ("LOOK_S", "LOOK_CAMERA_S", "LOOK_REFRESH_S"):
+            self.assertTrue(any(f"{k} is not" in n for n in bad.notices), k)
+        # Look's own phone interval (2 s, at least 2), apart from the meeting camera's CAMERA_S (5)
+        d = copilot.Settings({})
+        self.assertEqual((d.camera_s, d.look_camera_s, d.look_refresh_s, d.look_warm), (5.0, 2.0, 60.0, True))
+        self.assertEqual(copilot.Settings({"MEETING_COPILOT_LOOK_CAMERA_S": "0.5"}).look_camera_s, 2.0)
+        self.assertEqual(copilot.Settings({"MEETING_COPILOT_LOOK_REFRESH_S": "0"}).look_refresh_s, 0.0)
+        self.assertFalse(copilot.Settings({"MEETING_COPILOT_LOOK_WARM": "0"}).look_warm)
         # Look has its own time limit, longer than a suggestions call
         self.assertEqual(copilot.Settings({}).look_timeout_s, 90.0)
         self.assertGreater(copilot.Settings({}).look_timeout_s, copilot.AI_TIMEOUT_S)
@@ -1748,6 +1757,33 @@ class LanHttps(unittest.TestCase):
         self.use(LOOK="0")
         self.assertEqual(post("/look", {"on": True})[0], 409)
         self.assertFalse(copilot.E.public()["look"]["enabled"])
+
+    def test_look_keeps_an_unchanged_frame_after_a_quiet_minute(self):
+        copilot.S.claude = "/bin/true"
+        port = self.serve()
+        h = {"Content-Type": "application/json", "Origin": "https://copilot.local:8443"}
+        self.assertEqual(self.req(port, "/look", "copilot.local:8443", h, "POST", b'{"on": true}')[0], 200)
+        self.addCleanup(copilot.look_stop, "test")
+        img = png_bytes(64, 48, (10, 120, 200))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(self.look_upload(port, img)[1]["kept"], True)
+            self.assertEqual(self.look_upload(port, img)[1]["kept"], False)   # the same, soon after
+            self.assertEqual(copilot.E.public()["look"]["camera_s"], 2.0)      # LOOK_CAMERA_S, for the page
+            with copilot.FRAMES.lock:                                          # a minute without a kept frame
+                for f in copilot.FRAMES.items:
+                    f["ts"] -= copilot.S.look_refresh_s
+            self.assertEqual(self.look_upload(port, img)[1]["kept"], True)    # kept anyway: the AI judges
+            self.assertEqual(self.look_upload(port, img)[1]["kept"], False)
+        log = out.getvalue()
+        self.assertIn("kept after 60 s with no change seen", log)
+        self.assertIn("1 frame(s) since", log)                                 # the dropped one is logged
+        # LOOK_REFRESH_S=0: never forced
+        copilot.S.look_refresh_s = 0.0
+        with copilot.FRAMES.lock:
+            for f in copilot.FRAMES.items:
+                f["ts"] -= 3600
+        self.assertEqual(self.look_upload(port, img)[1]["kept"], False)
 
     def test_look_frame_of_an_old_run_is_dropped_without_a_409(self):
         """Stop then start while an upload was being stored: the frame of the old run is not kept for the new
@@ -2296,6 +2332,7 @@ class Vision(unittest.TestCase):
         self.meeting(7)
 
     def tearDown(self):
+        copilot.LOOK_SPARE.stop()
         copilot.S, copilot.E, copilot.FRAMES, env = self.old
         os.environ.clear()
         os.environ.update(env)
@@ -2305,7 +2342,7 @@ class Vision(unittest.TestCase):
         cfg = {"MEETING_COPILOT_SCREEN": "1", "MEETING_COPILOT_DATA_DIR": os.path.join(self.t, "data"),
                "MEETING_COPILOT_SCREENCAPTURE": self.sc, "MEETING_COPILOT_WINDOW_LIST": f'"{self.wl}"',
                "MEETING_COPILOT_SIPS": "off", "MEETING_COPILOT_CLAUDE": self.claude,
-               "MEETING_COPILOT_API_CREDIT": "off"}
+               "MEETING_COPILOT_API_CREDIT": "off", "MEETING_COPILOT_LOOK_WARM": "0"}   # its own tests
         cfg.update({"MEETING_COPILOT_" + k: v for k, v in extra.items()})
         copilot.S = copilot.Settings(cfg)
         return copilot.S
@@ -2426,7 +2463,7 @@ class Vision(unittest.TestCase):
         copilot.ScreenWatcher().tick(1000)
         self.assertIn("black or empty", copilot.E.screen_msg)
         self.assertEqual(copilot.FRAMES.items, [])
-        # a real image: shrunk to a JPEG of at most 1280 px, fingerprint is a 32x24 thumbnail
+        # a real image: shrunk to a JPEG of at most 1280 px, fingerprint is a 128x96 thumbnail
         self.set_image((10, 120, 200), size=(2000, 1000))
         copilot.ScreenWatcher().tick(2000)
         self.assertEqual(copilot.E.screen_msg, "")
@@ -2434,7 +2471,8 @@ class Vision(unittest.TestCase):
         self.assertEqual(fr["media_type"], "image/jpeg")
         with open(fr["path"], "rb") as f:
             self.assertEqual(copilot.image_size(f.read()), (1280, 640))
-        self.assertEqual(len(fr["thumb"]), 32 * 24)
+        self.assertEqual(len(fr["thumb"]), copilot.THUMB_W * copilot.THUMB_H)
+        self.assertEqual(len(fr["thumb"]), 128 * 96)
 
     def test_full_mode_takes_the_main_display_without_listing_windows(self):
         self.settings(SCREEN_MODE="full")
@@ -2487,7 +2525,8 @@ class Vision(unittest.TestCase):
         a = [100] * 768
         self.assertFalse(copilot.frame_changed(a, list(a)))
         self.assertFalse(copilot.frame_changed(a, [101] * 768))         # noise
-        self.assertTrue(copilot.frame_changed(a, [110] * 768))          # everything a bit brighter
+        self.assertFalse(copilot.frame_changed(a, [110] * 768))         # only brighter: camera exposure
+        self.assertTrue(copilot.frame_changed(a, [100] * 384 + [140] * 384))   # half the picture changed
         b = list(a)
         b[5] = b[6] = 250                                                # a small sharp change (slide number)
         self.assertTrue(copilot.frame_changed(a, b))
@@ -2496,6 +2535,91 @@ class Vision(unittest.TestCase):
         self.assertTrue(copilot.frame_changed(None, a))
         with self.assertRaises(ValueError):
             copilot.FRAMES.add(7, "camera", b"<html>not an image</html>", 1.0)
+
+    def test_frame_diff_takes_the_exposure_out(self):
+        a = [100] * 1000 + [200] * 1000
+        self.assertEqual(copilot.frame_diff(a, list(a)), (0.0, 0))
+        mean, spots = copilot.frame_diff(a, [x + 9 for x in a])          # all 9 brighter: exposure only
+        self.assertEqual((mean, spots), (0.0, 0))
+        b = list(a)
+        b[10:20] = [30] * 10                                               # 10 pixels of a new stroke
+        self.assertEqual(copilot.frame_diff(a, b)[1], 10)
+        self.assertEqual(copilot.spots_needed(768), 2)
+        self.assertEqual(copilot.spots_needed(128 * 96), 5)
+        self.assertFalse(copilot.frame_changed(a, b[:9] + a[9:]))          # not enough spots
+        self.assertTrue(copilot.frame_changed(a, b))
+
+    @unittest.skipUnless(sys.platform == "darwin" and os.path.exists("/usr/bin/sips"), "needs macOS sips")
+    def test_new_question_on_the_same_page_is_a_new_frame_and_camera_noise_is_not(self):
+        """The Look silence of 25/11: a new question on the same page (small text, same layout) moved the old
+        32x24 thumbnail less than camera noise did, so the new screen was dropped as "the same".
+        tests/fixtures: one made-up quiz page rendered with ImageMagick, then made to look like a phone photo
+        of a screen (tilt, blur, gaussian noise, JPEG): q3_cam_a/b = the same page with two noise draws,
+        q4_cam = the next question, q3b_cam = one answer option changed, q3_bright = exposure +8%."""
+        self.settings(SIPS="/usr/bin/sips")
+        fx = os.path.join(ROOT, "tests", "fixtures")
+
+        def thumb(name, size=None):
+            with open(os.path.join(fx, name + ".jpg"), "rb") as f:
+                data = f.read()
+            with tempfile.TemporaryDirectory() as w:
+                if not size:
+                    return copilot.prepare_image(data, copilot.Path(w))[2]
+                src, out = os.path.join(w, "in.jpg"), os.path.join(w, "t.bmp")
+                with open(src, "wb") as f:
+                    f.write(data)
+                subprocess.run(["/usr/bin/sips", "-z", str(size[1]), str(size[0]), "-s", "format", "bmp", src,
+                                "--out", out], capture_output=True, check=True)
+                with open(out, "rb") as f:
+                    return copilot.bmp_gray(f.read())
+        base = thumb("q3_cam_a")
+        for name, new in (("q3_cam_b", False), ("q3_bright", False), ("q4_cam", True), ("q3b_cam", True)):
+            t = thumb(name)
+            self.assertEqual(copilot.frame_changed(base, t), new, f"{name}: {copilot.frame_diff(base, t)}")
+
+        # the old rule (32x24, mean >= 2 or 2 pixels off by 40) dropped the next question: the bug itself
+        def old_rule(a, b):
+            d = [abs(x - y) for x, y in zip(a, b)]
+            return sum(d) / len(d) >= 2.0 or sum(1 for x in d if x > 40) >= 2
+        self.assertFalse(old_rule(thumb("q3_cam_a", (32, 24)), thumb("q4_cam", (32, 24))))
+
+    def test_same_frames_are_counted_and_a_forced_one_is_kept(self):
+        img = png_bytes(64, 48, (250, 250, 250))
+        a = copilot.FRAMES.add(copilot.LOOK_MID, "camera", img, 100.0)
+        self.assertFalse(a["forced"])
+        self.assertIsNone(copilot.FRAMES.add(copilot.LOOK_MID, "camera", img, 105.0))
+        self.assertIsNone(copilot.FRAMES.add(copilot.LOOK_MID, "camera", img, 110.0))
+        self.assertEqual(copilot.FRAMES.newest_ts(copilot.LOOK_MID, "camera"), 100.0)
+        st = copilot.FRAMES.take_same(copilot.LOOK_MID, "camera")
+        self.assertEqual((st["n"], st["since"]), (2, 105.0))
+        self.assertIsNone(copilot.FRAMES.take_same(copilot.LOOK_MID, "camera"))     # reset by the read
+        b = copilot.FRAMES.add(copilot.LOOK_MID, "camera", img, 170.0, force=True)
+        self.assertTrue(b["forced"])
+        self.assertEqual(copilot.FRAMES.newest_ts(copilot.LOOK_MID, "camera"), 170.0)
+        self.assertIsNone(copilot.FRAMES.take_same(copilot.LOOK_MID, "camera"))     # a forced one is not "same"
+        copilot.FRAMES.add(copilot.LOOK_MID, "camera", img, 175.0)
+        copilot.FRAMES.drop(copilot.LOOK_MID)
+        self.assertEqual(copilot.FRAMES.same, {})
+
+    def test_look_logs_same_frames_at_most_every_30_s(self):
+        self.settings(CAMERA="1")
+        copilot.look_start()
+        img = png_bytes(64, 48, (250, 250, 250))
+        copilot.FRAMES.add(copilot.LOOK_MID, "camera", img, 1000.0)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            copilot.FRAMES.add(copilot.LOOK_MID, "camera", img, 1005.0)
+            copilot.look_log_same(1005.0)                     # the first one at once
+            for t in (1010.0, 1015.0, 1020.0):
+                copilot.FRAMES.add(copilot.LOOK_MID, "camera", img, t)
+                copilot.look_log_same(t)                      # then not before 30 s
+            copilot.FRAMES.add(copilot.LOOK_MID, "camera", img, 1036.0)
+            copilot.look_log_same(1036.0)
+        lines = [x for x in out.getvalue().splitlines() if "looked the same" in x]
+        self.assertEqual(len(lines), 2, out.getvalue())
+        self.assertIn("1 frame(s) since", lines[0])
+        self.assertIn("4 frame(s) since", lines[1])
+        self.assertRegex(lines[1], r"largest change: mean 0\.00 of 6, 0 of \d+ spots")
 
     # -------------------------------------------------------------- frames go to the suggestions call
 
@@ -2602,7 +2726,7 @@ class Vision(unittest.TestCase):
         self.assertEqual(a[a.index("--tools") + 1], "")
         self.assertEqual(len(c["images"]), 1)
         self.assertIn("Picture: phone camera at", c["text"])
-        self.assertIn("(NEW)", c["text"])
+        self.assertIn("(NEWEST, NEW)", c["text"])
         self.assertIn("## QUESTION\n(none", c["text"])
         st = copilot.E.public()["look"]
         self.assertEqual([i["kind"] for i in st["items"]], ["answer", "step"])
@@ -2624,7 +2748,9 @@ class Vision(unittest.TestCase):
         with open(self.claude_log) as f:
             c = [json.loads(x) for x in f][-1]
         self.assertIn("## QUESTION\nWhy does it fail?", c["text"])
-        self.assertEqual(len(c["images"]), 2)                  # the newest two pictures
+        # only the new picture: the one already answered is not sent again (the AI answered it once more)
+        self.assertEqual(len(c["images"]), 1)
+        self.assertEqual(c["text"].count("Picture: phone camera"), 1)
         items = copilot.E.public()["look"]["items"]
         # the fake answers the same again: the step was already shown (dropped), the answer to a question never is
         self.assertEqual([(i["kind"], i.get("q")) for i in items[2:]], [("answer", "Why does it fail?")])
@@ -2644,13 +2770,108 @@ class Vision(unittest.TestCase):
         copilot.look_start()
         self.assertEqual(copilot.E.public()["look"]["items"], [])
 
+    def test_look_sends_only_new_pictures_and_says_which_is_newest(self):
+        self.settings(CAMERA="1", LOOK_S="3")
+        calls = self.fake_look_ai()
+        copilot.look_start()
+        t = copilot.now()
+        copilot.FRAMES.add(copilot.LOOK_MID, "camera", png_bytes(64, 48, (250, 250, 250)), t - 4)
+        copilot.FRAMES.add(copilot.LOOK_MID, "camera", png_bytes(64, 48, (10, 10, 10)), t - 2)
+        copilot.look_round()
+        self.assertEqual(calls[-1][1], 2)                     # two new ones: both, the last one marked
+        self.assertIn("(earlier, NEW)", calls[-1][0])
+        self.assertIn("(NEWEST, NEW)", calls[-1][0])
+        prompt = copilot.PROMPT_LOOK
+        self.assertIn("Answer about the NEWEST picture", prompt)
+        self.assertIn("never say\n  that it is still the same screen", prompt)
+        # nothing new: a round is not due; a question gets the newest picture alone, not marked NEW
+        with copilot.E.lock:
+            self.assertFalse(copilot.look_due(copilot.now() + 100))
+        copilot.E.look_question = "What is this?"
+        copilot.look_round()
+        self.assertEqual(calls[-1][1], 1)
+        self.assertIn("(NEWEST)", calls[-1][0])
+        # a frame kept after a quiet minute says so
+        copilot.FRAMES.add(copilot.LOOK_MID, "camera", png_bytes(64, 48, (10, 10, 10)), copilot.now(), force=True)
+        copilot.look_round()
+        self.assertEqual(calls[-1][1], 1)
+        self.assertIn("(NEWEST, NEW, re-sent after a quiet minute", calls[-1][0])
+
+    def test_look_round_runs_on_the_spare_claude_and_starts_the_next(self):
+        self.settings(CAMERA="1", LOOK_WARM="1")
+        copilot.look_keep_warm()
+        self.assertIsNone(copilot.LOOK_SPARE.proc)            # Look off: no spare
+        copilot.look_start()
+        copilot.look_keep_warm()
+        first = copilot.LOOK_SPARE.proc
+        self.assertIsNotNone(first)
+        self.assertIsNone(first.poll())                        # started, waiting for its message
+        copilot.look_keep_warm()
+        self.assertIs(copilot.LOOK_SPARE.proc, first)          # one at most
+        copilot.FRAMES.add(copilot.LOOK_MID, "camera", png_bytes(64, 48, (250, 250, 250)), copilot.now())
+        copilot.look_round()
+        self.assertEqual([i["kind"] for i in copilot.E.public()["look"]["items"]], ["answer", "step"])
+        self.assertIsNotNone(first.poll())                     # the round ran on it, and it ended
+        with open(self.claude_log) as f:
+            c = [json.loads(x) for x in f][-1]
+        self.assertEqual(c["argv"][c["argv"].index("--input-format") + 1], "stream-json")
+        self.assertEqual(len(c["images"]), 1)
+        second = copilot.LOOK_SPARE.proc
+        self.assertIsNotNone(second)                           # the next one started at once
+        self.assertIsNot(second, first)
+        # a question with no picture also runs on it (stream-json, text only)
+        copilot.FRAMES.drop(copilot.LOOK_MID)
+        copilot.E.look_question = "What is a PNG?"
+        copilot.look_round()
+        self.assertIsNotNone(second.poll())
+        with open(self.claude_log) as f:
+            c = [json.loads(x) for x in f][-1]
+        self.assertEqual(c["images"], [])
+        self.assertIn("What is a PNG?", c["text"])
+        # another model (or language): the spare is replaced, not used with the old prompt
+        third = copilot.LOOK_SPARE.proc
+        copilot.S.model = "haiku"
+        copilot.look_keep_warm()
+        self.assertIsNot(copilot.LOOK_SPARE.proc, third)
+        self.assertIsNotNone(third.poll())
+        self.assertIn("haiku", copilot.LOOK_SPARE.key[0])
+        # Look stops: the spare is stopped, and a round ending later starts none
+        last = copilot.LOOK_SPARE.proc
+        copilot.look_stop("test")
+        self.assertIsNone(copilot.LOOK_SPARE.proc)
+        self.assertIsNotNone(last.poll())
+        copilot.look_keep_warm()
+        self.assertIsNone(copilot.LOOK_SPARE.proc)
+
+    def test_a_spare_that_does_not_wait_pauses_the_spares(self):
+        log = os.path.join(self.t, "starts.log")
+        quick = os.path.join(self.t, "bin", "quick-claude")
+        with open(quick, "w") as f:
+            f.write(f'#!/bin/sh\necho x >> "{log}"\nexit 1\n')
+        os.chmod(quick, 0o755)
+        self.settings(CAMERA="1", LOOK_WARM="1", CLAUDE=quick)
+        copilot.look_start()
+        copilot.look_keep_warm()
+        p = copilot.LOOK_SPARE.proc
+        p.wait(10)
+        for _ in range(5):                                     # look_loop calls it every second
+            copilot.look_keep_warm()
+        self.assertIsNone(copilot.LOOK_SPARE.proc)
+        with open(log) as f:
+            self.assertEqual(len(f.read().split()), 1)        # no new process every second
+        copilot.look_stop("test")
+        copilot.look_start()                                   # a new Look run tries again
+        copilot.look_keep_warm()
+        self.assertIsNotNone(copilot.LOOK_SPARE.proc)
+
     def fake_look_ai(self, answer=None, fail=False):
         """Replaces run_claude for Look rounds; returns the list of calls (message, image count)."""
         calls, real = [], copilot.run_claude
         self.addCleanup(setattr, copilot, "run_claude", real)
 
         def fake(system, msg, model, **kw):
-            calls.append((msg, len(kw.get("images") or [])))
+            imgs = kw.get("images") or []
+            calls.append(("\n".join([msg] + [i.get("label", "") for i in imgs]), len(imgs)))
             if fail:
                 raise RuntimeError("claude exited with code 1")
             return {"structured_output": answer or {"items": [{"kind": "insight", "text": "A blue square."}]}}
