@@ -50,7 +50,7 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
 import tlscert
 
-__version__ = "0.14.0"
+__version__ = "0.14.1"
 
 HERE = Path(__file__).resolve().parent
 PAGE = HERE / "page.html"
@@ -1088,6 +1088,7 @@ class State:
             return list(items) if full else items[-n:]
         with self.lock:
             return {
+                "version": __version__,
                 "meeting": self.meeting,
                 "live": self.meeting is not None,
                 "status": self.status,
@@ -1404,9 +1405,11 @@ def spawn_claude(cmd: list[str], env: dict | None, cwd: Path) -> subprocess.Pope
     # values and would swallow the message if it were the last argument.
     # Its own process group: on a timeout the whole group is stopped, so a wrapper's child (claude-credito
     # runs claude) is never left running on its own after we give up on it.
-    return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, encoding="utf-8", cwd=str(cwd), env=env,
-                            start_new_session=os.name == "posix")
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, encoding="utf-8", cwd=str(cwd), env=env,
+                         start_new_session=os.name == "posix")
+    p.born_m = time.monotonic()    # for the Look stage timing: a spare's age, a cold start's time to first byte
+    return p
 
 
 def stop_claude(p: subprocess.Popen) -> None:
@@ -1506,7 +1509,8 @@ def spare_key(cmd: list[str], env: dict | None) -> tuple:
 def run_claude(system_prompt: str, message: str, model: str, *, schema: dict | None = None,
                tools: list[str] | None = None, mcp_tools: list[str] | None = None,
                dirs: list[Path] | None = None, max_turns: int = 2, timeout: float | None = None,
-               images: list[dict] | None = None, spare: Spare | None = None) -> dict:
+               images: list[dict] | None = None, spare: Spare | None = None,
+               timing: dict | None = None) -> dict:
     """One `claude -p` call. With a spare: the call is stream-json (with or without images), runs on the
     spare when it was started with this same command, and a new spare is started right away for the next."""
     timeout = AI_TIMEOUT_S if timeout is None else timeout
@@ -1515,13 +1519,114 @@ def run_claude(system_prompt: str, message: str, model: str, *, schema: dict | N
                                    dirs=dirs, max_turns=max_turns, stream=stream)
     posix = os.name == "posix"
     p = spare.take(spare_key(cmd, env)) if spare else None
+    warm = p is not None
     if p is None:
         p = spawn_claude(cmd, env, cwd)
     if spare:
         spare.fill(spare_key(cmd, env), cmd, env, cwd)
+    born = getattr(p, "born_m", None)
+    if timing is not None:
+        timing["spawn"] = "warm" if warm else "cold"
+        if warm and born is not None:
+            timing["spawn_s"] = time.monotonic() - born     # how old the spare was when the round took it
+    if not stream:
+        out, err = _communicate(p, message, timeout, posix)
+        if p.returncode != 0 and not out.strip():
+            raise RuntimeError(f"claude exited {p.returncode}: {err.strip()[:300]}")
+        return json.loads(out)
+    # stream-json: the output is read line by line, so the time of the first event is known; the reading
+    # runs in threads and the wait for the process keeps the timeout and the kill below
+    marks: dict = {}
+    chunks: list[str] = []
+    errs: list[str] = []
+
+    def read_out():
+        try:
+            for ln in p.stdout:
+                t = time.monotonic()
+                chunks.append(ln)
+                marks.setdefault("byte", t)
+                if '"assistant"' in ln and "assistant" not in marks:
+                    try:
+                        if json.loads(ln).get("type") == "assistant":
+                            marks["assistant"] = t
+                    except (ValueError, AttributeError):
+                        pass
+                elif '"result"' in ln and "result" not in marks:
+                    try:
+                        if json.loads(ln).get("type") == "result":
+                            marks["result"] = t
+                    except (ValueError, AttributeError):
+                        pass
+        except (OSError, ValueError):
+            pass
+
+    def read_err():
+        try:
+            errs.append(p.stderr.read())
+        except (OSError, ValueError):
+            pass
+
+    def write_in():
+        try:
+            p.stdin.write(image_message(message, images or []))
+            p.stdin.flush()
+            marks["written"] = time.monotonic()
+            p.stdin.close()
+        except (OSError, ValueError):
+            pass
+
+    threads = [threading.Thread(target=f, daemon=True) for f in (read_out, read_err, write_in)]
+    for th in threads:
+        th.start()
     try:
-        out, err = p.communicate(image_message(message, images or []) if stream else message, timeout=timeout)
+        p.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
+        for sig, wait in ((signal.SIGTERM, 3), (getattr(signal, "SIGKILL", signal.SIGTERM), 5)):
+            try:
+                os.killpg(p.pid, sig) if posix else p.kill()
+            except OSError:
+                pass
+            try:
+                p.wait(timeout=wait)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+        for th in threads:
+            th.join(2)
+        _close_pipes(p)
+        raise ClaudeTimeout(timeout, "".join(errs)) from None
+    for th in threads:
+        th.join(5)
+    _close_pipes(p)
+    out, err = "".join(chunks), "".join(errs)
+    if timing is not None:
+        w = marks.get("written")
+        if not warm and born is not None and "byte" in marks:
+            timing["spawn_s"] = marks["byte"] - born         # cold: process start until its first output
+        if w is not None and "assistant" in marks:
+            timing["first_s"] = max(0.0, marks["assistant"] - w)
+        if w is not None:
+            timing["ai_s"] = max(0.0, marks.get("result", time.monotonic()) - w)
+    if p.returncode != 0 and not out.strip():
+        raise RuntimeError(f"claude exited {p.returncode}: {err.strip()[:300]}")
+    return stream_result(out)
+
+
+def _close_pipes(p: subprocess.Popen) -> None:
+    for f in (p.stdin, p.stdout, p.stderr):
+        try:
+            f and f.close()
+        except (OSError, ValueError):
+            pass
+
+
+def _communicate(p: subprocess.Popen, message: str, timeout: float, posix: bool) -> tuple[str, str]:
+    """p.communicate(message) with the kill of the whole group on a timeout (ClaudeTimeout)."""
+    try:
+        return p.communicate(message, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        err = ""
         for sig, wait in ((signal.SIGTERM, 3), (getattr(signal, "SIGKILL", signal.SIGTERM), 5)):
             try:
                 os.killpg(p.pid, sig) if posix else p.kill()
@@ -1533,9 +1638,6 @@ def run_claude(system_prompt: str, message: str, model: str, *, schema: dict | N
             except subprocess.TimeoutExpired:
                 err = ""
         raise ClaudeTimeout(timeout, err or "") from None
-    if p.returncode != 0 and not out.strip():
-        raise RuntimeError(f"claude exited {p.returncode}: {err.strip()[:300]}")
-    return stream_result(out) if stream else json.loads(out)
 
 
 def fmt(fs: list[dict]) -> str:
@@ -2479,13 +2581,15 @@ class Frames:
         return d
 
     def add(self, mid, source: str, data: bytes, ts: float, check_blank: bool = False,
-            force: bool = False) -> dict | None:
+            force: bool = False, meta: dict | None = None) -> dict | None:
         """Keeps a new frame and returns it, or None when it looks like the previous one of its source
         (force: kept anyway, and the returned frame has "forced": True). ValueError: not an image.
         CaptureError: blank image and check_blank (a screen capture)."""
         folder = self.folder(mid)
+        t_prep = _mono()
         with tempfile.TemporaryDirectory(dir=str(folder), prefix=".work-") as work:
             keep, media, thumb = prepare_image(data, Path(work))
+        prep_s = _mono() - t_prep
         if check_blank and looks_blank(thumb):
             raise CaptureError(permission_message("the screen capture came out black or empty"))
         with self.lock:
@@ -2508,7 +2612,8 @@ class Frames:
             path = folder / f"{source}-{fid}.{'png' if media == 'image/png' else 'jpg'}"
             _write_private_bytes(path, keep)
             fr = {"id": fid, "meeting": mid, "source": source, "ts": ts, "seen": ts, "path": path,
-                  "media_type": media, "thumb": thumb, "bytes": len(keep), "forced": forced}
+                  "media_type": media, "thumb": thumb, "bytes": len(keep), "forced": forced,
+                  "prep_s": prep_s, "kept_m": _mono(), **(meta or {})}
             self.items.append(fr)
             mine = [f for f in self.items if f["meeting"] == mid and f["source"] == source]
             for old in mine[:-FRAMES_KEEP]:
@@ -2709,8 +2814,25 @@ def look_due(t: float) -> bool:
     return FRAMES.newest_id(LOOK_MID, {"camera"}, t) > E.look_seen and t - E.look_round_at >= S.look_s
 
 
+def look_stages(frames: list[dict], timing: dict, t_round: float) -> str:
+    """One short line with the seconds of each stage of a Look round, to grep:
+    enc (page: capture+encode of the newest frame), up (page: the upload before it), prep (sips on the Mac),
+    wait (newest frame kept until the call starts), spawn (warm: age of the spare; cold: start to first
+    output), first (message written until the first assistant event), ai (message written until the result).
+    "-" is a stage that was not measured. The phone's clock is never compared with the Mac's (they differ), so
+    enc and up are durations the page measured itself."""
+    def f(v, nd=1):
+        return "-" if v is None else f"{v:.{nd}f}"
+    new = frames[-1] if frames else {}
+    wait = max(0.0, t_round - new["kept_m"]) if new.get("kept_m") else None
+    return (f"enc={f(new.get('enc_s'), 2)} up={f(new.get('up_s'), 2)} prep={f(new.get('prep_s'), 2)} "
+            f"wait={f(wait)} spawn={timing.get('spawn', '-')}:{f(timing.get('spawn_s'))} "
+            f"first={f(timing.get('first_s'))} ai={f(timing.get('ai_s'))}")
+
+
 def look_round(queued: float | None = None) -> None:
     """One Look call: the newest frames, the question (if any) and the items already shown."""
+    t_round = _mono()
     with E.lock:
         if not (S.look and E.look_on):
             return
@@ -2741,9 +2863,10 @@ def look_round(queued: float | None = None) -> None:
                + ("" if frames else "\n\n(No picture yet: answer the question from the text alone, or say "
                                      "that a picture is needed.)"))
         t0 = _mono()
+        timing: dict = {}
         r = structured(run_claude(personalize(PROMPT_LOOK), msg, S.model, schema=SCHEMA_LOOK,
                                   images=frames or None, timeout=S.look_timeout_s,
-                                  spare=LOOK_SPARE if S.look_warm else None))
+                                  spare=LOOK_SPARE if S.look_warm else None, timing=timing))
         items = []
         for it in r.get("items") or []:
             if not isinstance(it, dict):
@@ -2769,8 +2892,10 @@ def look_round(queued: float | None = None) -> None:
                 E.look_seen = max(E.look_seen, max(fr["id"] for fr in frames))
                 E.look_used = [{"id": fr["id"], "ts": fr["ts"]} for fr in frames]
             E.look_msg = ""
+        stages = look_stages(frames, timing, t_round)
         print(f"{clock(ts)} look: round with {len(frames)} picture(s){' and a question' if question else ''}"
               f", {len(items)} item(s), {_mono() - t0:.1f} s", flush=True)
+        print(f"{clock(ts)} look: stages {stages}", flush=True)
     except Exception as ex:
         with E.lock:
             if E.look_gen == gen:
@@ -3865,11 +3990,22 @@ class Page(BaseHTTPRequestHandler):
             return True
         return False
 
+    def _page_ms(self, name: str) -> float | None:
+        """Seconds from a timing header the page sent (milliseconds, a plausible number), else None."""
+        try:
+            v = float(self.headers.get(name, ""))
+        except ValueError:
+            return None
+        return v / 1000 if 0 <= v <= 120_000 else None
+
     def _store_frame(self, mid, raw: bytes, t: float, what: str, force: bool = False):
         """FRAMES.add for a phone frame: the kept frame, None (looks like the previous one), or False when
         it failed (the error answer is sent)."""
         try:
-            return FRAMES.add(mid, "camera", raw, t, force=force)
+            # enc_s: the page's own capture+encode time of this frame; up_s: how long the page's previous
+            # upload took (it is known only after the answer, so it travels with the next frame)
+            return FRAMES.add(mid, "camera", raw, t, force=force,
+                              meta={"enc_s": self._page_ms("X-Enc-Ms"), "up_s": self._page_ms("X-Prev-Up-Ms")})
         except ValueError as ex:
             self._json(415, {"error": str(ex)})
         except OSError as ex:
