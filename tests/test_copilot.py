@@ -1694,11 +1694,37 @@ class LanHttps(unittest.TestCase):
         self.assertEqual(toggle({"on": True, "meeting": 7}), 409)
 
     def look_upload(self, port, data, **kw):
-        h = {"Content-Type": kw.get("ctype", "image/png"), "Origin": kw.get("origin", "https://copilot.local:8443")}
+        h = {"Content-Type": kw.get("ctype", "image/png"), "Origin": kw.get("origin", "https://copilot.local:8443"),
+             **kw.get("headers", {})}
         code, _, body = self.req(port, "/look/frame", kw.get("host", "copilot.local:8443"), h, "POST", data,
                                  auth=kw.get("auth", True))
         copilot.E.look_last = 0.0
         return code, (json.loads(body) if body.startswith(b"{") else body)
+
+    def test_look_frame_keeps_the_timing_the_page_measured(self):
+        copilot.S.claude = "/bin/true"
+        copilot.E.reset(None)
+        port = self.serve()
+        h = {"Content-Type": "application/json", "Origin": "https://copilot.local:8443"}
+        self.assertEqual(self.req(port, "/look", "copilot.local:8443", h, "POST", b'{"on": true}')[0], 200)
+        code, _ = self.look_upload(port, png_bytes(64, 48, (250, 250, 250)),
+                                   headers={"X-Enc-Ms": "120", "X-Prev-Up-Ms": "430"})
+        self.assertEqual(code, 200)
+        fr = copilot.FRAMES.items[-1]
+        self.assertAlmostEqual(fr["enc_s"], 0.12)
+        self.assertAlmostEqual(fr["up_s"], 0.43)
+        self.assertGreaterEqual(fr["prep_s"], 0.0)
+        self.assertGreater(fr["kept_m"], 0)
+        copilot.FRAMES.drop(copilot.LOOK_MID)
+        # nonsense or out of range: ignored, the frame is still kept
+        self.assertEqual(self.look_upload(port, png_bytes(64, 48, (9, 9, 9)),
+                                          headers={"X-Enc-Ms": "abc", "X-Prev-Up-Ms": "-5"})[0], 200)
+        self.assertIsNone(copilot.FRAMES.items[-1]["enc_s"])
+        self.assertIsNone(copilot.FRAMES.items[-1]["up_s"])
+        copilot.FRAMES.drop(copilot.LOOK_MID)
+        self.assertEqual(self.look_upload(port, png_bytes(64, 48, (90, 9, 9)),
+                                          headers={"X-Enc-Ms": "9999999"})[0], 200)
+        self.assertIsNone(copilot.FRAMES.items[-1]["enc_s"])
 
     def test_look_needs_its_own_tap_and_no_meeting(self):
         copilot.S.claude = "/bin/true"                       # Look refuses to start without a claude command
@@ -2842,6 +2868,39 @@ class Vision(unittest.TestCase):
         self.assertIsNotNone(last.poll())
         copilot.look_keep_warm()
         self.assertIsNone(copilot.LOOK_SPARE.proc)
+
+    def test_look_round_logs_the_time_of_each_stage(self):
+        self.settings(CAMERA="1", LOOK_WARM="1")
+        copilot.look_start()
+        copilot.look_keep_warm()
+        self.assertIsNotNone(copilot.LOOK_SPARE.proc)
+        time.sleep(0.3)
+        copilot.FRAMES.add(copilot.LOOK_MID, "camera", png_bytes(64, 48, (250, 250, 250)), copilot.now(),
+                           meta={"enc_s": 0.12, "up_s": 0.43})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            copilot.look_round()
+        rows = out.getvalue().splitlines()
+        lines = [x for x in rows if "look: stages" in x]
+        self.assertEqual(len(lines), 1, out.getvalue())
+        print("EXAMPLE (warm):", lines[0])
+        self.assertRegex(lines[0], r"look: stages enc=0\.12 up=0\.43 prep=\d+\.\d\d wait=\d+\.\d "
+                                   r"spawn=warm:\d+\.\d first=\d+\.\d ai=\d+\.\d$")
+        self.assertGreaterEqual(float(re.search(r"spawn=warm:([\d.]+)", lines[0]).group(1)), 0.3)
+        self.assertIn("look: round with 1 picture(s)", rows[0])        # the stages line comes right after it
+        self.assertIs(rows[1], lines[0])
+        # no spare: a cold start (process start until its first output); the page sent no timing
+        copilot.LOOK_SPARE.stop()
+        copilot.look_start()
+        copilot.S.look_warm = False
+        copilot.FRAMES.add(copilot.LOOK_MID, "camera", png_bytes(64, 48, (7, 70, 170)), copilot.now())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            copilot.look_round()
+        line = next(x for x in out.getvalue().splitlines() if "look: stages" in x)
+        print("EXAMPLE (cold):", line)
+        self.assertRegex(line, r"enc=- up=- prep=\d+\.\d\d wait=\d+\.\d spawn=cold:\d+\.\d "
+                               r"first=\d+\.\d ai=\d+\.\d$")
 
     def test_a_spare_that_does_not_wait_pauses_the_spares(self):
         log = os.path.join(self.t, "starts.log")
