@@ -52,7 +52,7 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
 import tlscert
 
-__version__ = "0.16.0"
+__version__ = "0.17.0"
 
 HERE = Path(__file__).resolve().parent
 PAGE = HERE / "page.html"
@@ -148,17 +148,17 @@ def load_token(data_dir: Path) -> str:
 
 
 # ---------------------------------------------------------------- pairing code
-# A browser without a valid cookie gets a login page that asks for a 6-digit code. The code is shown on the
-# Mac (a notification, `meeting-copilot status`, and the "Pair a device" button on a page that is already
-# logged in). A right code gives that browser its own device cookie, saved hashed in <data_dir>/devices.json
-# and revocable with `meeting-copilot devices forget`. The page token keeps working (?token=, Bearer).
+# A browser without a valid cookie gets a login page that asks for a 6-digit code. Only the Mac opens a code
+# (`meeting-copilot code`, or the "Pair a device" button on a page that is already logged in), and it shows
+# there (also in `meeting-copilot status`). A browser that is not logged in never makes a code nor shows
+# anything on the Mac, so nobody who merely reaches the page can spam the Mac or lock the login. A right code
+# gives that browser its own device cookie, saved hashed in <data_dir>/devices.json and revocable with
+# `meeting-copilot devices forget`. The page token keeps working (?token=, Bearer).
 
 CODE_TTL_S = 300            # a code is valid for 5 minutes
-CODE_MAX_WRONG = 5          # wrong tries before the code is thrown away
-LOGIN_WRONG_PER_MIN = 10    # wrong tries per minute over every code and client; then every try waits
-LOGIN_MAX_WRONG = 20        # wrong tries since the last login: then locked until the Mac asks for a code
+CODE_MAX_WRONG = 5          # wrong tries per device (client address) for one code; then that device is done
+CODE_TOTAL_WRONG = 20       # wrong tries over every device for one code; then the code is thrown away
 LOGIN_LINK_TTL_S = 60       # the launcher's one-time link for the Mac's own browser
-NOTIFY_EVERY_S = 20         # "send the code again" shows the notification at most this often
 DEVICE_COOKIE = "meeting_copilot_device"
 SECURE_PREFIX = "__Host-"   # the name of a cookie set over https (Secure, Path=/, no Domain: what __Host- requires)
 DEVICES_FILE = "devices.json"
@@ -198,21 +198,21 @@ def builtin_language(value: str) -> str:
 
 
 class Pairing:
-    """The pairing code: 6 random digits, one active code at a time, single use.
+    """The pairing code: 6 random digits, one code at a time, single use, opened only from the Mac.
 
-    Asking for a code while one is valid returns the same code (several tabs or devices that open the login
-    page never invalidate each other's code, and the Mac gets one notification, not one per page view)."""
+    Opening while a code is valid returns the same code (two devices paired in the same 5 minutes share it).
+    Each device (client address) gets CODE_MAX_WRONG wrong tries per code, so one device guessing never uses up
+    another's tries; CODE_TOTAL_WRONG wrong tries over all devices throw the code away. A code is open only
+    after an action on the Mac, so guessing gets at most CODE_TOTAL_WRONG tries in a million per opening."""
 
     def __init__(self, clock=None) -> None:
         self.clock = clock or time.time
         self.lock = threading.Lock()
         self.code: str | None = None
         self.expires = 0.0
-        self.wrong = 0
-        self.fails: list[float] = []      # times of recent wrong tries, for the global limit
-        self.strikes = 0                  # wrong tries since the last right code or the Mac's own request
-        self.notified = 0.0
-        self.links: dict[str, float] = {}  # one-time login links: secret -> expiry
+        self.wrong = 0                      # wrong tries on this code, every device
+        self.wrong_by: dict[str, int] = {}  # wrong tries on this code per device (at most CODE_TOTAL_WRONG keys)
+        self.links: dict[str, float] = {}   # one-time login links: secret -> expiry
 
     def _active(self, t: float) -> bool:
         if self.code and t < self.expires:
@@ -226,66 +226,42 @@ class Pairing:
             t = self.clock()
             return (self.code, max(1, int(self.expires - t))) if self._active(t) else None
 
-    @property
-    def locked(self) -> bool:
-        return self.strikes >= LOGIN_MAX_WRONG
-
-    def get_or_create(self, owner: bool = False) -> tuple[str | None, int, bool]:
-        """(code, seconds left, made now): the active code, or a new one when there is none.
-
-        owner=True: asked on the Mac (`meeting-copilot code`, "Pair a device" on a logged-in page); this
-        also lifts the lock. When locked, a browser that is not logged in gets (None, 0, False)."""
+    def get_or_create(self) -> tuple[str, int, bool]:
+        """(code, seconds left, made now): the active code, or a new one. Only for the Mac's own actions
+        (`meeting-copilot code`, "Pair a device" on a logged-in page): never for a browser that is not
+        logged in."""
         with self.lock:
             t = self.clock()
-            if owner:
-                self.strikes, self.fails = 0, []
-            elif self.locked:
-                return None, 0, False
             made = not self._active(t)
             if made:
                 self.code = f"{secrets.randbelow(10 ** 6):06d}"
-                self.expires, self.wrong = t + CODE_TTL_S, 0
-                self.notified = t
+                self.expires, self.wrong, self.wrong_by = t + CODE_TTL_S, 0, {}
             return self.code, max(1, int(self.expires - t)), made
 
-    def may_notify_again(self) -> bool:
-        with self.lock:
-            t = self.clock()
-            if t - self.notified < NOTIFY_EVERY_S:
-                return False
-            self.notified = t
-            return True
-
-    def try_code(self, given: str) -> tuple[str, int]:
-        """("ok" | "wrong" | "used_up" | "expired" | "limited" | "locked", number): tries left after a wrong
-        code, seconds to wait when limited, else 0. A right code ends the code; so do CODE_MAX_WRONG wrong ones.
-        LOGIN_MAX_WRONG wrong tries since the last right code lock the login until the Mac asks for a code."""
+    def try_code(self, given: str, client: str = "") -> tuple[str, int]:
+        """("ok" | "wrong" | "used_up" | "expired", number): the tries this device has left after a wrong code,
+        else 0. "expired": no code is open (none was opened on the Mac, it expired or was used). "used_up":
+        this device used its CODE_MAX_WRONG tries on this code, or every device together CODE_TOTAL_WRONG."""
         given = re.sub(r"[\s-]", "", str(given or ""))
+        client = str(client)[:64]
         with self.lock:
             t = self.clock()
-            self.fails = [x for x in self.fails if t - x < 60]
-            if self.locked:
-                return "locked", 0
-            if len(self.fails) >= LOGIN_WRONG_PER_MIN:
-                return "limited", max(1, int(60 - (t - self.fails[0])) + 1)
             if not self._active(t):
                 return "expired", 0           # nothing to guess: not counted
-
+            if self.wrong_by.get(client, 0) >= CODE_MAX_WRONG:
+                return "used_up", 0
             # constant time: the code is never compared byte by byte with an early exit
             ok = hmac.compare_digest(given.encode(), self.code.encode()) and bool(_CODE_OK.match(given))
             if ok:
-                self.code, self.strikes = None, 0
-                return "ok", 0
-            self.fails.append(t)
-            self.strikes += 1
-            self.wrong += 1
-            if self.locked:
                 self.code = None
-                return "locked", 0
-            if self.wrong >= CODE_MAX_WRONG:
+                return "ok", 0
+            self.wrong += 1
+            self.wrong_by[client] = self.wrong_by.get(client, 0) + 1
+            if self.wrong >= CODE_TOTAL_WRONG:
                 self.code = None
                 return "used_up", 0
-            return "wrong", CODE_MAX_WRONG - self.wrong
+            left = CODE_MAX_WRONG - self.wrong_by[client]
+            return ("wrong", left) if left > 0 else ("used_up", 0)
 
     def new_link(self) -> str:
         with self.lock:
@@ -348,23 +324,32 @@ class Devices:
         with self.lock:
             return list(self._live(self._load()))
 
-    def add(self, label: str) -> str:
-        """Saves a new device and returns its cookie value (the file keeps only its hash)."""
+    def add(self, label: str, plain_http: bool = False) -> str:
+        """Saves a new device and returns its cookie value (the file keeps only its hash).
+
+        plain_http: the login came over the plain http LAN listener, where anyone on the Wi-Fi may have
+        seen the cookie; that cookie then works only there, never over https or the tunnel."""
         secret = secrets.token_urlsafe(32)
         with self.lock:
             items = self._live(self._load())[-(DEVICES_MAX - 1):]
             # printable ASCII only: `meeting-copilot devices` prints it to a terminal (no escape sequences)
             label = "".join(c if " " <= c <= "~" else "?" for c in label)[:120]
-            items.append({"id": _hash(secret), "created": int(now()), "label": label})
+            item = {"id": _hash(secret), "created": int(now()), "label": label}
+            if plain_http:
+                item["http"] = True
+            items.append(item)
             self._save(items)
         return secret
 
-    def ok(self, secret: str) -> bool:
+    def ok(self, secret: str, plain_http: bool = False) -> bool:
+        """A paired device's cookie. plain_http: asked by the plain http LAN listener, which accepts only
+        cookies it gave out itself (and every other listener refuses those)."""
         if not secret or self.path is None:
             return False
         h = _hash(secret)
         with self.lock:
-            return any(hmac.compare_digest(h, d["id"]) for d in self._live(self._load()))
+            return any(hmac.compare_digest(h, d["id"]) and bool(d.get("http")) == plain_http
+                       for d in self._live(self._load()))
 
     def forget_all(self) -> int:
         with self.lock:
@@ -379,27 +364,9 @@ class Devices:
 
 
 PAIR = Pairing()
-LOCKED_MSG = "Too many wrong codes: login is locked. On the Mac, run: meeting-copilot code"
+CLOSED_MSG = ("No code is open. On the Mac, run: meeting-copilot code (or tap \"Pair a device\" on a page "
+              "that is already logged in), then type the code here.")
 DEVICES = Devices(None)   # main() points it at <data_dir>/devices.json
-
-
-def notify(code: str) -> None:
-    """Shows the code as a macOS notification (osascript), in the background. No-op without osascript."""
-    exe = S.osascript
-    if not exe:
-        return
-    # the text goes in as arguments, never pasted into the AppleScript source
-    cmd = [exe, "-e", "on run argv", "-e", "display notification (item 2 of argv) with title (item 1 of argv)",
-           "-e", "end run", "Meeting Copilot", f"Code to open the page: {code} (valid 5 minutes)"]
-
-    def run():
-        try:
-            subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           timeout=15)
-        except (OSError, subprocess.SubprocessError):
-            pass
-
-    threading.Thread(target=run, daemon=True).start()
 
 
 def _is_path(cmd: str) -> bool:
@@ -587,6 +554,11 @@ def typesafe_key(key_file: str = "", notices: list | None = None) -> str:
         return ""
 
 
+# The LAN listener answers only these client addresses: loopback and the private ranges.
+LAN_NETS = tuple(ipaddress.ip_network(n) for n in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "fc00::/7", "fe80::/10"))
+
+
 class Settings:
     def __init__(self, cfg: dict) -> None:
         g = lambda k, d="": cfg.get("MEETING_COPILOT_" + k) or d  # noqa: E731  (KEY= with no value: the default)
@@ -752,6 +724,22 @@ class Settings:
             name = ""
         self.lan_name = name
         self.lan_ip = g("LAN_IP").strip()   # empty: found by itself, and followed when it changes
+        # The networks where the LAN page answers other devices: subnets such as 192.168.1.0/24, separated by
+        # commas, or "any" (every private network, as before 0.17.0). Empty: no other device (only this Mac),
+        # so a laptop taken to a hotel or airport Wi-Fi never offers the login page to the people around.
+        trusted = g("LAN_TRUSTED").strip()
+        self.lan_trusted_any = trusted.lower() == "any"
+        self.lan_trusted = []
+        for part in ([] if self.lan_trusted_any else [x.strip() for x in trusted.split(",") if x.strip()]):
+            try:
+                net = ipaddress.ip_network(part, strict=False)
+            except ValueError:
+                self.notices.append(f"MEETING_COPILOT_LAN_TRUSTED: not a subnet such as 192.168.1.0/24: {part}")
+                continue
+            if not any(net.version == n.version and net.subnet_of(n) for n in LAN_NETS):
+                self.notices.append(f"MEETING_COPILOT_LAN_TRUSTED: not a private network, ignored: {part}")
+                continue
+            self.lan_trusted.append(net)
         # Optional: the phone camera as context (CAMERA=1, then a toggle per meeting on the page).
         self.camera = _on(g("CAMERA", "0"))
         try:
@@ -831,12 +819,6 @@ class Settings:
         self.tmutil = _tool(g("TMUTIL"), "tmutil")
         dns_sd = g("DNS_SD").strip()
         self.dns_sd = _expand(dns_sd) if dns_sd else (shutil.which("dns-sd") if sys.platform == "darwin" else None)
-        # the pairing code notification: osascript on macOS; OSASCRIPT=off turns it off
-        osa = g("OSASCRIPT").strip()
-        if osa.lower() in ("0", "no", "false", "off"):
-            self.osascript = None
-        else:
-            self.osascript = _expand(osa) if osa else (shutil.which("osascript") if sys.platform == "darwin" else None)
 
         # Optional: the meeting screen as context for the suggestions (SCREEN=1, then a toggle per meeting).
         # Only the meeting app's window by default; SCREEN_MODE=full takes the whole main display.
@@ -3942,12 +3924,37 @@ def read_new_lines(con: sqlite3.Connection, meeting_id: int) -> None:
             E.metrics = compute_metrics(E.lines)
 
 
+def assist_due(t: float) -> bool:
+    """A suggestions round is due: a new transcript line, or a new screen/camera frame (a slide that changed
+    during a silence), since the last round, and ASSIST_S since the last one started. Both AI modes use it."""
+    mid = (E.meeting or {}).get("id")
+    sources = vision_sources()
+    new_frame = mid is not None and bool(sources) and FRAMES.newest_id(mid, sources) > E.frames_seen
+    return (E.last_id > E.assist_seen or new_frame) and t - E.last_assist >= S.assist_s
+
+
+def schedule_ai(t: float) -> None:
+    """Starts the AI calls that are due (from the loop, during a meeting the AI is allowed for)."""
+    if not S.use_session:   # one queue: one AI call at a time, as before 0.9.2
+        kind = next_round(t) if not QA.busy else None
+        if kind == "assist":
+            E.last_assist = t
+            QA.try_run(assist_round)
+        elif kind == "data":
+            E.last_data = t
+            QA.try_run(data_round)
+    else:   # the suggestions never wait behind a fact search
+        if not QA.busy and assist_due(t):
+            request_assist()
+        if not QD.busy and S.data_enabled and E.last_id > E.data_seen and t - E.last_data >= S.data_s:
+            E.last_data = t
+            QD.try_run(data_round)
+
+
 def next_round(t: float) -> str | None:
     """Which AI call is due: "assist", "data" or None. When both are due, the one that ran longer ago goes
     first (suggestions on a tie), so suggestions that take longer than ASSIST_S never starve the fact search."""
-    mid = (E.meeting or {}).get("id")
-    new_frame = mid is not None and bool(vision_sources()) and FRAMES.newest_id(mid, vision_sources()) > E.frames_seen
-    assist = (E.last_id > E.assist_seen or new_frame) and t - E.last_assist >= S.assist_s
+    assist = assist_due(t)
     data = S.data_enabled and E.last_id > E.data_seen and t - E.last_data >= S.data_s
     if data and (not assist or E.last_data < E.last_assist):
         return "data"
@@ -4006,21 +4013,7 @@ def loop(db: Path) -> None:
                     E.last_warning = now()
 
             if S.claude and E.ai_allowed():
-                t = now()
-                if not S.use_session:   # one queue: one AI call at a time, as before 0.9.2
-                    kind = next_round(t) if not QA.busy else None
-                    if kind == "assist":
-                        E.last_assist = t
-                        QA.try_run(assist_round)
-                    elif kind == "data":
-                        E.last_data = t
-                        QA.try_run(data_round)
-                else:   # the suggestions never wait behind a fact search
-                    if not QA.busy and E.last_id > E.assist_seen and t - E.last_assist >= S.assist_s:
-                        request_assist()
-                    if not QD.busy and S.data_enabled and E.last_id > E.data_seen and t - E.last_data >= S.data_s:
-                        E.last_data = t
-                        QD.try_run(data_round)
+                schedule_ai(now())
         try:
             ai_reconcile()   # AI turned off, the next-meeting click expired, a process that died: catch up
         except Exception as ex:
@@ -4028,11 +4021,6 @@ def loop(db: Path) -> None:
         time.sleep(S.poll_s)
 
 # ---------------------------------------------------------------- local server
-
-
-# The LAN listener answers only these client addresses: loopback and the private ranges.
-LAN_NETS = tuple(ipaddress.ip_network(n) for n in (
-    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "fc00::/7", "fe80::/10"))
 
 
 def _ip(text: str):
@@ -4047,6 +4035,43 @@ def lan_client_ok(ip: str) -> bool:
     """Whether an address is loopback or in a private range (never a public internet address)."""
     a = _ip(ip)
     return a is not None and (a.is_loopback or any(a.version == n.version and a in n for n in LAN_NETS))
+
+
+UNTRUSTED_NET = ("this network is not trusted: the Mac answers other devices only on the networks listed in "
+                 "MEETING_COPILOT_LAN_TRUSTED")
+
+
+def lan_trusted(client: str, local: str) -> str:
+    """Why the LAN listener refuses a private-address client, or "" when it answers it.
+
+    client: the device's address; local: this Mac's own address on that connection (the interface the
+    device reached). Loopback is always answered. Otherwise the Mac's address and the device's address
+    must both be in one subnet of MEETING_COPILOT_LAN_TRUSTED (or it is "any")."""
+    a = _ip(client)
+    if a is not None and a.is_loopback:
+        return ""
+    if S.lan_trusted_any:
+        return ""
+    if not S.lan_trusted:
+        return f"{UNTRUSTED_NET} (empty)"
+    mine = _ip(local)
+    nets = [n for n in S.lan_trusted if mine is not None and mine.version == n.version and mine in n]
+    if not nets:
+        return f"{UNTRUSTED_NET} (this Mac is on {mine or 'an unknown address'} now)"
+    if a is None or not any(a.version == n.version and a in n for n in nets):
+        return f"{UNTRUSTED_NET} (this device's address {client} is outside it)"
+    return ""
+
+
+_UNTRUSTED_LOGGED: dict[str, float] = {}
+
+
+def log_untrusted(why: str) -> None:
+    """The log line for a refused LAN device: once a minute for the same reason (a phone retries often)."""
+    t = now()
+    if t - _UNTRUSTED_LOGGED.get(why, -1e9) >= 60:
+        _UNTRUSTED_LOGGED[why] = t
+        print(f"{clock(t)} LAN page refused a device: {why}", flush=True)
 
 
 def lan_host_ok(host: str, s: Settings, https: bool = False) -> bool:
@@ -4117,6 +4142,8 @@ SETUP_PAGE = HERE / "setup.html"
 HTTPS_UP = {"port": 0}     # the port of the running TLS listener (0: none), for the redirect and `status`
 SETUP_PATHS = ("/setup", "/ca.crt", "/ca.mobileconfig", "/ping")
 HTTPS_COOKIE = "mc_https"  # set by the /setup page (JavaScript) to ca_tag() once https works on that phone
+HTTP_OFF_MSG = (b"LAN https is on: this page answers over https only. Open /setup on this address to set this "
+                b"device up, then use the https address.\n")
 
 
 def tls_dir() -> Path:
@@ -4290,9 +4317,40 @@ class Page(BaseHTTPRequestHandler):
     def _tls(self) -> bool:
         return getattr(self.server, "tls", False)
 
+    @property
+    def _plain_lan(self) -> bool:
+        """The plain http LAN listener: what it sends and gets can be seen by anyone on the Wi-Fi."""
+        return self._lan and not self._tls
+
+    def _client_key(self) -> str:
+        """Who is trying a pairing code, for the per-device limit: the client address; behind the tunnel (on
+        the loopback listener) the visitor's address the tunnel passes on."""
+        ip = str(self.client_address[0])
+        if not self._lan and (_ip(ip) is not None and _ip(ip).is_loopback):
+            fwd = (self.headers.get("Cf-Connecting-IP") or self.headers.get("X-Forwarded-For", "").split(",")[0])
+            if fwd.strip():
+                return fwd.strip()[:64]
+        return ip
+
     def _client_ok(self) -> bool:
         # the LAN listener (0.0.0.0) never answers an address from outside the local network
         return not self._lan or lan_client_ok(str(self.client_address[0]))
+
+    def _local_ip(self) -> str:
+        """This Mac's own address on this connection (the interface the device reached)."""
+        try:
+            return str(self.connection.getsockname()[0])
+        except (OSError, IndexError):
+            return ""
+
+    def _untrusted(self) -> str:
+        """Why the LAN listener refuses this device on this network, or "" (see lan_trusted)."""
+        if not self._lan:
+            return ""
+        why = lan_trusted(str(self.client_address[0]), self._local_ip())
+        if why:
+            log_untrusted(why)
+        return why
 
     def _host_ok(self) -> bool:
         # blocks DNS rebinding: only our own host names are answered
@@ -4352,7 +4410,8 @@ class Page(BaseHTTPRequestHandler):
     def _authed(self) -> bool:
         """The token cookie, a paired device's cookie, or the token as `Authorization: Bearer` (scripts)."""
         return (any(self._token_ok(v) for n in (TOKEN_COOKIE, SECURE_PREFIX + TOKEN_COOKIE) for v in self._cookies(n))
-                or any(DEVICES.ok(v) for n in (DEVICE_COOKIE, SECURE_PREFIX + DEVICE_COOKIE) for v in self._cookies(n))
+                or any(DEVICES.ok(v, self._plain_lan) for n in (DEVICE_COOKIE, SECURE_PREFIX + DEVICE_COOKIE)
+                       for v in self._cookies(n))
                 or self._token_ok(self._bearer()))
 
     def _cookie(self, name: str, value: str) -> str:
@@ -4369,9 +4428,7 @@ class Page(BaseHTTPRequestHandler):
 
     def _deny(self) -> None:
         if self.command == "GET" and self._navigation():
-            code, _, made = PAIR.get_or_create()
-            if made:
-                notify(code)
+            # the login page only: no code is made and nothing shows on the Mac (only the Mac opens a code)
             return self._send(401, LOGIN_PAGE.read_bytes(), "text/html; charset=utf-8")
         self._send(401, b"missing or wrong token: open the page in a browser and type the code shown on the "
                         b"Mac, or send the token as Authorization: Bearer\n", "text/plain; charset=utf-8")
@@ -4394,13 +4451,22 @@ class Page(BaseHTTPRequestHandler):
     def do_GET(self):
         if not self._client_ok():
             return self._send(403, b"network", "text/plain")
+        why = self._untrusted()
+        if why:
+            return self._send(403, f"network: {why}\n".encode(), "text/plain; charset=utf-8")
         if not self._host_ok():
             return self._send(403, b"host", "text/plain")
         path, given, once = self._route()
         if self._lan and S.lan_https and path in SETUP_PATHS and self._setup(path):
             return
-        if self._lan and not self._tls and self._to_https(path):
-            return
+        if self._plain_lan and HTTPS_UP["port"]:
+            # LAN https is on: plain http only sets a phone up (above) and sends it on. No login, no cookie and
+            # no page here, where anyone on the Wi-Fi could read them.
+            if self._to_https(path):
+                return
+            if self._navigation():
+                return self._send(302, b"", "text/plain", {"Location": "/setup"})
+            return self._send(403, HTTP_OFF_MSG, "text/plain; charset=utf-8")
         if given is not None:
             return self._clean_redirect(path) if self._token_ok(given) else self._deny()
         if once is not None:
@@ -4423,8 +4489,7 @@ class Page(BaseHTTPRequestHandler):
             return self._send(200, got[0], got[1], {"X-Content-Type-Options": "nosniff"})
         if path == "/pair":
             cur = PAIR.current()
-            return self._json(200, {"code": cur[0] if cur else None, "expires_in": cur[1] if cur else 0,
-                                    "locked": PAIR.locked})
+            return self._json(200, {"code": cur[0] if cur else None, "expires_in": cur[1] if cur else 0})
         if path == "/login-link":
             # only with the token itself (the launcher): a paired device cannot turn itself into the token
             if not self._token_ok(self._bearer()):
@@ -4488,24 +4553,20 @@ class Page(BaseHTTPRequestHandler):
             code = str(body.get("code", "")) if isinstance(body, dict) else ""
         except ValueError:   # bad JSON, or bytes that are not UTF-8/16/32 (UnicodeDecodeError)
             code = ""
-        result, n = PAIR.try_code(code[:20])
+        result, n = PAIR.try_code(code[:20], self._client_key())
         if result == "ok":
             label = f"{self.headers.get('User-Agent', '')[:80]} via {self.headers.get('Host', '')[:40]}"
             try:
-                secret = DEVICES.add(label)
+                secret = DEVICES.add(label, self._plain_lan)
             except OSError as ex:
                 error(f"saving the paired device: {ex}")
                 return self._json(500, {"error": "could not save this device on the Mac"})
             print(f"{clock(now())} a device logged in with the pairing code", flush=True)
             return self._json(200, {"ok": True}, {"Set-Cookie": self._cookie(DEVICE_COOKIE, secret)})
-        if result == "locked":
-            return self._json(429, {"error": LOCKED_MSG})
-        if result == "limited":
-            return self._json(429, {"error": f"Too many wrong codes. Wait {n} seconds."}, {"Retry-After": str(n)})
         if result == "used_up":
-            return self._json(429, {"error": "Too many wrong tries for this code. Ask for a new code."})
+            return self._json(429, {"error": "Too many wrong tries for this code. " + CLOSED_MSG})
         if result == "expired":
-            return self._json(410, {"error": "No valid code: it expired or was used. Ask for a new code."})
+            return self._json(410, {"error": CLOSED_MSG})
         return self._json(401, {"error": f"Wrong code. {n} {'try' if n == 1 else 'tries'} left.", "left": n})
 
     def _frame_refused(self, raw: bytes, declared: int) -> bool:
@@ -4607,15 +4668,6 @@ class Page(BaseHTTPRequestHandler):
             look_log_same(t)
         self._json(200, {"ok": True, "kept": bool(kept)})
 
-    def _send_code(self) -> None:
-        """POST /login/code: shows the code on the Mac again (a new one when it expired). Never returns it."""
-        code, left, made = PAIR.get_or_create()
-        if code is None:
-            return self._json(429, {"error": LOCKED_MSG})
-        if made or PAIR.may_notify_again():
-            notify(code)
-        self._json(200, {"ok": True})
-
     def do_POST(self):
         # The body is read before any answer, refusals included: closing a connection with unread
         # bytes resets it, and the client may never see the 403/401.
@@ -4640,12 +4692,18 @@ class Page(BaseHTTPRequestHandler):
         raw = self.rfile.read(min(n, cap)) if n else b""
         if not client_ok:
             return self._send(403, b"network", "text/plain")
+        why = self._untrusted()
+        if why:
+            return self._send(403, f"network: {why}\n".encode(), "text/plain; charset=utf-8")
         if not page_ok:
             return self._send(403, b"origin", "text/plain")
+        if self._plain_lan and HTTPS_UP["port"]:
+            return self._send(403, HTTP_OFF_MSG, "text/plain; charset=utf-8")   # see do_GET
         if path == "/login":
             return self._login(raw)
         if path == "/login/code":
-            return self._send_code()
+            # the old "show the code on the Mac again" button (a login page still open from 0.16 or before)
+            return self._json(409, {"error": CLOSED_MSG})
         if not authed:
             return self._deny()
         if upload:
@@ -4693,7 +4751,7 @@ class Page(BaseHTTPRequestHandler):
                 threading.Thread(target=SESSION.relanguage, daemon=True).start()
             return self._json(200, {"ok": True, "language": value})
         if path == "/pair":
-            code, left, _ = PAIR.get_or_create(owner=True)   # someone logged in: no notification, lifts the lock
+            code, left, _ = PAIR.get_or_create()   # someone logged in (or the Mac's `meeting-copilot code`)
             return self._json(200, {"code": code, "expires_in": left})
         stop_look = False
         with E.lock:
@@ -4848,6 +4906,8 @@ def print_urls(port: str, lan_port: str, https_port: str = "") -> None:
                       f"  (phone setup: http://{S.lan_name}.local{sfx}/setup)")
             elif S.lan_https:
                 print("  HTTPS:  on in the settings but not listening (see `meeting-copilot log`)")
+            if not (S.lan_trusted_any or S.lan_trusted):
+                print("  note:   no other device is answered until MEETING_COPILOT_LAN_TRUSTED lists your network")
         else:
             print("  LAN:    on in the settings but not listening (see `meeting-copilot log`)")
     for h in S.extra_hosts:
@@ -4882,12 +4942,10 @@ def cli(action: str, port: str) -> int:
             cur = local_call(port, "/pair")
         except (OSError, ValueError):
             cur = None
-        if cur and cur.get("locked"):
-            print("  code:   locked after too many wrong codes (`meeting-copilot code` unlocks and shows one)")
-        elif cur and cur.get("code"):
+        if cur and cur.get("code"):
             print(f"  code:   {cur['code']}  (pairing code, valid {_left(int(cur['expires_in']))} more)")
         else:
-            print("  code:   none now (open the page on the other device, or run `meeting-copilot code`)")
+            print("  code:   none open (`meeting-copilot code` opens one for 5 minutes)")
         n = len(DEVICES.list())
         print(f"  paired devices: {n}" + ("  (`meeting-copilot devices forget` logs them out)" if n else ""))
     elif action == "new-code":
@@ -5016,6 +5074,17 @@ def start_tls() -> bool:
     return True
 
 
+def lan_trust_note() -> str:
+    """The start-up line that says where the LAN page answers other devices (MEETING_COPILOT_LAN_TRUSTED)."""
+    if S.lan_trusted_any:
+        return ("note: MEETING_COPILOT_LAN_TRUSTED=any: the LAN page answers devices on every private network, "
+                "hotel and airport Wi-Fi included")
+    if not S.lan_trusted:
+        return ("note: the LAN page answers no other device until you list your home network in "
+                "MEETING_COPILOT_LAN_TRUSTED (e.g. 192.168.1.0/24)")
+    return f"LAN page answers other devices only on {', '.join(map(str, S.lan_trusted))}"
+
+
 def start_lan() -> bool:
     """LAN=1: the second listener on 0.0.0.0:LAN_PORT, and its .local name. A failure is a note, not an exit."""
     if not S.lan:
@@ -5027,6 +5096,7 @@ def start_lan() -> bool:
         return False
     threading.Thread(target=lan.serve_forever, daemon=True).start()
     print(f"LAN page on port {S.lan_port} (private addresses only)", flush=True)
+    print(lan_trust_note(), flush=True)
     if S.lan_https:
         start_tls()
     if S.lan_name and S.dns_sd:
