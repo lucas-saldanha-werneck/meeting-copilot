@@ -1,0 +1,31 @@
+# meeting-copilot's AI on a server. See "Run the AI on a server" in the README.
+# Put this folder on the server (for example /opt/copilot-ai), then: docker compose up -d --build
+services:
+  copilot-ai:
+    build:
+      context: .
+      args:
+        CLAUDE_VERSION: ${CLAUDE_VERSION:-latest}
+    image: copilot-ai:local
+    container_name: copilot-ai
+    restart: unless-stopped
+    init: true                  # reaps the claude processes that docker exec leaves behind
+    # CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`) and any value the MCP template uses
+    env_file: ${SECRETS_ENV:-.env}
+    volumes:
+      - ./notes:/notes:ro       # the read-only copy of your search folders (sync-notes.sh)
+      - ./claude-home:/home/node/.claude
+      - ./mcp.template.json:/config/mcp.template.json:ro
+    # It shares the server: a hard memory cap (no swap, so a runaway is stopped, not slowed down) and CPUs.
+    mem_limit: ${MEM_LIMIT:-1200m}
+    memswap_limit: ${MEM_LIMIT:-1200m}
+    cpus: ${CPUS:-2}
+    pids_limit: 256
+    logging:
+      driver: json-file
+      options: { max-size: "2m", max-file: "2" }
+    # To reach an MCP server running in another container, join its network:
+    # networks: [the-mcp-network]
+# networks:
+#   the-mcp-network:
+#     external: true

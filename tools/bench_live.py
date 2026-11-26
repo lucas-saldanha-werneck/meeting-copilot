@@ -4,6 +4,7 @@
 Usage:
   python3 tools/bench_live.py [--rounds N] [--mode both|spawn|kept] [--claude PATH] [--model sonnet]
                               [--language "Brazilian Portuguese"] [--credit]
+                              [--remote "ssh myserver docker exec -i copilot-ai claude"]
 
 Each round adds one transcript line and runs one suggestions round, like a live meeting:
   spawn  a new `claude -p` per round (MEETING_COPILOT_PERSISTENT_AI=0)
@@ -11,6 +12,8 @@ Each round adds one transcript line and runs one suggestions round, like a live 
 It prints each round and p50 / p90 / max per mode. It calls the real claude (costs a little), never
 reads your config file or your data folder (a temporary folder is used), and never touches Muesli.
 --credit uses your claude-credito setup (API credit first) for the kept-open process; default: off.
+--remote runs the calls on another machine (MEETING_COPILOT_REMOTE), with this machine's claude as the
+fallback; each round line says where it ran.
 """
 
 from __future__ import annotations
@@ -51,7 +54,10 @@ def run(mode: str, n: int, args, tmp: str) -> list[float]:
         cfg["MEETING_COPILOT_CLAUDE"] = args.claude
     if args.language:
         cfg["MEETING_COPILOT_LANGUAGE"] = args.language
+    if args.remote:
+        cfg["MEETING_COPILOT_REMOTE"] = args.remote
     copilot.S = copilot.Settings(cfg)
+    copilot.REMOTE.reset()
     if not copilot.S.claude:
         raise SystemExit("claude not found (use --claude)")
     copilot.E = copilot.State()
@@ -89,7 +95,8 @@ def run(mode: str, n: int, args, tmp: str) -> list[float]:
         dt = time.monotonic() - t0
         r = e.rounds[-1] if e.rounds else {}
         print(f"  {mode} round {i + 1}: {dt:.2f}s ok={ok} first_byte={r.get('first_byte', '-')} "
-              f"turn={r.get('turn', '-')} attempts={r.get('attempts', 1)} say={len(e.say)}", flush=True)
+              f"turn={r.get('turn', '-')} attempts={r.get('attempts', 1)} say={len(e.say)} "
+              f"where={r.get('where', '-')}", flush=True)
         if ok:
             out.append(dt)
     copilot.SESSION.close("bench done", wait=True)
@@ -104,6 +111,7 @@ def main() -> None:
     ap.add_argument("--model", default="sonnet")
     ap.add_argument("--language", default="")
     ap.add_argument("--credit", action="store_true")
+    ap.add_argument("--remote", default="", help="the command that starts claude on another machine")
     args = ap.parse_args()
     results = {}
     with tempfile.TemporaryDirectory() as tmp:

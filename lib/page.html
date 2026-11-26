@@ -62,6 +62,7 @@
   #latency { color: var(--dim); font-size: 12px; }
   #lang { display: none; background: var(--card); color: var(--txt); border: 1px solid var(--line); border-radius: 8px; padding: 4px 6px; font: inherit; font-size: 12px; max-width: 14em; }
   #lang.bad { border-color: var(--warn); }
+  #aihost.out { color: var(--corr); }
   @media (pointer: coarse) { #lang { font-size: 16px; } }   /* iOS zooms into a smaller select */
   #vision { display: none; gap: 12px; align-items: flex-start; flex-wrap: wrap; padding: 0 16px 8px; color: var(--dim); font-size: 12px; }
   #vision figure { margin: 0; }
@@ -74,6 +75,7 @@
   <h1>Meeting Copilot</h1>
   <span id="status" class="pill">…</span>
   <span id="title" class="pill"></span>
+  <span id="aihost" class="pill" style="display:none"></span>
   <div id="metrics"></div>
   <span id="latency" title="From the speech or frame reaching the copilot to the answer being ready (the page checks every 2 s)"></span>
   <button id="ai"></button>
@@ -169,6 +171,15 @@ async function refresh() {
   cameraUI(e, v);
   lookUI(e);
   langUI(e.language, langAt);
+  // MEETING_COPILOT_REMOTE: which machine runs the AI now (this Mac while the server does not answer)
+  const rh = document.getElementById("aihost"), rm = e.remote;
+  rh.style.display = rm ? "inline-block" : "none";
+  if (rm) {
+    rh.className = "pill" + (rm.on ? "" : " out");
+    rh.textContent = rm.on ? "AI on the server" : `AI on this Mac · server out since ${hhmm(rm.since)}`;
+    rh.title = rm.on ? "The AI calls run on the remote machine (MEETING_COPILOT_REMOTE)"
+      : `The remote machine did not answer (${rm.why}); it is checked again in the background`;
+  }
   document.getElementById("latency").textContent = lat.n ?
     `last answer ${lat.last} s · median ${lat.median} s` + (lat.n_image ? `, with image ${lat.median_image} s` : "") : "";
   const vis = document.getElementById("vision");

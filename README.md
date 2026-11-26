@@ -195,6 +195,10 @@ Every key:
 | `MEETING_COPILOT_ASSIST_S`, `_DATA_S`, `_POLL_S` | `25`, `45`, `5` | Intervals in seconds |
 | `MEETING_COPILOT_PERSISTENT_AI` | `1` | `1`: one kept-open `claude` process per meeting for the suggestions (see "The kept-open AI process"). `0`: a new `claude -p` per round |
 | `MEETING_COPILOT_AI_FIRST_BYTE_S`, `_AI_ROUND_S` | `6`, `10` | Watchdog of a suggestions round on the kept-open process: seconds to the API's first byte, and to the answer |
+| `MEETING_COPILOT_REMOTE` | empty (off) | The command that starts `claude` on another machine, e.g. `ssh myserver docker exec -i copilot-ai claude`: the AI calls run there, and here while it does not answer. See [Run the AI on a server](#run-the-ai-on-a-server) |
+| `MEETING_COPILOT_REMOTE_PATHS` | empty | `local=remote` folder pairs (separated by `:`) that map the search folders to their copies on that machine |
+| `MEETING_COPILOT_REMOTE_MCP_CONFIG` | empty | The MCP config file on that machine (`MCP_TOOLS` applies to it); empty: no MCP tools while the AI runs there |
+| `MEETING_COPILOT_REMOTE_FIRST_BYTE_S`, `_REMOTE_RETRY_S` | `6`, `30` | A one-shot call there that prints nothing for this long runs here instead; how often the machine is checked again while it is out (doubling after each failed check, at most 5 min) |
 | `MEETING_COPILOT_CONTEXT_FILE` | empty | A text file about you that both AI calls read: your name and role, your projects, what your notes folders and MCP tools hold, words the transcript tends to get wrong. The first 8000 characters are used |
 | `MEETING_COPILOT_LANGUAGE` | empty (the meeting's language) | Language for every suggestion, fact and Look answer, e.g. `Brazilian Portuguese`. The language menu on the page overrides it (see [Language](#language)) |
 | `MEETING_COPILOT_PROMPT_FILE` | empty (the built-in prompt) | A text file that replaces the built-in suggestions prompt. See [Your own prompt](#your-own-prompt) |
@@ -411,6 +415,51 @@ needed. On by default when `MEETING_COPILOT_CAMERA=1` (`MEETING_COPILOT_LOOK=1` 
   leaving the page or locking the phone while it shows live video, or the copilot stopping), whatever
   `KEEP_FRAMES` says. Answers stay on the page until the next tap on Look; they are not saved with any meeting.
 
+## Run the AI on a server
+
+On a busy Mac every new `claude -p` can take more than 10 s just to start (in one meeting the Mac's load was
+25 per CPU and no suggestion came for 4 minutes). With `MEETING_COPILOT_REMOTE` the AI calls (suggestions, fact
+search, Look, and the screen and camera frames that go with them) run on another machine instead, and this
+Mac only records and transcribes.
+
+```
+MEETING_COPILOT_REMOTE=ssh myserver docker exec -i copilot-ai claude
+MEETING_COPILOT_REMOTE_PATHS=~/Dropbox=/notes
+MEETING_COPILOT_REMOTE_MCP_CONFIG=/home/node/mcp.json
+```
+
+- **How it reaches the server:** each AI process is one `ssh myserver docker exec -i copilot-ai claude ...`.
+  Its input and output are the same pipes as a local `claude`, so the kept-open suggestions process, the Look
+  spare and the frames (base64 inside the messages) work unchanged; nothing listens on a port. ssh gets batch
+  mode, a 5 s connect timeout, keep-alives and connection sharing (one login for every call; a new call costs
+  one round trip), unless your command sets those options itself. Each argument is quoted for the remote
+  shell. Your Mac's ssh key must log in without a prompt.
+- **Fallback:** the machine is out when ssh or `docker exec` fails, when a one-shot call there prints nothing in
+  `REMOTE_FIRST_BYTE_S` (6 s), when the kept-open process misses its first-byte watchdog, or when claude there
+  says it is not logged in. That round runs here at once (for the suggestions, on a fresh seeded process; the
+  remote failure does not count as one of the round's two tries). Until the machine answers again every call
+  runs here, and the page header says `AI on this Mac · server out since 16:01` (hover for the reason). In the
+  background `claude --version` is run there every `REMOTE_RETRY_S` (30 s, doubling after each failed check, at
+  most 5 min); when it answers, the next calls go there and the kept-open process moves back before the next
+  round. The local `claude` stays required: it is the fallback.
+- **What it does not use there:** the claude-credito wrapper (`API_CREDIT`) and your Mac's Claude Code login. The
+  server's claude has its own login (for example `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`).
+- **Search folders:** the fact search reads the server's copy. `REMOTE_PATHS` maps each search folder to it
+  (a folder under no pair is searched only when the AI runs here, and the log says so at start). The same
+  path rules apply there: Read, Grep and Glob only inside those folders.
+- **Stopping a call:** stopping the local `ssh` closes the remote `claude`'s input, so it ends after the answer
+  it is writing; a call stopped in the middle can still finish there.
+- **Logs:** every suggestions line ends with `on the remote machine` or `on this machine`, the Look stage line
+  has `where=`, and `/state` has `remote` (`on`, `why`, `since`) and `where` in each round.
+  `tools/bench_live.py --remote "<command>"` measures rounds through it.
+
+`tools/remote/` has a container for the server: `Dockerfile` (Node and Claude Code; pin the version your Mac
+runs with `CLAUDE_VERSION`), `docker-compose.yml` (memory and CPU caps, no port, an `init` that reaps finished
+processes, your notes copy mounted read-only at `/notes`), `entry.sh` (writes the MCP config from a template
+with `${VAR}`s taken from the container's environment) and `sync-notes.sh` (an rclone copy of your search
+folders, run from cron; a copy, not a mount, because Grep reads every file and each read on a mount is a cloud
+API call; it leaves out files over 25 MB and archives and audio, and skips a run when the disk is short).
+
 ## Response time
 
 Every suggestions round is timed: when its input reached the copilot (the earliest transcript line or
@@ -440,6 +489,7 @@ With neither search folders nor MCP, the "Relevant facts" panel says fact search
 
 - The Muesli database is opened read-only and never written.
 - The transcript of the last 3 minutes, your goals and the items already shown are sent to Claude through `claude -p` (on the kept-open process: once, then only the new lines each round). With screen sharing or the phone camera turned on for a meeting, the newest frames go too (see "Screen and camera"). In Look mode, after you tap **Look**, the newest camera frames and the questions you type go to Claude (see "Look mode"). With a TypeSafe key set, the newest Look frame also goes to TypeSafe (Jev) for the gate. Nothing else leaves the machine.
+- With `MEETING_COPILOT_REMOTE`, that same AI input goes over ssh to the machine you name, and the fact search reads that machine's copy of your search folders (see [Run the AI on a server](#run-the-ai-on-a-server)).
 - Sessions (full transcript plus suggestions) are saved as JSON files readable only by your user. A meeting saved again (the copilot restarted, or the meeting stopped and recorded again) gets a new file with `-2`, `-3`, and so on, so nothing earlier is overwritten.
 - The fact search may read files only inside the search folders: Read, Grep and Glob are allowed with a path rule for each folder, so a request in the meeting to open any other file is refused. The AI runs in an empty folder of its own and loads no Claude Code settings files, so no hook planted in a search folder runs with it.
 - The page answers only on 127.0.0.1 / localhost (plus any `MEETING_COPILOT_EXTRA_HOSTS`, and, with `MEETING_COPILOT_LAN=1`, private addresses on the home network, where POSTs must come from the page's own `http://<host>` origin), checks the `Host` header against DNS rebinding, and accepts POSTs only from its own origin. Every request (the page, `/state` and each POST) needs a login: the cookie of a browser that typed a pairing code, the token cookie (set by the launcher's one-time link or a `?token=` URL), or the token as an `Authorization: Bearer` header; anything else gets `401` (a browser gets the login page). The code is never shown to a browser that is not logged in, not even on the Mac itself: only the notification, `meeting-copilot status`/`code` and a logged-in page show it. The login POST passes the same `Host` and origin checks as every POST, and the code is compared in constant time. The token file and `devices.json` are readable only by your user, so other users' programs and web pages cannot read the meeting; a program running as you can still read the files.

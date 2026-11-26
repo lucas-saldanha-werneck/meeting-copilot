@@ -14,7 +14,9 @@ suggestions JSON. It ends at the end of its input. Test knobs (environment):
   FAKE_CLAUDE_BAD_ONCE    a path: the first answer to find it missing creates it and replies with prose
   FAKE_CLAUDE_TOKENS      context tokens reported per turn (grows with each turn of the process)
   FAKE_CLAUDE_REFUSE_KEY  1: a process started with ANTHROPIC_API_KEY answers "Credit balance is too low"
+  FAKE_CLAUDE_WHERE       written in every entry as "where" (default "local"; the fake remote sets "remote")
 Every entry has "key": whether ANTHROPIC_API_KEY was set (never its value).
+`--version` prints a version and logs nothing (the remote machine's check).
 A message with images (content blocks) is logged with "text" and "images" ([{media_type, len}]) in both modes.
 One-shot with images (`--input-format stream-json` plus --json-schema): the stream-json events ending with the
 same result object as `--output-format json`.
@@ -42,6 +44,7 @@ LOOK = {"items": [{"kind": "answer", "text": "The error says the port 8443 is al
 
 
 def log(entry):
+    entry["where"] = os.environ.get("FAKE_CLAUDE_WHERE", "local")
     with open(LOG, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")
 
@@ -96,6 +99,10 @@ def stream_mode():
               "usage": {"input_tokens": 4, "cache_read_input_tokens": per_turn * turn,
                         "cache_creation_input_tokens": 0, "output_tokens": 50}})
 
+
+if argv == ["--version"]:
+    print("2.0.0 (Claude Code)")
+    sys.exit(0)
 
 stream = "--input-format" in argv and argv[argv.index("--input-format") + 1] == "stream-json"
 if stream and "--json-schema" not in argv:      # the kept-open process; a one-shot call has a schema

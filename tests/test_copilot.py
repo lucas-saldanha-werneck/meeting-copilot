@@ -4,6 +4,7 @@
 Everything runs in temporary folders with a fake HOME: a fake Muesli database built here with an
 invented meeting, and a fake `claude` first on PATH (tests/fake_claude.py). No real Muesli, no AI.
 """
+import base64
 import contextlib
 import filecmp
 import hashlib
@@ -13,6 +14,7 @@ import http.server
 import json
 import os
 import re
+import shlex
 import signal
 import socket
 import sqlite3
@@ -3478,6 +3480,226 @@ class Vision(unittest.TestCase):
         content = msg["message"]["content"]
         self.assertEqual([b["type"] for b in content], ["text", "text", "image"])
         self.assertEqual(content[2]["source"]["data"], "iVBORw==")
+
+
+@unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
+class RemoteAI(unittest.TestCase):
+    """MEETING_COPILOT_REMOTE: the AI calls on another machine through a fake ssh (tests/fake_ssh.py runs the
+    command with /bin/sh -c, as sshd does, and the fake claude logs where=remote), with this machine's fake
+    claude as the fallback."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        t = self.t = os.path.realpath(self.tmp.name)
+        self.claude_log = os.path.join(t, "claude.jsonl")
+        self.ssh_log = os.path.join(t, "ssh.jsonl")
+        self.down = os.path.join(t, "remote-down")
+        self.hang = os.path.join(t, "remote-hang")
+        bin_, rbin = os.path.join(t, "bin"), os.path.join(t, "rbin")
+        os.makedirs(bin_)
+        os.makedirs(rbin)
+        self.claude, self.ssh, self.rclaude = (os.path.join(bin_, "claude"), os.path.join(rbin, "ssh"),
+                                               os.path.join(rbin, "claude"))
+        for path, body in ((self.claude, f'exec "{PY}" "{ROOT}/tests/fake_claude.py" "$@"'),
+                           (self.rclaude, f'exec "{PY}" "{ROOT}/tests/fake_claude.py" "$@"'),
+                           (self.ssh, f'exec "{PY}" "{ROOT}/tests/fake_ssh.py" "$@"')):
+            with open(path, "w") as f:
+                f.write("#!/bin/sh\n" + body + "\n")
+            os.chmod(path, 0o755)
+        self.old = (copilot.S, copilot.E, copilot.SESSION, dict(os.environ))
+        os.environ.update(FAKE_CLAUDE_LOG=self.claude_log, FAKE_SSH_LOG=self.ssh_log, FAKE_SSH_DOWN=self.down,
+                          FAKE_SSH_HANG=self.hang)
+        for k in ("FAKE_CLAUDE_HANG_ONCE", "FAKE_CLAUDE_WHERE", "FAKE_CLAUDE_SLEEP"):
+            os.environ.pop(k, None)
+        copilot.REMOTE.reset()
+        copilot.E = copilot.State()
+        copilot.SESSION = copilot.AssistSession()
+        self.settings()
+
+    def tearDown(self):
+        copilot.LOOK_SPARE.stop()
+        copilot.SESSION.close("test", wait=True)
+        open(self.down, "w").close()     # a check loop still running finds the machine out and keeps waiting
+        copilot.S, copilot.E, copilot.SESSION, env = self.old
+        copilot.REMOTE.reset()
+        os.environ.clear()
+        os.environ.update(env)
+        self.tmp.cleanup()
+
+    def settings(self, **extra):
+        cfg = {"MEETING_COPILOT_DATA_DIR": os.path.join(self.t, "data"), "MEETING_COPILOT_CLAUDE": self.claude,
+               "MEETING_COPILOT_API_CREDIT": "off", "MEETING_COPILOT_LOOK_WARM": "0",
+               "MEETING_COPILOT_REMOTE": f"{self.ssh} myserver {self.rclaude}",
+               "MEETING_COPILOT_REMOTE_FIRST_BYTE_S": "1", "MEETING_COPILOT_REMOTE_RETRY_S": "0.2"}
+        cfg.update({"MEETING_COPILOT_" + k: v for k, v in extra.items()})
+        copilot.S = copilot.Settings(cfg)
+        return copilot.S
+
+    def log(self, spawn=False):
+        if not os.path.exists(self.claude_log):
+            return []
+        with open(self.claude_log) as f:
+            return [e for e in map(json.loads, f) if bool(e.get("spawn")) == spawn]
+
+    def quiet(self, fn, *a, **k):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            r = fn(*a, **k)
+        return r, out.getvalue()
+
+    def test_off_by_default(self):
+        s = self.settings(REMOTE="")
+        self.assertEqual(s.remote, [])
+        self.assertFalse(copilot.REMOTE.use())
+        self.assertIsNone(copilot.E.public()["remote"])
+        copilot.run_claude("p", "m", "sonnet", schema=copilot.SCHEMA_ASSIST)
+        self.assertEqual([e["where"] for e in self.log()], ["local"])
+        self.assertFalse(os.path.exists(self.ssh_log))
+
+    def test_ssh_command_quotes_each_argument_and_shares_one_login(self):
+        self.settings(REMOTE="ssh -o ControlMaster=no myserver docker exec -i copilot-ai claude")
+        args = ["-p", "--setting-sources", "", "it's a \"test\"\nwith $HOME and `date`", "a;b"]
+        cmd = copilot.remote_command(args)
+        self.assertEqual(cmd[0], "ssh")
+        self.assertIn("-T", cmd)
+        opts = [cmd[i + 1] for i, v in enumerate(cmd) if v == "-o"]
+        self.assertIn("BatchMode=yes", opts)
+        self.assertIn("ControlPersist=600", opts)
+        self.assertTrue(any(o.startswith("ControlPath=") for o in opts), opts)
+        self.assertEqual([o for o in opts if o.startswith("ControlMaster")], ["ControlMaster=no"])   # yours wins
+        tail = cmd[cmd.index("claude") + 1:]
+        self.assertEqual(shlex.split(" ".join(tail)), args)      # what the remote shell reads back
+        # not ssh (a local docker, a wrapper): the arguments go as they are
+        self.settings(REMOTE="docker exec -i copilot-ai claude")
+        self.assertEqual(copilot.remote_command(args), ["docker", "exec", "-i", "copilot-ai", "claude", *args])
+
+    def test_the_remote_claude_gets_the_same_arguments_through_the_remote_shell(self):
+        prompt = "Say it's \"fine\".\nUse $HOME, `whoami` and; nothing else * ?"
+        copilot.run_claude(prompt, "hello", "sonnet", schema=copilot.SCHEMA_ASSIST)
+        [e] = self.log()
+        self.assertEqual(e["where"], "remote")
+        want = copilot.claude_command(prompt, "sonnet", schema=copilot.SCHEMA_ASSIST, stream=True)[0][1:]
+        self.assertEqual(e["argv"], want)
+        self.assertEqual(e["stdin"], "hello")
+
+    def test_search_folders_and_mcp_config_are_the_remote_ones(self):
+        mapped = os.path.join(self.t, "Cloud", "vault", "wiki")
+        other = os.path.join(self.t, "elsewhere")
+        os.makedirs(mapped)
+        os.makedirs(other)
+        mcp = os.path.join(self.t, "mcp.json")
+        with open(mcp, "w") as f:
+            f.write('{"mcpServers": {}}')
+        s = self.settings(SEARCH_DIRS=mapped + os.pathsep + other, MCP_CONFIG=mcp, MCP_TOOLS="mcp__x__Find",
+                          REMOTE_PATHS=os.path.join(self.t, "Cloud") + "=/notes",
+                          REMOTE_MCP_CONFIG="/home/node/mcp.json")
+        self.assertTrue(any("elsewhere" in n and "REMOTE_PATHS" in n for n in s.notices), s.notices)
+        copilot.run_claude(copilot.data_prompt, "m", "sonnet", tools=["Read", "Grep", "Glob"],
+                           mcp_tools=s.mcp_tools, dirs=s.search_dirs, max_turns=8)
+        [e] = self.log()
+        a = e["argv"]
+        self.assertEqual(e["where"], "remote")
+        self.assertEqual([a[i + 1] for i, v in enumerate(a) if v == "--add-dir"], ["/notes/vault/wiki"])
+        self.assertEqual(a[a.index("--mcp-config") + 1], "/home/node/mcp.json")
+        self.assertEqual(sorted(a[a.index("--allowedTools") + 1].split(",")),
+                         sorted([f"{t}(//notes/vault/wiki/**)" for t in ("Read", "Grep", "Glob")] + ["mcp__x__Find"]))
+        sp = a[a.index("--append-system-prompt") + 1]
+        self.assertIn("/notes/vault/wiki", sp)
+        self.assertNotIn(self.t, sp)                 # no path of this machine in the remote prompt
+        # without a remote MCP config the remote call gets no MCP tools; here they stay
+        s = self.settings(SEARCH_DIRS=mapped, MCP_CONFIG=mcp, MCP_TOOLS="mcp__x__Find",
+                          REMOTE_PATHS=os.path.join(self.t, "Cloud") + "=/notes")
+        self.assertTrue(any("REMOTE_MCP_CONFIG" in n for n in s.notices), s.notices)
+        cmd = copilot.claude_command("p", "sonnet", tools=["Read"], mcp_tools=s.mcp_tools, dirs=s.search_dirs,
+                                     remote=True)[0]
+        self.assertNotIn("--mcp-config", cmd)
+        self.assertNotIn("mcp__x__Find", " ".join(cmd))
+        self.assertIn("mcp__x__Find", copilot.claude_command("p", "sonnet", tools=["Read"], mcp_tools=s.mcp_tools,
+                                                             dirs=s.search_dirs)[0][-3])
+
+    def test_machine_out_the_call_runs_here_then_goes_back_when_it_answers(self):
+        open(self.down, "w").close()
+        out, printed = self.quiet(copilot.run_claude, "p", "m", "sonnet", schema=copilot.SCHEMA_ASSIST)
+        self.assertEqual(out["structured_output"]["say"], json.loads(json.dumps(out["structured_output"]))["say"])
+        self.assertEqual([e["where"] for e in self.log()], ["local"])
+        st = copilot.E.public()["remote"]
+        self.assertFalse(st["on"])
+        self.assertIn("Connection refused", st["why"])
+        self.assertIn("remote AI out", printed)
+        self.assertFalse(copilot.REMOTE.use())            # the next call goes here at once, no new try there
+        self.quiet(copilot.run_claude, "p", "m", "sonnet", schema=copilot.SCHEMA_ASSIST)
+        self.assertEqual([e["where"] for e in self.log()], ["local", "local"])
+        os.remove(self.down)
+        self.assertTrue(wait_for(copilot.REMOTE.use, 5))   # the background check found it answering
+        self.assertTrue(copilot.E.public()["remote"]["on"])
+        copilot.run_claude("p", "m", "sonnet", schema=copilot.SCHEMA_ASSIST)
+        self.assertEqual(self.log()[-1]["where"], "remote")
+
+    def test_a_silent_remote_is_left_after_the_first_byte_limit(self):
+        open(self.hang, "w").close()
+        t0 = time.monotonic()
+        timing = {}
+        self.quiet(copilot.run_claude, "p", "m", "sonnet", schema=copilot.SCHEMA_ASSIST, timing=timing)
+        self.assertLess(time.monotonic() - t0, 8)
+        self.assertEqual([e["where"] for e in self.log()], ["local"])
+        self.assertEqual(timing["where"], "local")
+        self.assertIn("no output", copilot.E.public()["remote"]["why"])
+
+    def test_a_cancelled_remote_call_does_not_mark_the_machine_out(self):
+        os.environ["FAKE_CLAUDE_SLEEP"] = "5"
+        holder = {"stale": False}
+        threading.Timer(0.5, lambda: (holder.__setitem__("stale", True),
+                                      copilot.stop_claude(holder["proc"]))).start()
+        with self.assertRaises(RuntimeError):
+            self.quiet(copilot.run_claude, "p", "m", "sonnet", schema=copilot.SCHEMA_ASSIST, holder=holder)
+        self.assertTrue(copilot.REMOTE.use())
+
+    def test_frames_reach_the_remote_machine(self):
+        img = png_bytes(64, 48, (10, 200, 30))
+        copilot.run_claude(copilot.personalize(copilot.PROMPT_LOOK), "what is this?", "haiku",
+                           schema=copilot.SCHEMA_LOOK,
+                           images=[{"media_type": "image/png", "data": img, "label": "Picture 1"}])
+        [e] = self.log()
+        self.assertEqual(e["where"], "remote")
+        self.assertEqual(e["images"], [{"media_type": "image/png", "len": len(base64.b64encode(img))}])
+        self.assertIn("Picture 1", e["text"])
+
+    def test_kept_open_process_round_goes_here_when_the_remote_one_hangs_and_moves_back(self):
+        copilot.SESSION.close("test", wait=True)
+        self.settings(AI_FIRST_BYTE_S="1", AI_ROUND_S="3", CONFIRM_AI="0")
+        os.environ["FAKE_CLAUDE_HANG_ONCE"] = os.path.join(self.t, "hung")   # the first process: the remote one
+        copilot.E.reset({"id": 7, "title": "T", "start": "2026-11-12T10:00:00Z"})
+        copilot.E.lines = [{**line(1, "Others", 0, 5, "The price goes up fifteen percent."), "seen_at": copilot.now()}]
+        copilot.E.last_id = 1
+        copilot.SESSION.warm(7)
+        self.assertTrue(copilot.SESSION.remote)
+        _, printed = self.quiet(copilot.assist_round)
+        r = copilot.E.rounds[-1]
+        self.assertTrue(r["ok"], printed)
+        self.assertEqual((r["where"], r["attempts"]), ("local", 1))    # the remote failure was not a try
+        self.assertTrue(copilot.E.say, printed)
+        self.assertIn("this round goes on this machine", printed)
+        self.assertEqual([e["where"] for e in self.log(spawn=True)], ["remote", "local"])
+        # the remote machine answers its check: the process moves back there before the next round
+        self.assertTrue(wait_for(lambda: [e["where"] for e in self.log(spawn=True)] == ["remote", "local", "remote"],
+                                 8), self.log(spawn=True))
+        self.assertTrue(wait_for(lambda: copilot.SESSION.remote and copilot.SESSION.alive(), 5))
+        copilot.E.lines.append({**line(2, "You", 6, 9, "Who decided that?"), "seen_at": copilot.now()})
+        copilot.E.last_id = 2
+        self.quiet(copilot.assist_round)
+        self.assertEqual(copilot.E.rounds[-1]["where"], "remote")
+        self.assertEqual(self.log()[-1]["where"], "remote")
+
+    def test_page_shows_where_the_ai_runs(self):
+        self.assertEqual(copilot.E.public()["remote"], {"on": True, "why": "", "since": None})
+        self.quiet(copilot.REMOTE.failed, "no output from the remote claude in 6 s")
+        st = copilot.E.public()["remote"]
+        self.assertFalse(st["on"])
+        self.assertIsInstance(st["since"], float)
+        with open(os.path.join(ROOT, "lib", "page.html"), encoding="utf-8") as f:
+            page = f.read()
+        self.assertIn('id="aihost"', page)
+        self.assertIn("AI on this Mac", page)
 
 
 class Seed(unittest.TestCase):
