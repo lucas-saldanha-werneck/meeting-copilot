@@ -52,7 +52,7 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
 import tlscert
 
-__version__ = "0.15.0"
+__version__ = "0.15.1"
 
 HERE = Path(__file__).resolve().parent
 PAGE = HERE / "page.html"
@@ -69,6 +69,12 @@ LOOK_TIMEOUT_S = 90        # one Look call (6-9 s on a quiet Mac; a Mac out of m
 ROTATE_TOKENS = 40000      # the kept-open suggestions process starts fresh past this context size
 ROTATE_TURNS = 150         # ... or after this many rounds
 SEED_KEEP_S = WINDOW_S     # a fresh process is seeded with this much of the transcript
+# a process that has never answered gets COLD_GRACE_S more for its first byte; each first-byte miss of
+# such a process doubles it (up to COLD_GRACE_MAX_S), so a Mac too slow to start `claude` in time does not
+# kill every new process before it is ready (26/11: 24 tries in a row, 4 min with no suggestion)
+COLD_GRACE_S = 4.0
+COLD_GRACE_MAX_S = 40.0
+BEHIND_WARN_S = 30         # warn when the newest transcript line is this far behind the speech
 # a "Turn on AI for the next meeting" click: waits for the next meeting with no time limit
 # (MEETING_COPILOT_NEXT_MEETING_ARM_MIN > 0 sets one); you turn it off with the same button
 CONTEXT_MAX_CHARS = 8000   # of your context file that goes into each prompt
@@ -1398,6 +1404,10 @@ def check_warnings(m: dict, recent_kinds: set[str] | None = None, muted: set[str
         recent_kinds = {a["kind"] for a in E.warnings if now() - a["ts"] < REPEAT_WARNING_S}
     muted = E.muted if muted is None else muted
     rules = []
+    behind = m.get("behind_s") or 0
+    if behind >= BEHIND_WARN_S:
+        rules.append(("transcript_behind", f"The transcript is {behind:.0f} s behind the speech, so suggestions "
+                      f"come late{overload_note()}. Close heavy apps."))
     if m["monologue_s"] >= 90:
         rules.append(("monologue", f"You have been talking for {m['monologue_s']} s. Make room: ask a question."))
     if m["minutes"] >= 2 and m["you_pct_5min"] >= 70:
@@ -1473,6 +1483,19 @@ def load_now() -> tuple[float, int] | None:
         return os.getloadavg()[0], os.cpu_count() or 1
     except (AttributeError, OSError):
         return None
+
+
+def cold_grace(misses: int) -> float:
+    """Extra seconds to the first byte for a process that has never answered, after `misses` such misses."""
+    return min(COLD_GRACE_MAX_S, COLD_GRACE_S * 2 ** max(0, misses))
+
+
+def overload_note() -> str:
+    """'; this Mac is overloaded (load 98 on 8 CPUs)' when it is, else ''."""
+    load = load_now()
+    if load is None or load[0] <= 2 * load[1]:
+        return ""
+    return f"; this Mac is overloaded (load {load[0]:.0f} on {load[1]} CPUs)"
 
 
 def slow_note(timeout_s: float) -> str:
@@ -2019,6 +2042,7 @@ class AssistSession:
         self.turns = 0
         self.tokens = 0                      # context size at its last answer
         self.spawns = 0
+        self.cold_misses = 0                 # first-byte misses in a row of processes that never answered
         self.mode = ""                       # "api credit" or "subscription (...)"
         self.pause: Path | None = None       # the API credit pause file to write if the API refuses
         self.prompt = ""                     # the system prompt it was started with
@@ -2196,6 +2220,7 @@ class AssistSession:
                     typ == "stream_event" and (ev.get("event") or {}).get("type") == "message_start")):
                 first = _mono()
                 timing["first_byte"] = round(first - timing["q"], 2)
+                self.cold_misses = 0
             if typ == "result":
                 return ev
 
@@ -2236,8 +2261,10 @@ class AssistSession:
                     send = [fr for fr in (frames or []) if seed or fr["id"] > frames_seen]
                     content = image_content(msg, send) if send else msg
                     gsig, turn = snap["gsig"], self.turns + 1
-                    # a process that has not answered yet may still be starting up: a little more time
-                    extra = 4.0 if not self.seeded and _mono() - self.started < 15 else 0.0
+                    # a process that has not answered yet may still be starting up: more time, and more
+                    # after each such process that missed its first byte (a slow Mac starts slowly)
+                    cold = not self.seeded and _mono() - self.started < 15 + cold_grace(self.cold_misses)
+                    extra = cold_grace(self.cold_misses) if cold else 0.0
                     extra += 3.0 if send else 0.0   # the pictures take longer to upload
                 timing.update(attempts=attempt, seeded=seed, turn=turn, mode=self.mode, _frames=send)
                 sent = _mono()
@@ -2253,6 +2280,8 @@ class AssistSession:
                     with self.lock:
                         if self.proc is not p:
                             return None              # closed meanwhile: nobody wants this answer
+                        if cold and str(ex).startswith("no first byte"):
+                            self.cold_misses += 1
                         if refusals == 0 and self._refusal(p, " ".join(self.stderr[-5:])):
                             refusals, attempt = 1, attempt - 1
                             continue
@@ -2262,8 +2291,10 @@ class AssistSession:
                             self._end(p)
                             self.proc = self.events = None
                     if attempt >= 2:
-                        raise RuntimeError(f"{ex} (twice; a fresh AI process is ready for the next round)") from None
-                    print(f"{clock(now())} assist: {ex}; trying once more on a fresh AI process", flush=True)
+                        raise RuntimeError(f"{ex} (twice; a fresh AI process is ready for the next round"
+                                           f"{overload_note()})") from None
+                    print(f"{clock(now())} assist: {ex}; trying once more on a fresh AI process"
+                          f" (it gets {S.first_byte_s + cold_grace(self.cold_misses):g}s)", flush=True)
                     continue
                 if res.get("is_error") or res.get("subtype") not in (None, "success"):
                     with self.lock:
@@ -3640,6 +3671,18 @@ def read_new_lines(con: sqlite3.Connection, meeting_id: int) -> None:
             E.lines.extend(lines)
             E.last_id = lines[-1]["id"]
             E.metrics = compute_metrics(E.lines)
+            behind = transcript_behind(lines, (E.meeting or {}).get("start"), t)
+            if behind is not None and E.metrics:
+                E.metrics["behind_s"] = behind
+
+
+def transcript_behind(lines: list[dict], meeting_start, t: float) -> float | None:
+    """Seconds from the end of the newest of these lines (by the meeting's clock) to t, when they reached the
+    copilot: how far Muesli's transcript runs behind the speech. None without a meeting start."""
+    start = parse_iso(meeting_start) if meeting_start else None
+    if start is None or not lines:
+        return None
+    return round(max(0.0, t - (start.timestamp() + max(f["end"] for f in lines))), 1)
 
 
 def next_round(t: float) -> str | None:
