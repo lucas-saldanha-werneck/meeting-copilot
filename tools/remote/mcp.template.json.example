@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "example": {
+      "type": "http",
+      "url": "http://example-mcp:8080/mcp",
+      "headers": { "X-API-Key": "${EXAMPLE_MCP_KEY}" }
+    }
+  }
+}

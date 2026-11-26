@@ -52,7 +52,7 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
 import tlscert
 
-__version__ = "0.15.0"
+__version__ = "0.16.0"
 
 HERE = Path(__file__).resolve().parent
 PAGE = HERE / "page.html"
@@ -550,6 +550,17 @@ def _tool(value: str, name: str) -> str | None:
     return shutil.which(name) if sys.platform == "darwin" else None
 
 
+def remote_dir(d: Path, pairs: list[tuple[Path, str]]) -> str | None:
+    """Where the local folder d is on the remote machine (MEETING_COPILOT_REMOTE_PATHS); None when no pair has it."""
+    for local, there in pairs:
+        try:
+            rel = d.relative_to(local)
+        except ValueError:
+            continue
+        return there if not rel.parts else there.rstrip("/") + "/" + rel.as_posix()
+    return None
+
+
 TYPESAFE_KEY_ENV = "MEETING_COPILOT_TYPESAFE_KEY"
 
 
@@ -661,6 +672,42 @@ class Settings:
                                     "MCP tools are off (list the read-only tools you allow)")
             else:
                 self.mcp_config, self.mcp_tools = p.resolve(), tools
+
+        # Optional: run the AI calls on another machine (a server), with this machine's claude as the
+        # fallback while that one does not answer. REMOTE is the command that starts claude there, for
+        # example `ssh myserver docker exec -i copilot-ai claude`; the claude arguments are added after it.
+        self.remote: list[str] = []
+        remote = g("REMOTE").strip()
+        if remote and remote.lower() not in ("0", "no", "false", "off"):
+            try:
+                self.remote = shlex.split(remote)
+            except ValueError as ex:
+                self.notices.append(f"MEETING_COPILOT_REMOTE could not be read ({ex}): the AI runs here")
+        # REMOTE_PATHS: local=remote folder pairs (separated like SEARCH_DIRS), for the search folders: a
+        # search folder under a local one is searched under the remote one; one under none is left out there.
+        self.remote_paths: list[tuple[Path, str]] = []
+        for part in g("REMOTE_PATHS").split(os.pathsep):
+            if not part.strip():
+                continue
+            local, sep, there = part.partition("=")
+            if not sep or not local.strip() or not there.strip().startswith("/"):
+                self.notices.append(f"MEETING_COPILOT_REMOTE_PATHS needs local=/remote/folder pairs, ignored: {part}")
+                continue
+            self.remote_paths.append((Path(_expand(local.strip())).resolve(), there.strip().rstrip("/") or "/"))
+        # REMOTE_MCP_CONFIG: the MCP config file on the remote machine (the MCP_TOOLS list applies to it)
+        self.remote_mcp_config = g("REMOTE_MCP_CONFIG").strip()
+        # a one-shot call there that prints nothing for this long (not even its start) goes to this machine
+        self.remote_first_byte_s = self._num(g, "REMOTE_FIRST_BYTE_S", 6.0)
+        # while the remote machine is out: how often it is checked again (doubling after each failed check)
+        self.remote_retry_s = self._num(g, "REMOTE_RETRY_S", 30.0)
+        if self.remote:
+            left = [str(d) for d in self.search_dirs if remote_dir(d, self.remote_paths) is None]
+            if left:
+                self.notices.append("search folder(s) with no MEETING_COPILOT_REMOTE_PATHS entry, searched only "
+                                    "when the AI runs on this machine: " + ", ".join(left))
+            if self.mcp_tools and not self.remote_mcp_config:
+                self.notices.append("MEETING_COPILOT_REMOTE_MCP_CONFIG is not set: MCP tools are used only when "
+                                    "the AI runs on this machine")
 
         # Optional: what the AI should know about you (name, role, projects, where your notes are),
         # and the language every suggestion and fact is written in.
@@ -1118,18 +1165,24 @@ def assist_prompt() -> str:
     return personalize(S.prompt or PROMPT_ASSIST)
 
 
-def data_prompt() -> str:
-    return personalize(S.data_prompt or PROMPT_DATA, sources=data_sources_text())
+def data_prompt(remote: bool = False) -> str:
+    return personalize(S.data_prompt or PROMPT_DATA, sources=data_sources_text(remote))
 
 
-def data_sources_text() -> str:
+def data_sources_text(remote: bool = False) -> str:
+    """The fact search's sources, as the machine that runs the call sees them (remote: its own folder paths,
+    and the MCP tools only when it has an MCP config)."""
     lines = []
-    if S.search_dirs:
+    dirs = [str(d) for d in S.search_dirs]
+    tools = S.mcp_tools
+    if remote:
+        dirs = [p for p in (remote_dir(d, S.remote_paths) for d in S.search_dirs) if p]
+        tools = tools if S.remote_mcp_config else []
+    if dirs:
         lines.append("- search the user's notes in these folders (use Grep and Glob before Read, with one of these "
-                     "folders as the path; files outside them are refused): "
-                     + ", ".join(str(d) for d in S.search_dirs) + ";")
-    if S.mcp_tools:
-        lines.append("- use these read-only tools: " + ", ".join(S.mcp_tools) + ".")
+                     "folders as the path; files outside them are refused): " + ", ".join(dirs) + ";")
+    if tools:
+        lines.append("- use these read-only tools: " + ", ".join(tools) + ".")
     return "\n".join(lines)
 
 # ---------------------------------------------------------------- state
@@ -1256,6 +1309,7 @@ class State:
                 "lines": last(self.lines, 8),
                 "errors": STARTUP_ERRORS + last(self.errors, 3),
                 "ai_rounds": self.rounds[-5:],
+                "remote": REMOTE.public(),
                 "now": clock(now()),
             }
 
@@ -1488,47 +1542,197 @@ def slow_note(timeout_s: float) -> str:
     return f"{took} (this Mac's load is fine: {one:.1f} on {cpus} CPUs; check the network or the AI service)"
 
 
+SSH_OPTIONS = (("BatchMode", "yes"), ("ConnectTimeout", "5"), ("ServerAliveInterval", "5"),
+               ("ServerAliveCountMax", "3"), ("ControlMaster", "auto"), ("ControlPersist", "600"))
+
+
+def ssh_control_path() -> str:
+    """The ssh connection-sharing socket: one ssh login is shared by every AI call (a new call costs one round
+    trip, not a new login). A Unix socket path is limited to about 104 bytes, %C adds 40."""
+    p = str(S.data_dir / "ssh-%C")
+    return p if len(p) + 38 < 100 else os.path.join("/tmp", f"meeting-copilot-{os.getuid()}-%C")
+
+
+def remote_command(args: list[str]) -> list[str]:
+    """MEETING_COPILOT_REMOTE plus the claude arguments. Through ssh the remote shell reads the command line
+    again, so each argument is quoted for it; ssh gets batch mode, a short connect timeout, keep-alives and
+    connection sharing, unless the REMOTE command sets one of those options itself."""
+    base = list(S.remote)
+    if not base or os.path.basename(base[0]) != "ssh":
+        return base + args
+    given = " ".join(base[1:]).lower()
+    opts = ["-T"]
+    for k, v in SSH_OPTIONS + (("ControlPath", ssh_control_path()),):
+        if k.lower() + "=" not in given and k.lower() + " " not in given:
+            opts += ["-o", f"{k}={v}"]
+    return [base[0], *opts, *base[1:], *[shlex.quote(a) for a in args]]
+
+
 def claude_command(system_prompt: str, model: str, *, schema: dict | None = None,
                    tools: list[str] | None = None, mcp_tools: list[str] | None = None,
                    dirs: list[Path] | None = None, max_turns: int = 2,
-                   stream: bool = False) -> tuple[list[str], dict | None, Path]:
-    """(command, environment or None, working folder) of one `claude -p` call."""
+                   stream: bool = False, remote: bool = False) -> tuple[list[str], dict | None, Path]:
+    """(command, environment or None, working folder) of one `claude -p` call, on this machine or (remote=True)
+    on the MEETING_COPILOT_REMOTE one, where the search folders and the MCP config are its own paths."""
     if not S.claude:
         raise RuntimeError("claude command not found (install Claude Code or set MEETING_COPILOT_CLAUDE)")
-    # With the wrapper, it runs the same `claude` this tool would have run (CLAUDE_CREDITO_REAL).
-    env = {**os.environ, "CLAUDE_CREDITO_REAL": S.claude} if S.credit else None
+    # With the wrapper, it runs the same `claude` this tool would have run (CLAUDE_CREDITO_REAL). Not for the
+    # remote machine: it runs claude with its own login.
+    env = {**os.environ, "CLAUDE_CREDITO_REAL": S.claude} if S.credit and not remote else None
     if TYPESAFE_KEY_ENV in os.environ:      # the Look gate's key is none of claude's business
         env = {k: v for k, v in (env or os.environ).items() if k != TYPESAFE_KEY_ENV}
     # With frames, the message goes in as stream-json (the only input format of `claude -p` that carries
     # images; it requires stream-json output too, whose last line is the same result object as json).
     fmt = (["--input-format", "stream-json", "--output-format", "stream-json", "--verbose"] if stream
            else ["--output-format", "json"])
-    cmd = [
-        S.credit or S.claude, "-p", "--model", model,
+    args = [
+        "-p", "--model", model,
         # no settings file from anywhere: a .claude/settings.json in a search folder (or yours) could add hooks
         "--no-session-persistence", "--setting-sources", "",
         *fmt, "--max-turns", str(max_turns),
         "--append-system-prompt", system_prompt,
         "--strict-mcp-config",
     ]
-    tools, mcp_tools, dirs = tools or [], mcp_tools or [], dirs or []
+    tools, mcp_tools = tools or [], mcp_tools or []
+    places = [str(d) for d in dirs or []]
+    mcp_config = str(S.mcp_config) if S.mcp_config else ""
+    if remote:
+        places = [p for p in (remote_dir(Path(d), S.remote_paths) for d in dirs or []) if p]
+        mcp_config = S.remote_mcp_config
+        tools = tools if places else []
+        mcp_tools = mcp_tools if mcp_config else []
     if tools or mcp_tools:
-        if mcp_tools and S.mcp_config:
-            cmd += ["--mcp-config", str(S.mcp_config)]
+        if mcp_tools and mcp_config:
+            args += ["--mcp-config", mcp_config]
         # File tools are allowed only inside the search folders: a bare "Read" rule would let the AI read
         # any file on the Mac, and anyone speaking in the meeting can ask it to.
-        rules = [f"{t}(/{Path(d).as_posix()}/**)" for t in tools for d in dirs]
-        cmd += ["--tools", ",".join(tools), "--allowedTools", ",".join(rules + mcp_tools)]
-        for d in dirs:
-            cmd += ["--add-dir", str(d)]
+        rules = [f"{t}(/{Path(d).as_posix()}/**)" for t in tools for d in places]
+        args += ["--tools", ",".join(tools), "--allowedTools", ",".join(rules + mcp_tools)]
+        for d in places:
+            args += ["--add-dir", d]
     else:
-        cmd += ["--tools", ""]
+        args += ["--tools", ""]
     if schema:
-        cmd += ["--json-schema", json.dumps(schema)]
+        args += ["--json-schema", json.dumps(schema)]
     # An empty folder of ours: nothing in it to read, and no project settings or CLAUDE.md to load.
     cwd = S.data_dir / "ai-cwd"
     cwd.mkdir(parents=True, exist_ok=True)
+    cmd = remote_command(args) if remote else [S.credit or S.claude, *args]
     return cmd, env, cwd
+
+
+# The remote machine said it is not logged in: claude here (its own login) may still answer.
+REMOTE_LOGIN_RE = re.compile(r"invalid api key|please run /login|not logged in|oauth token has expired|"
+                             r"authentication_error", re.I)
+
+
+class RemoteFailed(RuntimeError):
+    """The remote machine did not start claude, or claude there said nothing in time: the call goes here."""
+
+
+class Remote:
+    """Is the MEETING_COPILOT_REMOTE machine answering? Every AI call asks use(): True while it is, else the
+    call runs on this machine. A failed call there marks it out and starts a background check, every
+    REMOTE_RETRY_S (doubling after each failed check, at most 5 min), that runs `claude --version` there; when
+    that answers, calls go there again. The kept-open suggestions process follows both changes ahead of the
+    next round (on_change)."""
+
+    MAX_RETRY_S = 300.0
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.down_since: float | None = None    # wall clock, for the page
+        self.why = ""
+        self.fails = 0                          # in a row, since the last call that worked there
+        self.checking = False
+        self.gen = 0                            # a check loop from before a reset() stops
+        self.on_change = None                   # called (no lock held) when it goes out or comes back
+
+    def reset(self) -> None:
+        with self.lock:
+            self.down_since, self.why, self.fails, self.checking = None, "", 0, False
+            self.gen += 1
+
+    def use(self) -> bool:
+        if not S.remote:
+            return False
+        with self.lock:
+            return self.down_since is None
+
+    def worked(self) -> None:
+        """A call there answered."""
+        with self.lock:
+            self.fails = 0
+
+    def failed(self, why: str) -> None:
+        """A call there failed: the next calls run here, until a check finds it answering again."""
+        why = " ".join(str(why).split())[:200]
+        with self.lock:
+            first = self.down_since is None
+            if first:
+                self.down_since = now()
+            self.fails += 1
+            self.why = why
+            start, gen = not self.checking, self.gen
+            self.checking = True
+        if first:
+            print(f"{clock(now())} remote AI out ({why}): the AI runs on this machine until it answers again",
+                  flush=True)
+        if start:
+            threading.Thread(target=self._check_loop, args=(gen,), daemon=True).start()
+        if first and self.on_change:
+            self.on_change()
+
+    def _wait_s(self) -> float:
+        with self.lock:
+            return min(self.MAX_RETRY_S, S.remote_retry_s * 2 ** max(0, self.fails - 1))
+
+    def check(self) -> tuple[bool, str]:
+        """(answers, why not): runs `claude --version` there, at most 15 s."""
+        try:
+            p = subprocess.run(remote_command(["--version"]), capture_output=True, text=True, timeout=15,
+                               stdin=subprocess.DEVNULL, encoding="utf-8", errors="replace")
+        except subprocess.TimeoutExpired:
+            return False, "no answer to a check in 15 s"
+        except OSError as ex:
+            return False, str(ex)
+        if p.returncode == 0 and p.stdout.strip():
+            return True, ""
+        return False, (p.stderr.strip() or p.stdout.strip() or f"exit {p.returncode}")[-200:]
+
+    def _check_loop(self, gen: int) -> None:
+        while True:
+            time.sleep(self._wait_s())
+            with self.lock:
+                if gen != self.gen:
+                    return
+            ok, why = self.check()
+            with self.lock:
+                if gen != self.gen:
+                    return
+                if self.down_since is None:          # someone else brought it back meanwhile
+                    self.checking = False
+                    return
+                if ok:
+                    self.down_since, self.why, self.checking = None, "", False
+                else:
+                    self.fails += 1
+                    self.why = " ".join(why.split())[:200]
+            if ok:
+                print(f"{clock(now())} remote AI answers again: the next AI calls go there", flush=True)
+                if self.on_change:
+                    self.on_change()
+                return
+
+    def public(self) -> dict | None:
+        if not S.remote:
+            return None
+        with self.lock:
+            return {"on": self.down_since is None, "why": self.why if self.down_since is not None else "",
+                    "since": self.down_since}
+
+
+REMOTE = Remote()
 
 
 def spawn_claude(cmd: list[str], env: dict | None, cwd: Path) -> subprocess.Popen:
@@ -1637,18 +1841,54 @@ def spare_key(cmd: list[str], env: dict | None) -> tuple:
     return tuple(cmd), bool(env)
 
 
-def run_claude(system_prompt: str, message: str, model: str, *, schema: dict | None = None,
+def run_claude(system_prompt, message: str, model: str, *, schema: dict | None = None,
                tools: list[str] | None = None, mcp_tools: list[str] | None = None,
                dirs: list[Path] | None = None, max_turns: int = 2, timeout: float | None = None,
                images: list[dict] | None = None, spare: Spare | None = None,
                timing: dict | None = None, holder: dict | None = None) -> dict:
     """One `claude -p` call. holder: a dict that gets the process as holder["proc"], so another thread can stop
     it; with holder["stale"] set the call is cancelled (RuntimeError) before or while it runs. With a spare: the call is stream-json (with or without images), runs on the
-    spare when it was started with this same command, and a new spare is started right away for the next."""
+    spare when it was started with this same command, and a new spare is started right away for the next.
+
+    With MEETING_COPILOT_REMOTE the call runs on that machine while it answers (REMOTE.use()); when it does not
+    start claude or prints nothing in REMOTE_FIRST_BYTE_S, it is marked out and this same call runs here.
+    system_prompt: the text, or a function of remote (True/False) that gives it (its folder paths differ)."""
+    kw = dict(schema=schema, tools=tools, mcp_tools=mcp_tools, dirs=dirs, max_turns=max_turns, timeout=timeout,
+              images=images, spare=spare, timing=timing, holder=holder)
+    prompt = system_prompt if callable(system_prompt) else (lambda remote: system_prompt)
+    if REMOTE.use():
+        try:
+            out = _run_claude(prompt(True), message, model, remote=True, **kw)
+        except RemoteFailed as ex:
+            if holder is not None and holder.get("stale"):
+                raise RuntimeError("cancelled") from None      # stopped on purpose, not a failure there
+            REMOTE.failed(str(ex))
+            print(f"{clock(now())} remote AI: {ex}; this call runs on this machine", flush=True)
+        except ClaudeTimeout as ex:
+            # it started but did not finish in time: that machine is struggling; no time left to try here
+            REMOTE.failed(f"no answer in {ex.timeout_s:g} s")
+            raise
+        else:
+            REMOTE.worked()
+            if timing is not None:
+                timing["where"] = "remote"
+            return out
+    if timing is not None:
+        timing["where"] = "local"
+    return _run_claude(prompt(False), message, model, remote=False, **kw)
+
+
+def _run_claude(system_prompt: str, message: str, model: str, *, schema: dict | None = None,
+                tools: list[str] | None = None, mcp_tools: list[str] | None = None,
+                dirs: list[Path] | None = None, max_turns: int = 2, timeout: float | None = None,
+                images: list[dict] | None = None, spare: Spare | None = None,
+                timing: dict | None = None, holder: dict | None = None, remote: bool = False) -> dict:
+    """run_claude on one machine. remote=True: always stream-json, so the first output line is seen, and
+    RemoteFailed when claude there did not start (no output, a failed exit) or said it is not logged in."""
     timeout = AI_TIMEOUT_S if timeout is None else timeout
-    stream = bool(images) or spare is not None
+    stream = bool(images) or spare is not None or remote
     cmd, env, cwd = claude_command(system_prompt, model, schema=schema, tools=tools, mcp_tools=mcp_tools,
-                                   dirs=dirs, max_turns=max_turns, stream=stream)
+                                   dirs=dirs, max_turns=max_turns, stream=stream, remote=remote)
     posix = os.name == "posix"
     p = spare.take(spare_key(cmd, env)) if spare else None
     warm = p is not None
@@ -1676,6 +1916,7 @@ def run_claude(system_prompt: str, message: str, model: str, *, schema: dict | N
     marks: dict = {}
     chunks: list[str] = []
     errs: list[str] = []
+    got_byte = threading.Event()
 
     def read_out():
         try:
@@ -1683,6 +1924,7 @@ def run_claude(system_prompt: str, message: str, model: str, *, schema: dict | N
                 t = time.monotonic()
                 chunks.append(ln)
                 marks.setdefault("byte", t)
+                got_byte.set()
                 if '"assistant"' in ln and "assistant" not in marks:
                     try:
                         if json.loads(ln).get("type") == "assistant":
@@ -1716,8 +1958,17 @@ def run_claude(system_prompt: str, message: str, model: str, *, schema: dict | N
     threads = [threading.Thread(target=f, daemon=True) for f in (read_out, read_err, write_in)]
     for th in threads:
         th.start()
+    t_start = time.monotonic()
     try:
-        p.wait(timeout=timeout)
+        if remote:
+            # claude there prints its first line (its start event) as soon as it has the message: nothing in
+            # REMOTE_FIRST_BYTE_S means ssh, the container or that machine is stuck
+            if not got_byte.wait(min(S.remote_first_byte_s, timeout)) and p.poll() is None:
+                stop_claude(p)
+                for th in threads:
+                    th.join(2)
+                raise RemoteFailed(f"no output from the remote claude in {min(S.remote_first_byte_s, timeout):g} s")
+        p.wait(timeout=max(0.0, timeout - (time.monotonic() - t_start)))
     except subprocess.TimeoutExpired:
         for sig, wait in ((signal.SIGTERM, 3), (getattr(signal, "SIGKILL", signal.SIGTERM), 5)):
             try:
@@ -1746,8 +1997,19 @@ def run_claude(system_prompt: str, message: str, model: str, *, schema: dict | N
         if w is not None:
             timing["ai_s"] = max(0.0, marks.get("result", time.monotonic()) - w)
     if p.returncode != 0 and not out.strip():
+        if remote:
+            raise RemoteFailed(f"the remote claude did not start (exit {p.returncode}): {err.strip()[-200:]}")
         raise RuntimeError(f"claude exited {p.returncode}: {err.strip()[:300]}")
-    return stream_result(out)
+    try:
+        res = stream_result(out)
+    except ValueError:
+        if remote:      # the connection broke in the middle
+            raise RemoteFailed(f"the remote claude stopped without an answer (exit {p.returncode}): "
+                               f"{err.strip()[-200:]}") from None
+        raise
+    if remote and res.get("is_error") and REMOTE_LOGIN_RE.search(str(res.get("result") or "")):
+        raise RemoteFailed(f"the remote claude is not logged in: {str(res.get('result'))[:120]}")
+    return res
 
 
 def _close_pipes(p: subprocess.Popen) -> None:
@@ -2022,20 +2284,22 @@ class AssistSession:
         self.mode = ""                       # "api credit" or "subscription (...)"
         self.pause: Path | None = None       # the API credit pause file to write if the API refuses
         self.prompt = ""                     # the system prompt it was started with
+        self.remote = False                  # it runs on the MEETING_COPILOT_REMOTE machine
 
     @staticmethod
     def system_prompt() -> str:
         """The system prompt a process started now gets (your language, context, prompt and picture setup)."""
         return assist_prompt() + (IMAGES_NOTE if vision_configured() else "") + ASSIST_FORMAT
 
-    def cmd(self, prompt: str) -> list[str]:
-        return [S.claude, "-p", "--model", S.model,
+    def cmd(self, prompt: str, remote: bool = False) -> list[str]:
+        args = ["-p", "--model", S.model,
                 # no settings file from anywhere, as in run_claude; no tools at all
                 "--no-session-persistence", "--setting-sources", "",
                 "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
                 "--include-partial-messages",   # message_start = the API's first byte, for the watchdog
                 "--max-turns", "2", "--append-system-prompt", prompt,
                 "--strict-mcp-config", "--tools", ""]
+        return remote_command(args) if remote else [S.claude, *args]
 
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
@@ -2046,11 +2310,15 @@ class AssistSession:
         cwd.mkdir(parents=True, exist_ok=True)
         # with the API-credit wrapper installed: the plan's API credit first (its key in the child's
         # environment only), the subscription while that key is paused
-        env, mode, pause = CREDIT.choose() if S.credit else (None, "subscription", None)
+        # on the remote machine while it answers: its own login, no credit wrapper
+        remote = REMOTE.use()
+        env, mode, pause = (None, "the remote machine", None) if remote else \
+            CREDIT.choose() if S.credit else (None, "subscription", None)
         prompt = self.system_prompt()   # read once: what it runs with is what self.prompt says
-        p = subprocess.Popen(self.cmd(prompt), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             text=True, encoding="utf-8", errors="replace", bufsize=1, cwd=str(cwd), env=env)
-        self.mode, self.pause = mode, pause
+        p = subprocess.Popen(self.cmd(prompt, remote), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", bufsize=1,
+                             cwd=str(cwd), env=env)
+        self.mode, self.pause, self.remote = mode, pause, remote
         q: queue.Queue = queue.Queue()
         err: list[str] = []
         threading.Thread(target=self._read, args=(p, q), daemon=True).start()
@@ -2121,8 +2389,9 @@ class AssistSession:
         return True
 
     def stale(self) -> bool:
-        """Was it started with another system prompt than a fresh one gets now (the language changed)?"""
-        return self.prompt != self.system_prompt()
+        """Was it started with another system prompt than a fresh one gets now (the language changed), or on
+        the other machine than a fresh one would use (the remote machine went out or came back)?"""
+        return self.prompt != self.system_prompt() or self.remote != REMOTE.use()
 
     def warm(self, owner, why: str = "") -> None:
         """Starts the process ahead of the first round, so that round has no start-up cost. A process armed
@@ -2138,7 +2407,7 @@ class AssistSession:
         print(f"{clock(now())} AI process started for {'the next meeting' if owner == 'next' else f'meeting {owner}'}"
               f" on {self.mode}" + (f" ({why})" if why else ""), flush=True)
 
-    def relanguage(self) -> None:
+    def relanguage(self, change: str = "language changed") -> None:
         """The language changed on the page: a process started with another system prompt is replaced by a
         fresh one (seeded at its first round), after any round in progress, so the next round has no start-up
         cost and answers in the new language. Only while it is still wanted (wanted_owner): for a meeting
@@ -2151,12 +2420,13 @@ class AssistSession:
                 if want is None or not (self.owner == want or self.owner == "next"):
                     p, self.proc, self.events, self.owner, self.seeded = self.proc, None, None, None, False
                     self._end(p)
-                    why = "AI not allowed now" if want is None else "it served another meeting"
-                    print(f"{clock(now())} AI process closed ({why}; language changed)", flush=True)
+                    why_not = "AI not allowed now" if want is None else "it served another meeting"
+                    print(f"{clock(now())} AI process closed ({why_not}; {change})", flush=True)
                     return
                 if not self._replace(want):
                     return
-        print(f"{clock(now())} AI process replaced by a fresh one (language changed)", flush=True)
+                where = self.mode
+        print(f"{clock(now())} AI process replaced by a fresh one on {where} ({change})", flush=True)
 
     def close(self, why: str, wait: bool = False) -> None:
         with self.lock:
@@ -2220,9 +2490,11 @@ class AssistSession:
         gets only those it has not seen (frames_seen = the newest frame id the AI has been given), so a long
         meeting does not send the same picture every round. The answer dict has "frames", the ones sent.
 
-        A refusal of the API credit key is not a try: the round goes again, seeded, on the subscription."""
+        A refusal of the API credit key is not a try: the round goes again, seeded, on the subscription. Nor is a
+        failure on the remote machine (MEETING_COPILOT_REMOTE): it is marked out and the round goes again,
+        seeded, on a process on this machine."""
         with self.round_lock:
-            attempt, refusals = 0, 0
+            attempt, refusals, remote_fails = 0, 0, 0
             while True:
                 attempt += 1
                 with self.lock:
@@ -2239,7 +2511,9 @@ class AssistSession:
                     # a process that has not answered yet may still be starting up: a little more time
                     extra = 4.0 if not self.seeded and _mono() - self.started < 15 else 0.0
                     extra += 3.0 if send else 0.0   # the pictures take longer to upload
-                timing.update(attempts=attempt, seeded=seed, turn=turn, mode=self.mode, _frames=send)
+                    on_remote = self.remote
+                timing.update(attempts=attempt, seeded=seed, turn=turn, mode=self.mode, _frames=send,
+                              where="remote" if on_remote else "local")
                 sent = _mono()
                 timing["sent"] = round(sent - timing["q"], 2)
                 try:
@@ -2256,16 +2530,34 @@ class AssistSession:
                         if refusals == 0 and self._refusal(p, " ".join(self.stderr[-5:])):
                             refusals, attempt = 1, attempt - 1
                             continue
-                        if attempt >= 2:
+                        fall_back = on_remote and remote_fails == 0
+                        if fall_back:
+                            remote_fails, attempt = 1, attempt - 1
+                            self._end(p)
+                            self.proc = self.events = None
+                        elif attempt >= 2:
                             self._replace(mid)       # warm again for the next round
                         else:
                             self._end(p)
                             self.proc = self.events = None
+                    if fall_back:
+                        REMOTE.failed(str(ex))
+                        print(f"{clock(now())} assist: remote AI: {ex}; this round goes on this machine", flush=True)
+                        continue
                     if attempt >= 2:
                         raise RuntimeError(f"{ex} (twice; a fresh AI process is ready for the next round)") from None
                     print(f"{clock(now())} assist: {ex}; trying once more on a fresh AI process", flush=True)
                     continue
                 if res.get("is_error") or res.get("subtype") not in (None, "success"):
+                    if on_remote and remote_fails == 0 and REMOTE_LOGIN_RE.search(str(res.get("result") or "")):
+                        with self.lock:
+                            if self.proc is not p:
+                                return None
+                            remote_fails, attempt = 1, attempt - 1
+                            self._end(p)
+                            self.proc = self.events = None
+                        REMOTE.failed(f"the remote claude is not logged in: {str(res.get('result'))[:120]}")
+                        continue
                     with self.lock:
                         if self.proc is not p:
                             return None
@@ -2286,6 +2578,8 @@ class AssistSession:
                     rotate = tokens >= ROTATE_TOKENS or self.turns >= ROTATE_TURNS
                     if rotate:
                         self._replace(mid)
+                if on_remote:
+                    REMOTE.worked()
                 if rotate:
                     print(f"{clock(now())} AI process replaced by a fresh one after {turn} rounds and "
                           f"{tokens} tokens of context", flush=True)
@@ -2295,6 +2589,9 @@ class AssistSession:
 
 
 SESSION = AssistSession()
+# the remote machine went out or came back: the kept-open process moves ahead of the next round
+REMOTE.on_change = lambda: threading.Thread(target=SESSION.relanguage, args=("the remote AI went out or came back",),
+                                            daemon=True).start()
 
 
 def wanted_owner():
@@ -2363,7 +2660,7 @@ def assist_round(queued: float | None = None) -> None:
                    + "\n\n" + transcript(lines, seen))
             timing["sent"] = round(_mono() - timing["q"], 2)
             out = run_claude(assist_prompt() + (IMAGES_NOTE if frames else ""), msg, S.model,
-                             schema=SCHEMA_ASSIST, images=frames)
+                             schema=SCHEMA_ASSIST, images=frames, timing=timing)
             cost = out.get("total_cost_usd")
             r = structured(out)
         timing["ok"] = True
@@ -2414,6 +2711,8 @@ def assist_round(queued: float | None = None) -> None:
     parts = [f"{k} +{timing[k]:.1f}s" for k in ("sent", "first_byte") if k in timing]
     extra = f" ({', '.join(parts)}, turn {timing['turn']}{', seeded' if timing.get('seeded') else ''}" \
             f"{', retried' if timing.get('attempts', 1) > 1 else ''})" if "turn" in timing else ""
+    if S.remote:
+        extra += " on the remote machine" if timing.get("where") == "remote" else " on this machine"
     print(f"{clock(ts)} assist ok in {ts - t0:.1f}s (event to answer {done['total_s']:.1f}s"
           f"{', ' + str(len(used)) + ' image(s)' if used else ''}){extra}", flush=True)
 
@@ -2434,7 +2733,7 @@ def data_round(queued: float | None = None) -> None:
            + "\n\n" + transcript(lines, seen))
     t0 = now()
     tools = ["Read", "Grep", "Glob"] if S.search_dirs else []
-    out = run_claude(data_prompt(), msg, S.data_model,
+    out = run_claude(data_prompt, msg, S.data_model,
                      tools=tools, mcp_tools=S.mcp_tools if S.mcp_config else [],
                      dirs=S.search_dirs, max_turns=8, timeout=DATA_TIMEOUT_S)
     text = (out.get("result") or "").strip()
@@ -2959,7 +3258,8 @@ def look_stages(frames: list[dict], timing: dict, t_round: float, gate: tuple = 
     wait (newest frame kept until the call starts), spawn (warm: age of the spare; cold: start to first
     output), first (message written until the first assistant event), ai (message written until the result),
     gate (Jev's probability of a question on the screen / its seconds), deep ("-": no deep pass this round,
-    "run": started in the background; its seconds come on its own `look: deep` line).
+    "run": started in the background; its seconds come on its own `look: deep` line), where (with
+    MEETING_COPILOT_REMOTE only: remote or local, the machine that answered).
     "-" is a stage that was not measured. The phone's clock is never compared with the Mac's (they differ), so
     enc and up are durations the page measured itself."""
     def f(v, nd=1):
@@ -2970,7 +3270,7 @@ def look_stages(frames: list[dict], timing: dict, t_round: float, gate: tuple = 
             f"wait={f(wait)} spawn={timing.get('spawn', '-')}:{f(timing.get('spawn_s'))} "
             f"first={f(timing.get('first_s'))} ai={f(timing.get('ai_s'))} "
             f"gate={'-' if gate[0] is None else format(gate[0], '.2f')}/{f(gate[1] if gate[1] else None)} "
-            f"deep={deep}")
+            f"deep={deep}" + (f" where={timing.get('where', '-')}" if S.remote else ""))
 
 
 def look_round(queued: float | None = None) -> None:
@@ -4793,6 +5093,9 @@ def main(argv=None) -> None:
                          "Install and run Muesli, or point MEETING_COPILOT_DB / --db at its muesli.db.")
     for n in S.notices:
         print(f"note: {n}", flush=True)
+    if S.remote:
+        print(f"AI calls run on the remote machine ({shlex.join(S.remote)}), and here while it does not answer",
+              flush=True)
     if not S.claude:
         msg = ("claude command not found: only the speaking metrics and warnings will work "
                "(install Claude Code or set MEETING_COPILOT_CLAUDE)")

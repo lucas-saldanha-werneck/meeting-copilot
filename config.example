@@ -124,6 +124,25 @@
 #MEETING_COPILOT_AI_FIRST_BYTE_S=6
 #MEETING_COPILOT_AI_ROUND_S=10
 
+# Run the AI calls (suggestions, fact search, Look) on another machine, with this
+# machine's claude as the fallback while that one does not answer (see README,
+# "Run the AI on a server"). The command that starts claude there; the claude
+# arguments go after it, quoted for the remote shell when it starts with ssh.
+# Empty: everything runs here.
+#MEETING_COPILOT_REMOTE=ssh myserver docker exec -i copilot-ai claude
+# local=remote folder pairs, separated like SEARCH_DIRS: a search folder under a
+# local folder is searched under the remote one; a search folder under none is
+# searched only when the AI runs here.
+#MEETING_COPILOT_REMOTE_PATHS=~/Dropbox=/notes
+# The MCP config file on the remote machine (MCP_TOOLS applies to it). Empty: no
+# MCP tools while the AI runs there.
+#MEETING_COPILOT_REMOTE_MCP_CONFIG=
+# A one-shot call there that prints nothing for this many seconds goes here, and
+# how often (seconds, doubling after each failed check) the remote machine is
+# checked again while it is out.
+#MEETING_COPILOT_REMOTE_FIRST_BYTE_S=6
+#MEETING_COPILOT_REMOTE_RETRY_S=30
+
 # Intervals in seconds: suggestions, fact search, reading the transcript.
 #MEETING_COPILOT_ASSIST_S=25
 #MEETING_COPILOT_DATA_S=45
