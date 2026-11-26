@@ -182,6 +182,7 @@ LANGUAGE_LOCK = threading.Lock()   # the language file and S.language change tog
 CONTEXT_KEEP_S = 6 * 3600   # an older file is from another day: ignored
 CONTEXT_ON = False          # set by main(): code imported by the tests never writes the real file
 DEVICE_MAX_AGE_S = 365 * 24 * 3600
+DEVICE_V = 2                # devices.json records from 0.17.0 on (older ones must pair again: see Devices.ok)
 DEVICES_MAX = 50            # the oldest paired device is dropped beyond this
 _CODE_OK = re.compile(r"^[0-9]{6}$")
 _HASH_OK = re.compile(r"^[0-9a-f]{64}$")
@@ -229,19 +230,21 @@ class Pairing:
     def get_or_create(self) -> tuple[str, int, bool]:
         """(code, seconds left, made now): the active code, or a new one. Only for the Mac's own actions
         (`meeting-copilot code`, "Pair a device" on a logged-in page): never for a browser that is not
-        logged in."""
+        logged in. A code someone already guessed wrong is replaced, so opening again from the Mac always
+        gives every device its full tries (and a device that used them up is never stuck)."""
         with self.lock:
             t = self.clock()
-            made = not self._active(t)
+            made = not self._active(t) or self.wrong > 0
             if made:
                 self.code = f"{secrets.randbelow(10 ** 6):06d}"
                 self.expires, self.wrong, self.wrong_by = t + CODE_TTL_S, 0, {}
             return self.code, max(1, int(self.expires - t)), made
 
     def try_code(self, given: str, client: str = "") -> tuple[str, int]:
-        """("ok" | "wrong" | "used_up" | "expired", number): the tries this device has left after a wrong code,
-        else 0. "expired": no code is open (none was opened on the Mac, it expired or was used). "used_up":
-        this device used its CODE_MAX_WRONG tries on this code, or every device together CODE_TOTAL_WRONG."""
+        """("ok" | "wrong" | "device_used_up" | "used_up" | "expired", number): the tries this device has left
+        after a wrong code, else 0. "expired": no code is open (none was opened on the Mac, it expired or was
+        used). "device_used_up": this device used its CODE_MAX_WRONG tries on this code (the code stays open
+        for the others). "used_up": every device together made CODE_TOTAL_WRONG: the code is thrown away."""
         given = re.sub(r"[\s-]", "", str(given or ""))
         client = str(client)[:64]
         with self.lock:
@@ -249,7 +252,7 @@ class Pairing:
             if not self._active(t):
                 return "expired", 0           # nothing to guess: not counted
             if self.wrong_by.get(client, 0) >= CODE_MAX_WRONG:
-                return "used_up", 0
+                return "device_used_up", 0
             # constant time: the code is never compared byte by byte with an early exit
             ok = hmac.compare_digest(given.encode(), self.code.encode()) and bool(_CODE_OK.match(given))
             if ok:
@@ -261,7 +264,7 @@ class Pairing:
                 self.code = None
                 return "used_up", 0
             left = CODE_MAX_WRONG - self.wrong_by[client]
-            return ("wrong", left) if left > 0 else ("used_up", 0)
+            return ("wrong", left) if left > 0 else ("device_used_up", 0)
 
     def new_link(self) -> str:
         with self.lock:
@@ -334,22 +337,28 @@ class Devices:
             items = self._live(self._load())[-(DEVICES_MAX - 1):]
             # printable ASCII only: `meeting-copilot devices` prints it to a terminal (no escape sequences)
             label = "".join(c if " " <= c <= "~" else "?" for c in label)[:120]
-            item = {"id": _hash(secret), "created": int(now()), "label": label}
-            if plain_http:
-                item["http"] = True
+            item = {"id": _hash(secret), "created": int(now()), "label": label, "v": DEVICE_V,
+                    "http": bool(plain_http)}
             items.append(item)
             self._save(items)
         return secret
 
     def ok(self, secret: str, plain_http: bool = False) -> bool:
         """A paired device's cookie. plain_http: asked by the plain http LAN listener, which accepts only
-        cookies it gave out itself (and every other listener refuses those)."""
+        cookies it gave out itself (and every other listener refuses those). A device paired before 0.17.0
+        (no "v" in the file) is refused everywhere: it may have got its cookie over plain http, where anyone
+        on the Wi-Fi could read it, and the file cannot tell. It pairs again once."""
         if not secret or self.path is None:
             return False
         h = _hash(secret)
         with self.lock:
-            return any(hmac.compare_digest(h, d["id"]) and bool(d.get("http")) == plain_http
-                       for d in self._live(self._load()))
+            return any(hmac.compare_digest(h, d["id"]) and d.get("v") == DEVICE_V
+                       and bool(d.get("http")) == plain_http for d in self._live(self._load()))
+
+    def legacy(self) -> int:
+        """How many saved devices were paired before 0.17.0 and must pair again (see ok)."""
+        with self.lock:
+            return sum(d.get("v") != DEVICE_V for d in self._live(self._load()))
 
     def forget_all(self) -> int:
         with self.lock:
@@ -366,6 +375,9 @@ class Devices:
 PAIR = Pairing()
 CLOSED_MSG = ("No code is open. On the Mac, run: meeting-copilot code (or tap \"Pair a device\" on a page "
               "that is already logged in), then type the code here.")
+DEVICE_USED_UP_MSG = (f"This device used its {CODE_MAX_WRONG} tries for this code. On the Mac, run: "
+                      "meeting-copilot code (or tap \"Pair a device\" on a page that is already logged in) for "
+                      "a new code, then type it here.")
 DEVICES = Devices(None)   # main() points it at <data_dir>/devices.json
 
 
@@ -703,6 +715,13 @@ class Settings:
 
         hosts = [h.strip() for h in g("EXTRA_HOSTS").split(",") if h.strip()]
         self.extra_hosts = hosts
+        # The header your tunnel fills with the visitor's real address (Cloudflare: Cf-Connecting-IP), for the
+        # per-device limit of the pairing code. Empty: none (every visitor through the tunnel counts as one).
+        self.client_ip_header = g("CLIENT_IP_HEADER").strip()
+        if self.client_ip_header and not re.match(r"^[A-Za-z0-9-]{1,64}$", self.client_ip_header):
+            self.notices.append(f"MEETING_COPILOT_CLIENT_IP_HEADER is not a header name, ignored: "
+                                f"{self.client_ip_header}")
+            self.client_ip_header = ""
         self.hosts_ok = {f"127.0.0.1:{self.port}", f"localhost:{self.port}", *hosts}
         self.origins_ok = {f"http://127.0.0.1:{self.port}", f"http://localhost:{self.port}",
                            *(f"https://{h}" for h in hosts)}
@@ -3929,7 +3948,9 @@ def assist_due(t: float) -> bool:
     during a silence), since the last round, and ASSIST_S since the last one started. Both AI modes use it."""
     mid = (E.meeting or {}).get("id")
     sources = vision_sources()
-    new_frame = mid is not None and bool(sources) and FRAMES.newest_id(mid, sources) > E.frames_seen
+    # only a frame the round would really send (current, as for_ai picks them): a stale one never sent would
+    # keep the round due, and a paid call would run every ASSIST_S in a silence
+    new_frame = mid is not None and bool(sources) and FRAMES.newest_id(mid, sources, t) > E.frames_seen
     return (E.last_id > E.assist_seen or new_frame) and t - E.last_assist >= S.assist_s
 
 
@@ -4047,31 +4068,40 @@ def lan_trusted(client: str, local: str) -> str:
     client: the device's address; local: this Mac's own address on that connection (the interface the
     device reached). Loopback is always answered. Otherwise the Mac's address and the device's address
     must both be in one subnet of MEETING_COPILOT_LAN_TRUSTED (or it is "any")."""
-    a = _ip(client)
-    if a is not None and a.is_loopback:
-        return ""
+    return lan_refusal(client, local)[1]
+
+
+def lan_refusal(client: str, local: str) -> tuple[str, str]:
+    """(kind, why) of lan_trusted; kind ("empty", "mac", "device", or "" when answered) keys the log limit."""
+    a, mine = _ip(client), _ip(local)
+    if a is not None and (a.is_loopback or a == mine):
+        return "", ""   # this Mac itself (also its browser opening http://copilot.local, from its LAN address)
     if S.lan_trusted_any:
-        return ""
+        return "", ""
     if not S.lan_trusted:
-        return f"{UNTRUSTED_NET} (empty)"
-    mine = _ip(local)
+        return "empty", f"{UNTRUSTED_NET} (empty)"
     nets = [n for n in S.lan_trusted if mine is not None and mine.version == n.version and mine in n]
     if not nets:
-        return f"{UNTRUSTED_NET} (this Mac is on {mine or 'an unknown address'} now)"
+        return "mac", f"{UNTRUSTED_NET} (this Mac is on {mine or 'an unknown address'} now)"
     if a is None or not any(a.version == n.version and a in n for n in nets):
-        return f"{UNTRUSTED_NET} (this device's address {client} is outside it)"
-    return ""
+        return "device", f"{UNTRUSTED_NET} (this device's address {client} is outside it)"
+    return "", ""
 
 
-_UNTRUSTED_LOGGED: dict[str, float] = {}
+_UNTRUSTED_LOGGED: dict[str, float] = {}   # kind -> when it was last logged
+_UNTRUSTED_LOCK = threading.Lock()
 
 
-def log_untrusted(why: str) -> None:
-    """The log line for a refused LAN device: once a minute for the same reason (a phone retries often)."""
+def log_untrusted(kind: str, why: str) -> None:
+    """The log line for a refused LAN device: once a minute per kind of refusal (a phone retries often)."""
     t = now()
-    if t - _UNTRUSTED_LOGGED.get(why, -1e9) >= 60:
-        _UNTRUSTED_LOGGED[why] = t
-        print(f"{clock(t)} LAN page refused a device: {why}", flush=True)
+    with _UNTRUSTED_LOCK:
+        for k in [k for k, v in _UNTRUSTED_LOGGED.items() if t - v >= 60]:
+            del _UNTRUSTED_LOGGED[k]
+        if kind in _UNTRUSTED_LOGGED:
+            return
+        _UNTRUSTED_LOGGED[kind] = t
+    print(f"{clock(t)} LAN page refused a device: {why}", flush=True)
 
 
 def lan_host_ok(host: str, s: Settings, https: bool = False) -> bool:
@@ -4323,13 +4353,18 @@ class Page(BaseHTTPRequestHandler):
         return self._lan and not self._tls
 
     def _client_key(self) -> str:
-        """Who is trying a pairing code, for the per-device limit: the client address; behind the tunnel (on
-        the loopback listener) the visitor's address the tunnel passes on."""
+        """Who is trying a pairing code, for the per-device limit: the client address. Behind a tunnel every
+        visitor reaches 127.0.0.1, so with MEETING_COPILOT_CLIENT_IP_HEADER set (e.g. Cf-Connecting-IP, which
+        Cloudflare overwrites with the real visitor address) that header names the visitor, but only for a
+        request to one of your EXTRA_HOSTS on the loopback listener. Never by default: a header the tunnel
+        does not overwrite could be set to anything by the visitor."""
         ip = str(self.client_address[0])
-        if not self._lan and (_ip(ip) is not None and _ip(ip).is_loopback):
-            fwd = (self.headers.get("Cf-Connecting-IP") or self.headers.get("X-Forwarded-For", "").split(",")[0])
-            if fwd.strip():
-                return fwd.strip()[:64]
+        name = S.client_ip_header
+        if name and not self._lan and self.headers.get("Host", "") in S.extra_hosts:
+            a = _ip(ip)
+            fwd = (self.headers.get(name) or "").strip()
+            if a is not None and a.is_loopback and fwd and _ip(fwd) is not None:
+                return str(_ip(fwd))
         return ip
 
     def _client_ok(self) -> bool:
@@ -4347,9 +4382,9 @@ class Page(BaseHTTPRequestHandler):
         """Why the LAN listener refuses this device on this network, or "" (see lan_trusted)."""
         if not self._lan:
             return ""
-        why = lan_trusted(str(self.client_address[0]), self._local_ip())
+        kind, why = lan_refusal(str(self.client_address[0]), self._local_ip())
         if why:
-            log_untrusted(why)
+            log_untrusted(kind, why)
         return why
 
     def _host_ok(self) -> bool:
@@ -4563,8 +4598,10 @@ class Page(BaseHTTPRequestHandler):
                 return self._json(500, {"error": "could not save this device on the Mac"})
             print(f"{clock(now())} a device logged in with the pairing code", flush=True)
             return self._json(200, {"ok": True}, {"Set-Cookie": self._cookie(DEVICE_COOKIE, secret)})
+        if result == "device_used_up":
+            return self._json(429, {"error": DEVICE_USED_UP_MSG})
         if result == "used_up":
-            return self._json(429, {"error": "Too many wrong tries for this code. " + CLOSED_MSG})
+            return self._json(429, {"error": "Too many wrong tries for this code: it was thrown away. " + CLOSED_MSG})
         if result == "expired":
             return self._json(410, {"error": CLOSED_MSG})
         return self._json(401, {"error": f"Wrong code. {n} {'try' if n == 1 else 'tries'} left.", "left": n})
@@ -4965,7 +5002,8 @@ def cli(action: str, port: str) -> int:
         items = DEVICES.list()
         for d in items:
             when = datetime.fromtimestamp(d["created"]).strftime("%Y-%m-%d %H:%M")
-            print(f"{when}  {d.get('label', '')}")
+            old = "  (paired before 0.17.0: must pair again)" if d.get("v") != DEVICE_V else ""
+            print(f"{when}  {d.get('label', '')}{old}")
         print(f"{len(items)} paired device(s)" + ("; `meeting-copilot devices forget` logs them all out" if items else ""))
     elif action == "forget-devices":
         print(f"{DEVICES.forget_all()} paired device(s) logged out")
@@ -5154,6 +5192,10 @@ def main(argv=None) -> None:
     S = Settings(cfg)
     S.token = load_token(S.data_dir)
     DEVICES.path = S.data_dir / DEVICES_FILE
+    old = DEVICES.legacy()
+    if old:
+        print(f"note: {old} device(s) paired before 0.17.0 must pair again (their cookie may have gone over "
+              "plain http): open the page on each one and type a code from `meeting-copilot code`", flush=True)
     global CONTEXT_ON
     load_context()
     CONTEXT_ON = True

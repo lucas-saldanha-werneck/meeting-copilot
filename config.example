@@ -70,6 +70,12 @@
 # Extra host names allowed to load the page (behind your own reverse proxy or
 # tunnel), comma-separated. Empty: none.
 #MEETING_COPILOT_EXTRA_HOSTS=
+# The header your tunnel fills with each visitor's real address, e.g. Cf-Connecting-IP
+# for Cloudflare Tunnel (Cloudflare overwrites it, so a visitor cannot fake it). Used
+# only for the pairing code's 5 tries per device, and only on requests to EXTRA_HOSTS.
+# Name a header only if your tunnel always overwrites it. Empty: every visitor through
+# the tunnel counts as one device.
+#MEETING_COPILOT_CLIENT_IP_HEADER=
 
 # 1: also answer your other devices on the home network: a second listener on
 # 0.0.0.0:LAN_PORT that refuses every address outside the private ranges, with the
