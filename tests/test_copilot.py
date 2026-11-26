@@ -98,6 +98,26 @@ class Logic(unittest.TestCase):
         self.assertIsNone(copilot.check_warnings(m, set(), {"monologue", "talks_too_much", "few_questions", "fast"}))
         self.assertIsNone(copilot.check_warnings({}, set(), set()))
 
+    def test_transcript_behind_warning_comes_first(self):
+        m = {"minutes": 5, "you_pct_5min": 80, "monologue_s": 100, "wpm": 200, "questions": 0, "behind_s": 66}
+        w = copilot.check_warnings(m, set(), set())
+        self.assertEqual(w["kind"], "transcript_behind")
+        self.assertIn("66 s behind", w["text"])
+        m["behind_s"] = copilot.BEHIND_WARN_S - 1
+        self.assertEqual(copilot.check_warnings(m, set(), set())["kind"], "monologue")
+
+    def test_transcript_behind_measures_from_the_newest_line(self):
+        start = "2026-11-26T19:00:36Z"
+        t0 = copilot.parse_iso(start).timestamp()
+        lines = [line(1, "Others", 0, 8, "a"), line(2, "Others", 9, 20, "b")]
+        self.assertEqual(copilot.transcript_behind(lines, start, t0 + 86), 66.0)
+        self.assertEqual(copilot.transcript_behind(lines, start, t0 + 10), 0.0)
+        self.assertIsNone(copilot.transcript_behind(lines, None, t0))
+        self.assertIsNone(copilot.transcript_behind([], start, t0))
+
+    def test_cold_grace_doubles_up_to_a_cap(self):
+        self.assertEqual([copilot.cold_grace(n) for n in range(6)], [4, 8, 16, 32, 40, 40])
+
     def test_transcript_before_and_new(self):
         lines = [line(1, "Others", 0, 5, "old"), line(2, "You", 6, 9, "new one")]
         t = copilot.transcript(lines, 1)
@@ -4443,6 +4463,18 @@ class Live(unittest.TestCase):
         self.assertNotEqual(retry["pid"], hung)
         self.assertIn("## ALREADY SHOWN", retry["stdin"])     # the fresh process was seeded
         self.assertIn("Thanks for joining", retry["stdin"])
+        self.assertEqual(self.state()["ai_rounds"][-1]["attempts"], 2)
+
+    @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
+    def test_a_slow_start_gets_more_time_instead_of_being_killed_again(self):
+        # 26/11: an overloaded Mac took ~10 s to a first byte; with the same 10 s for every fresh process,
+        # 24 tries in a row were killed before they could answer. The retry now waits longer.
+        self.start(FAKE_CLAUDE_SLEEP="6.5", MEETING_COPILOT_AI_FIRST_BYTE_S="1", MEETING_COPILOT_AI_ROUND_S="2")
+        self.assertTrue(wait_for(lambda: self.spawns(), 5), self.log())
+        self.speak()
+        self.assertTrue(wait_for(lambda: (self.state() or {}).get("say"), 25), self.log())
+        self.assertIn("no first byte from the AI in 5s", self.log())
+        self.assertIn("(it gets 9s)", self.log())
         self.assertEqual(self.state()["ai_rounds"][-1]["attempts"], 2)
 
     @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)

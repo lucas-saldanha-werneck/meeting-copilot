@@ -420,6 +420,12 @@ for news every 2 s, so add up to 2 s to see it). Each meeting keeps a log, one J
 `<data folder>/latency/<date>-meeting-<id>.jsonl` (also `from_speech_s`: from the end of the sentence, by
 Muesli's clock), and `meeting-copilot status` sums up the latest one.
 
+On a slow Mac a fresh `claude` process can take longer than the watchdog to its first byte. A process that
+has never answered gets 4 s more than `AI_FIRST_BYTE_S`, doubled after each such miss (8, 16, 32, up to
+40 s), so it is not killed again and again before it is ready; the first byte resets it. When Muesli's
+transcript reaches the copilot 30 s or more after the speech (`from_speech_s`), the page warns that
+suggestions come late, with the Mac's load when it is overloaded.
+
 `meeting-copilot bench [N] --yes` runs N rounds with the transcript only and N with a sample slide
 (`tools/sample-slide.jpg`) on the fake meeting, with the real `claude`, and prints the median and p90 of
 each. It starts no server and uses a temporary folder, so a running copilot is never touched. Without
