@@ -70,11 +70,24 @@
 # Extra host names allowed to load the page (behind your own reverse proxy or
 # tunnel), comma-separated. Empty: none.
 #MEETING_COPILOT_EXTRA_HOSTS=
+# The header your tunnel fills with each visitor's real address, e.g. Cf-Connecting-IP
+# for Cloudflare Tunnel (Cloudflare overwrites it, so a visitor cannot fake it). Used
+# only for the pairing code's 5 tries per device, and only on requests to EXTRA_HOSTS.
+# Name a header only if your tunnel always overwrites it. Empty: every visitor through
+# the tunnel counts as one device.
+#MEETING_COPILOT_CLIENT_IP_HEADER=
 
 # 1: also answer your other devices on the home network: a second listener on
 # 0.0.0.0:LAN_PORT that refuses every address outside the private ranges, with the
-# same token. Plain http: use it only on a network you trust. Default: 0.
+# same token. It answers other devices only on the networks in LAN_TRUSTED. Default: 0.
 #MEETING_COPILOT_LAN=0
+# The networks where the LAN page answers your other devices, as subnets separated by
+# commas, e.g. 192.168.1.0/24 (`ipconfig getifaddr en0` on the Mac shows its address
+# at home). Both this Mac and the device must be in one of them. On any other network
+# (a hotel, an airport, a cafe) the LAN page refuses every device but this Mac, and the
+# log says why. any: every private network (the rule before 0.17.0). Empty: no other
+# device.
+#MEETING_COPILOT_LAN_TRUSTED=
 # Port of that listener (80 = no port in the URL; macOS lets your user use it).
 #MEETING_COPILOT_LAN_PORT=80
 # Name published as <name>.local with macOS dns-sd, e.g. http://copilot.local
@@ -90,7 +103,9 @@
 # authority of its own that can vouch only for <LAN_NAME>.local and home network
 # addresses, signs one certificate with it and deletes the authority's key at once.
 # Each phone installs it once from http://<LAN_NAME>.local/setup (see README,
-# "Phone camera"). Default: 1 when LAN is 1 and CAMERA or LOOK is 1, else 0.
+# "Phone camera"). While it runs, the plain http page only does that set-up and sends
+# a set-up phone on to https: no login and no cookie over http.
+# Default: 1 when LAN is 1 and CAMERA or LOOK is 1, else 0.
 #MEETING_COPILOT_LAN_HTTPS=
 # Port of the https listener (443 = no port in the URL; macOS lets your user use it).
 #MEETING_COPILOT_LAN_HTTPS_PORT=443
@@ -99,11 +114,6 @@
 # The command that keeps the certificate folder out of Time Machine backups
 # (empty: tmutil on PATH, macOS only; off: not used).
 #MEETING_COPILOT_TMUTIL=
-
-# The command that shows the pairing code as a notification on the Mac. Default:
-# osascript (macOS only; elsewhere no notification). off: no notification (the code
-# is still in `meeting-copilot status`).
-#MEETING_COPILOT_OSASCRIPT=osascript
 
 # 1: no AI call in a meeting until you click "Turn on AI" on the page. Each
 # meeting asks again. Useful when the copilot starts at login. Default: 0.

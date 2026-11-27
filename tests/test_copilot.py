@@ -1084,7 +1084,8 @@ class Lan(unittest.TestCase):
         self.use({"MEETING_COPILOT_LAN": "1", "MEETING_COPILOT_LAN_PORT": "8080"})
 
     def use(self, cfg):
-        copilot.S = copilot.Settings(cfg)
+        # the old rule (every private network) unless a test says otherwise; see LanTrusted for the default
+        copilot.S = copilot.Settings({"MEETING_COPILOT_LAN_TRUSTED": "any", **cfg})
         copilot.S.token = self.TOK
 
     def serve(self, lan=True, client_ip=None):
@@ -1416,7 +1417,7 @@ class LanHttps(unittest.TestCase):
                "MEETING_COPILOT_CAMERA_S": "2", "MEETING_COPILOT_LAN_HTTPS_PORT": "8443",
                "MEETING_COPILOT_DATA_DIR": os.path.join(self.t, "data"), "MEETING_COPILOT_SIPS": "off",
                "MEETING_COPILOT_LAN_IP": "192.168.1.10", "MEETING_COPILOT_TMUTIL": "off",
-               "MEETING_COPILOT_OPENSSL": OPENSSL}
+               "MEETING_COPILOT_OPENSSL": OPENSSL, "MEETING_COPILOT_LAN_TRUSTED": "any"}
         cfg.update({"MEETING_COPILOT_" + k: v for k, v in extra.items()})
         copilot.S = copilot.Settings(cfg)
         copilot.S.token = self.TOK
@@ -1548,6 +1549,7 @@ class LanHttps(unittest.TestCase):
         self.assertEqual(self.req(public, "/setup", "copilot.local:8443", auth=False)[0], 403)
 
     def test_http_listener_sends_a_set_up_phone_to_https(self):
+        self.addCleanup(copilot.HTTPS_UP.__setitem__, "port", 0)
         copilot.HTTPS_UP["port"] = 8443
         port = self.serve(tls=False)
         nav = {"Sec-Fetch-Mode": "navigate", "Accept": "text/html"}
@@ -1561,10 +1563,13 @@ class LanHttps(unittest.TestCase):
         code, hdrs, _ = self.req(port, "/?x=1", "copilot.local:8080", {**nav, "Cookie": f"mc_https={tag}"},
                                  auth=False, tls=False)
         self.assertEqual((code, hdrs["Location"]), (302, "https://copilot.local:8443/?x=1"))
-        # not set up yet (no cookie), or a script: no redirect
-        self.assertEqual(self.req(port, "/", "copilot.local:8080", nav, tls=False)[0], 200)
-        self.assertEqual(self.req(port, "/state", "copilot.local:8080", {"Cookie": f"mc_https={tag}; "
-                                  f"meeting_copilot_token={self.TOK}"}, tls=False)[0], 200)
+        # not set up yet (no cookie): to /setup, never the page over http; a script: refused, even with the token
+        code, hdrs, _ = self.req(port, "/", "copilot.local:8080", nav, tls=False)
+        self.assertEqual((code, hdrs["Location"]), (302, "/setup"))
+        code, _, body = self.req(port, "/state", "copilot.local:8080", {"Cookie": f"mc_https={tag}; "
+                                 f"meeting_copilot_token={self.TOK}"}, tls=False)
+        self.assertEqual(code, 403)
+        self.assertIn(b"https only", body)
         # a new CA (cert --renew): the old cookie no longer goes to https; the phone goes to /setup, cookie cleared
         copilot.tls_issue()
         self.assertNotEqual(copilot.ca_tag(), tag)
@@ -1579,6 +1584,39 @@ class LanHttps(unittest.TestCase):
         self.assertEqual(self.req(port, "/", "copilot.local:8080",
                                   {**nav, "Cookie": f"mc_https={tag}; meeting_copilot_token={self.TOK}"},
                                   tls=False)[0], 200)
+
+    def test_http_listener_gives_and_takes_no_login_while_https_is_on(self):
+        """LAN https on: port 80 only sets a phone up and sends it on. No login, no cookie, no page: anyone on the
+        Wi-Fi can read plain http."""
+        self.addCleanup(copilot.HTTPS_UP.__setitem__, "port", 0)
+        copilot.HTTPS_UP["port"] = 8443
+        old = (copilot.PAIR, copilot.DEVICES)
+        self.addCleanup(lambda: (setattr(copilot, "PAIR", old[0]), setattr(copilot, "DEVICES", old[1])))
+        copilot.PAIR = copilot.Pairing()
+        copilot.DEVICES = copilot.Devices(copilot.Path(self.t) / "devices.json")
+        right = copilot.PAIR.get_or_create()[0]
+        dev = copilot.DEVICES.add("an https phone")
+        port = self.serve(tls=False)
+        h = "copilot.local:8080"
+        post = {"Content-Type": "application/json", "Origin": "http://copilot.local:8080"}
+        for path, body in (("/login", json.dumps({"code": right}).encode()), ("/login/code", b"{}"),
+                           ("/mute", b'{"kind":"x"}'), ("/pair", b"{}")):
+            code, hdrs, got = self.req(port, path, h, post, "POST", body, tls=False)
+            self.assertEqual(code, 403, path)
+            self.assertIsNone(hdrs["Set-Cookie"], path)
+        self.assertEqual(copilot.PAIR.current()[0], right)       # the code was never even tried
+        for headers in ({"Cookie": f"meeting_copilot_device={dev}"}, {"Authorization": f"Bearer {self.TOK}"},
+                        {"Cookie": f"meeting_copilot_token={self.TOK}"}):
+            code, hdrs, _ = self.req(port, "/state", h, headers, auth=False, tls=False)
+            self.assertEqual(code, 403, headers)
+        code, hdrs, _ = self.req(port, f"/?token={self.TOK}", h, auth=False, tls=False)
+        self.assertEqual(code, 403)                              # no token cookie handed out over http
+        self.assertIsNone(hdrs["Set-Cookie"])
+        self.assertEqual(self.req(port, "/setup", h, auth=False, tls=False)[0], 200)   # the set-up still works
+        self.assertEqual(self.req(port, "/ca.crt", h, auth=False, tls=False)[0], 200)
+        # https not running (failed to start): plain http is the LAN page again, as before
+        copilot.HTTPS_UP["port"] = 0
+        self.assertEqual(self.req(port, "/state", h, tls=False)[0], 200)
 
     def test_https_cookies_have_their_own_name(self):
         """A Secure cookie set over https would block the same name over http (a login loop once https stops):
@@ -1905,16 +1943,6 @@ class LanHttps(unittest.TestCase):
         self.assertIn("--renew", why)
 
 
-def fake_osascript(folder) -> tuple[str, str]:
-    """A fake osascript: appends its arguments, joined by |, to a file."""
-    log = os.path.join(folder, "osascript.log")
-    path = os.path.join(folder, "osascript")
-    with open(path, "w") as f:
-        f.write(f'#!/bin/sh\nIFS="|"; echo "$*" >> "{log}"\n')
-    os.chmod(path, 0o755)
-    return path, log
-
-
 def read_lines(path) -> list[str]:
     try:
         with open(path, encoding="utf-8") as f:
@@ -1931,6 +1959,145 @@ class Clock:
         return self.t
 
 
+class LanTrusted(unittest.TestCase):
+    """MEETING_COPILOT_LAN_TRUSTED: the LAN page answers other devices only on the networks you list, so a
+    laptop on a hotel or airport Wi-Fi never offers its login page to the people around."""
+
+    TOK = "t" * 40
+
+    def setUp(self):
+        old = copilot.S
+        self.addCleanup(setattr, copilot, "S", old)
+        copilot._UNTRUSTED_LOGGED.clear()   # the once-a-minute log limit starts empty in each test
+        self.addCleanup(copilot._UNTRUSTED_LOGGED.clear)
+
+    def use(self, trusted=None):
+        cfg = {"MEETING_COPILOT_LAN": "1", "MEETING_COPILOT_LAN_PORT": "8080"}
+        if trusted is not None:
+            cfg["MEETING_COPILOT_LAN_TRUSTED"] = trusted
+        copilot.S = copilot.Settings(cfg)
+        copilot.S.token = self.TOK
+        return copilot.S
+
+    def test_settings(self):
+        s = self.use()
+        self.assertEqual((s.lan_trusted, s.lan_trusted_any), ([], False))     # default: nobody else
+        s = self.use("192.168.0.0/24, 10.1.0.0/16")
+        self.assertEqual([str(n) for n in s.lan_trusted], ["192.168.0.0/24", "10.1.0.0/16"])
+        self.assertEqual(s.notices, [])
+        s = self.use("192.168.0.70/24")                                       # a host address: its subnet
+        self.assertEqual([str(n) for n in s.lan_trusted], ["192.168.0.0/24"])
+        s = self.use("ANY")
+        self.assertTrue(s.lan_trusted_any)
+        for bad in ("8.8.8.0/24", "0.0.0.0/0", "home-wifi", "192.168.0.0/33"):  # public, everything, not a subnet
+            s = self.use(bad)
+            self.assertEqual(s.lan_trusted, [], bad)
+            self.assertTrue(s.notices, bad)
+
+    def test_rule(self):
+        self.use()
+        self.assertEqual(copilot.lan_trusted("127.0.0.1", "127.0.0.1"), "")        # this Mac: always
+        self.assertEqual(copilot.lan_trusted("::1", "::1"), "")
+        # the Mac's own browser opening http://copilot.local comes from the Mac's LAN address: always answered
+        self.assertEqual(copilot.lan_trusted("10.20.0.9", "10.20.0.9"), "")
+        self.assertEqual(copilot.lan_trusted("192.168.0.70", "192.168.0.70"), "")
+        self.assertIn("MEETING_COPILOT_LAN_TRUSTED", copilot.lan_trusted("192.168.0.20", "192.168.0.70"))
+        self.use("192.168.0.0/24")
+        self.assertEqual(copilot.lan_trusted("192.168.0.20", "192.168.0.70"), "")  # at home
+        self.assertEqual(copilot.lan_trusted("::ffff:192.168.0.20", "::ffff:192.168.0.70"), "")
+        why = copilot.lan_trusted("10.20.0.5", "10.20.0.9")                          # a hotel Wi-Fi
+        self.assertIn("this Mac is on 10.20.0.9", why)
+        why = copilot.lan_trusted("192.168.5.9", "192.168.0.70")                     # another subnet routed in
+        self.assertIn("192.168.5.9 is outside it", why)
+        self.assertTrue(copilot.lan_trusted("192.168.0.20", ""))                     # Mac address unknown: no
+        self.use("any")
+        self.assertEqual(copilot.lan_trusted("10.20.0.5", "10.20.0.9"), "")
+
+    def serve(self, client_ip, local_ip):
+        """A LAN listener on 127.0.0.1 that pretends the client and this Mac have these addresses."""
+        class Page(copilot.Page):
+            def _local_ip(s):
+                return local_ip
+
+        class Srv(copilot._LanServer):
+            def get_request(s):
+                sock, addr = super().get_request()
+                return sock, (client_ip, addr[1])
+
+        srv = Srv(("127.0.0.1", 0), Page)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return srv.server_address[1]
+
+    def get(self, port, path="/", headers=None, method="GET", body=None):
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+        try:
+            c.request(method, path, body=body, headers={"Host": "copilot.local:8080",
+                                                        "Cookie": f"meeting_copilot_token={self.TOK}",
+                                                        **(headers or {})})
+            r = c.getresponse()
+            return r.status, r.read()
+        finally:
+            c.close()
+
+    def test_listener_refuses_devices_off_the_trusted_network_and_says_why(self):
+        nav = {"Sec-Fetch-Mode": "navigate", "Accept": "text/html"}
+        post = {"Content-Type": "application/json", "Origin": "http://copilot.local:8080"}
+        self.use("192.168.0.0/24")
+        home = self.serve("192.168.0.20", "192.168.0.70")
+        self.assertEqual(self.get(home)[0], 200)
+        self.assertEqual(self.get(home, "/mute", post, "POST", b'{"kind":"x"}')[0], 200)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            hotel = self.serve("10.20.0.5", "10.20.0.9")
+            for path in ("/", "/setup", "/ca.crt", "/state"):
+                code, body = self.get(hotel, path, nav)
+                self.assertEqual(code, 403, path)
+                self.assertIn(b"MEETING_COPILOT_LAN_TRUSTED", body)
+                self.assertNotIn(b"6-digit", body)                       # never the login page
+            code, body = self.get(hotel, "/login", post, "POST", b'{"code":"123456"}')
+            self.assertEqual(code, 403)
+            self.assertIn(b"not trusted", body)
+        logged = [x for x in out.getvalue().splitlines() if "LAN page refused a device" in x]
+        self.assertEqual(len(logged), 1, out.getvalue())                 # once a minute per reason, not per hit
+        # nothing listed (the default): only this Mac
+        self.use()
+        self.assertEqual(self.get(home)[0], 403)
+        self.assertEqual(self.get(self.serve("127.0.0.1", "127.0.0.1"))[0], 200)
+        self.assertEqual(self.get(self.serve("192.168.0.70", "192.168.0.70"))[0], 200)   # this Mac's own browser
+        # a public address keeps its own short refusal, before anything else
+        self.use("any")
+        self.assertEqual(self.get(self.serve("203.0.113.5", "192.168.0.70")), (403, b"network"))
+        self.assertEqual(self.get(self.serve("10.20.0.5", "10.20.0.9"))[0], 200)   # any: the old rule
+
+    def test_refusal_log_is_keyed_by_kind_and_pruned(self):
+        self.use("192.168.0.0/24")
+        copilot._UNTRUSTED_LOGGED.clear()
+        self.addCleanup(copilot._UNTRUSTED_LOGGED.clear)
+        out = io.StringIO()
+        old_now = copilot.now
+        self.addCleanup(setattr, copilot, "now", old_now)
+        t = [1000.0]
+        copilot.now = lambda: t[0]
+        with contextlib.redirect_stdout(out):
+            for i in range(200):                                        # 200 devices from 200 addresses
+                kind, why = copilot.lan_refusal(f"10.20.{i // 250}.{i % 250 + 1}", "10.20.0.250")
+                copilot.log_untrusted(kind, why)
+            self.assertEqual(set(copilot._UNTRUSTED_LOGGED), {"mac"})   # one key, not one per address
+            t[0] += 61
+            kind, why = copilot.lan_refusal("192.168.5.9", "192.168.0.70")
+            copilot.log_untrusted(kind, why)
+        self.assertEqual(set(copilot._UNTRUSTED_LOGGED), {"device"})    # the old key pruned after a minute
+        self.assertEqual(len(out.getvalue().splitlines()), 2)
+
+    def test_start_says_which_networks(self):
+        for trusted, want in ((None, "answers no other device"), ("192.168.0.0/24", "only on 192.168.0.0/24"),
+                              ("any", "every private network")):
+            self.use(trusted)
+            self.assertIn(want, copilot.lan_trust_note(), trusted)
+
+
 class PairingCode(unittest.TestCase):
     """The 6-digit pairing code login: login page, code rules, device cookies, the one-time launcher link."""
 
@@ -1942,14 +2109,12 @@ class PairingCode(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.t = os.path.realpath(self.tmp.name)
         self.addCleanup(self.tmp.cleanup)
-        for name in ("S", "PAIR", "DEVICES", "notify"):
+        for name in ("S", "PAIR", "DEVICES"):
             self.addCleanup(setattr, copilot, name, getattr(copilot, name))
         self.use({})
         self.clock = Clock()
         copilot.PAIR = copilot.Pairing(clock=self.clock)
         copilot.DEVICES = copilot.Devices(copilot.Path(self.t) / "devices.json")
-        self.notified = []
-        copilot.notify = self.notified.append          # the macOS notification, mocked
 
     def use(self, cfg):
         copilot.S = copilot.Settings(cfg)
@@ -1979,41 +2144,61 @@ class PairingCode(unittest.TestCase):
         return self.req(port, path, {"Accept": "text/html,application/xhtml+xml", "Sec-Fetch-Mode": "navigate"},
                         host=host)
 
+    def open_code(self, port):
+        """The Mac opens a code (`meeting-copilot code` posts /pair with the token)."""
+        h = {"Authorization": f"Bearer {self.TOK}", "Content-Type": "application/json", "Origin": self.ORIGIN}
+        code, _, body = self.req(port, "/pair", h, "POST", b"{}")
+        self.assertEqual(code, 200)
+        return json.loads(body)["code"]
+
+    @staticmethod
+    def wrong_for(right):
+        return f"{(int(right) + 1) % 10 ** 6:06d}"
+
     @staticmethod
     def device_cookie(hdrs):
         m = re.match(r"meeting_copilot_device=([^;]+)", hdrs["Set-Cookie"] or "")
         return m.group(1) if m else None
 
-    def test_browser_without_cookie_gets_the_login_page_and_the_mac_the_code(self):
+    def test_browser_without_cookie_gets_the_login_page_and_never_makes_a_code(self):
         port = self.serve()
-        code, hdrs, body = self.browse(port)
-        self.assertEqual(code, 401)
+        for _ in range(5):                                       # page views, reloads: no code, ever
+            code, hdrs, body = self.browse(port)
+            self.assertEqual(code, 401)
         self.assertTrue(hdrs["Content-Type"].startswith("text/html"))
         self.assertIn(b"Type the 6-digit code shown on the Mac", body)
+        self.assertIn(b"meeting-copilot code", body)             # it says how to open one
         self.assertIn("frame-ancestors 'none'", hdrs["Content-Security-Policy"])
         self.assertNotIn(self.TOK.encode(), body)
-        self.assertEqual(len(self.notified), 1)
-        self.assertRegex(self.notified[0], r"^[0-9]{6}$")
-        self.assertNotIn(self.notified[0].encode(), body)       # the code is never on the login page
-        # another view (another tab, another device) gets the same code and no second notification
-        self.browse(port, "/state")
-        self.assertEqual(len(self.notified), 1)
-        self.assertEqual(copilot.PAIR.current()[0], self.notified[0])
+        self.assertIsNone(copilot.PAIR.current())
+        # the old "show the code on the Mac again" button: no code made, it says what to do
+        o = {"Content-Type": "application/json", "Origin": self.ORIGIN}
+        code, _, body = self.req(port, "/login/code", o, "POST", b"{}")
+        self.assertEqual(code, 409)
+        self.assertIn(b"meeting-copilot code", body)
+        self.assertIsNone(copilot.PAIR.current())
+        # a code the Mac opened is never on the login page
+        right = self.open_code(port)
+        self.assertNotIn(right.encode(), self.browse(port)[2])
         # API calls and scripts keep the short 401 text, never the login page
         for path in ("/", "/state"):
             code, hdrs, body = self.req(port, path)
             self.assertEqual(code, 401)
             self.assertTrue(hdrs["Content-Type"].startswith("text/plain"))
             self.assertIn(b"token", body)
-        o = {"Content-Type": "application/json", "Origin": self.ORIGIN}
         self.assertEqual(self.req(port, "/mute", o, "POST", b'{"kind":"x"}')[0], 401)
         self.assertEqual(self.req(port, "/pair", o, "POST", b"{}")[0], 401)
         self.assertEqual(self.req(port, "/pair")[0], 401)
 
+    def test_no_code_open_means_no_login(self):
+        port = self.serve()
+        code, _, body = self.login(port, "123456")
+        self.assertEqual(code, 410)
+        self.assertIn("meeting-copilot code", body["error"])
+
     def test_right_code_gives_a_device_cookie_once(self):
         port = self.serve()
-        self.browse(port)
-        right = self.notified[0]
+        right = self.open_code(port)
         code, hdrs, body = self.login(port, right)
         self.assertEqual((code, body), (200, {"ok": True}))
         cookie = hdrs["Set-Cookie"]
@@ -2047,88 +2232,97 @@ class PairingCode(unittest.TestCase):
 
     def test_expired_code_is_refused(self):
         port = self.serve()
-        self.browse(port)
-        right = self.notified[0]
+        right = self.open_code(port)
         self.clock.t += copilot.CODE_TTL_S + 1
         code, _, body = self.login(port, right)
         self.assertEqual(code, 410)
-        self.assertIn("expired", body["error"])
+        self.assertIn("No code is open", body["error"])
         self.assertIsNone(copilot.PAIR.current())
-        self.browse(port)                                        # a new view: a new code, a new notification
-        self.assertEqual(len(self.notified), 2)
+        self.browse(port)                                        # a page view does not open a new one
+        self.assertIsNone(copilot.PAIR.current())
+        self.assertNotEqual(self.open_code(port), None)          # only the Mac does
 
-    def test_wrong_codes_use_up_the_code(self):
+    def test_wrong_codes_use_up_only_that_devices_tries(self):
+        # behind a Cloudflare tunnel every visitor reaches 127.0.0.1: Cf-Connecting-IP (configured) tells them apart
+        self.use({"MEETING_COPILOT_EXTRA_HOSTS": "copilot.example.com",
+                  "MEETING_COPILOT_CLIENT_IP_HEADER": "Cf-Connecting-IP"})
         port = self.serve()
-        self.browse(port)
-        right = self.notified[0]
-        wrong = f"{(int(right) + 1) % 10 ** 6:06d}"
+        right = self.open_code(port)
+        wrong = self.wrong_for(right)
+        tun = dict(origin="https://copilot.example.com", host="copilot.example.com")
+        attacker = {"Cf-Connecting-IP": "203.0.113.9", "X-Forwarded-Proto": "https"}
         for left in (4, 3, 2, 1):
-            code, _, body = self.login(port, wrong)
+            code, _, body = self.login(port, wrong, extra=attacker, **tun)
             self.assertEqual((code, body["left"]), (401, left))
-        code, _, body = self.login(port, "12ab")                 # the 5th wrong try ends the code
+        code, _, body = self.login(port, "12ab", extra=attacker, **tun)  # the 5th wrong try: this device is done
         self.assertEqual(code, 429)
-        self.assertIn("new code", body["error"])
-        self.assertEqual(self.login(port, right)[0], 410)        # even the right one, now
-        self.assertIsNone(copilot.PAIR.current())
+        self.assertIn("This device used its 5 tries", body["error"])     # true: the code is still open
+        self.assertNotIn("No code is open", body["error"])
+        self.assertEqual(self.login(port, right, extra=attacker, **tun)[0], 429)   # even the right one, for it
+        # another visitor still logs in with the same code: one guesser does not lock out the others
+        self.assertEqual(copilot.PAIR.current()[0], right)
+        code, _, _ = self.login(port, right, extra={"Cf-Connecting-IP": "198.51.100.7", "X-Forwarded-Proto": "https"},
+                                **tun)
+        self.assertEqual(code, 200)
 
-    def test_global_limit_per_minute(self):
+    def test_forwarded_address_headers_are_ignored_unless_configured(self):
+        # without MEETING_COPILOT_CLIENT_IP_HEADER, a visitor cannot pick its own identity: a rotated
+        # X-Forwarded-For or Cf-Connecting-IP does not give it fresh tries, nor burn someone else's
+        self.use({"MEETING_COPILOT_EXTRA_HOSTS": "copilot.example.com"})
         port = self.serve()
-        for _ in range(2):                                       # two codes, 5 wrong tries each
-            self.browse(port)
-            right = self.notified[-1]
-            for _ in range(5):
-                self.login(port, f"{(int(right) + 1) % 10 ** 6:06d}")
-        self.browse(port)
-        right = self.notified[-1]
-        self.assertEqual(len(self.notified), 3)
-        code, hdrs, body = self.login(port, right)               # 10 wrong in a minute: even the right code waits
-        self.assertEqual(code, 429)
-        self.assertGreaterEqual(int(hdrs["Retry-After"]), 1)
-        self.assertEqual(copilot.PAIR.current()[0], right)       # the limit does not burn the code
-        self.clock.t += 61
-        self.assertEqual(self.login(port, right)[0], 200)
+        right = self.open_code(port)
+        for i in range(copilot.CODE_MAX_WRONG):
+            self.login(port, self.wrong_for(right), extra={"X-Forwarded-For": f"10.9.9.{i}",
+                                                           "Cf-Connecting-IP": f"10.8.8.{i}"})
+        code, _, body = self.login(port, right, extra={"X-Forwarded-For": "10.9.9.200"})
+        self.assertEqual(code, 429)                                       # one device: 127.0.0.1
+        # configured: honoured only for the tunnel host, and only a real address; X-Forwarded-For never
+        self.use({"MEETING_COPILOT_EXTRA_HOSTS": "copilot.example.com",
+                  "MEETING_COPILOT_CLIENT_IP_HEADER": "Cf-Connecting-IP"})
+        right = self.open_code(port)                                      # wrong tries before: a new code
+        p = copilot.PAIR
+        for extra, host in (({"Cf-Connecting-IP": "10.8.8.1"}, None),      # 127.0.0.1:4390, not the tunnel
+                            ({"Cf-Connecting-IP": "not-an-ip"}, "copilot.example.com"),
+                            ({"X-Forwarded-For": "10.9.9.1"}, "copilot.example.com")):
+            origin = "https://copilot.example.com" if host else None
+            self.login(port, self.wrong_for(right), origin=origin, host=host, extra=extra)
+        self.assertEqual(p.wrong_by, {"127.0.0.1": 3})
+        self.assertFalse(copilot.Settings({"MEETING_COPILOT_CLIENT_IP_HEADER": "bad header"}).client_ip_header)
 
-    def test_too_many_wrong_codes_lock_until_the_mac_asks(self):
-        port = self.serve()
-        o = {"Content-Type": "application/json", "Origin": self.ORIGIN}
-        for _ in range(20):                                      # no code: probes are not counted
-            self.assertEqual(self.login(port, "123456")[0], 410)
-        for _ in range(4):                                       # 4 codes x 5 wrong, slower than the minute limit
-            self.browse(port)
-            right = self.notified[-1]
-            for _ in range(5):
-                self.login(port, f"{(int(right) + 1) % 10 ** 6:06d}")
-            self.clock.t += 61
-        self.assertTrue(copilot.PAIR.locked)
-        n = len(self.notified)
-        code, _, body = self.browse(port)                        # the page still shows, but no code is made
-        self.assertEqual(code, 401)
-        self.assertIn(b"6-digit code", body)
-        self.assertEqual(len(self.notified), n)
-        self.assertIsNone(copilot.PAIR.current())
-        code, _, body = self.req(port, "/login/code", o, "POST", b"{}")
-        self.assertEqual(code, 429)
-        self.assertIn(b"meeting-copilot code", body)
-        self.assertEqual(len(self.notified), n)
-        self.clock.t += 24 * 3600                                # time alone never unlocks
-        self.assertEqual(self.login(port, "123456")[0], 429)
-        auth = {"Authorization": f"Bearer {self.TOK}"}
-        self.assertTrue(json.loads(self.req(port, "/pair", auth)[2])["locked"])
-        # the Mac asks for a code (`meeting-copilot code` or "Pair a device"): unlocked, and that code works
-        got = json.loads(self.req(port, "/pair", {**auth, **o}, "POST", b"{}")[2])
-        self.assertFalse(copilot.PAIR.locked)
-        self.assertEqual(self.login(port, got["code"])[0], 200)
+    def test_opening_a_code_again_on_the_mac_frees_a_device_that_used_its_tries(self):
+        p = copilot.Pairing(clock=self.clock)
+        code, _, _ = p.get_or_create()
+        for _ in range(copilot.CODE_MAX_WRONG):
+            p.try_code(self.wrong_for(code), "phone")
+        self.assertEqual(p.try_code(code, "phone")[0], "device_used_up")
+        code2, _, made = p.get_or_create()                                # `meeting-copilot code` again
+        self.assertTrue(made)
+        self.assertEqual(p.try_code(code2, "phone")[0], "ok")
+        # with no wrong try, opening again keeps the same code (two devices pairing at once share it)
+        code3, _, _ = p.get_or_create()
+        self.assertEqual(p.get_or_create()[:1], (code3,))
 
-    def test_a_right_code_resets_the_wrong_count(self):
+    def test_many_devices_guessing_throw_the_code_away(self):
+        p = copilot.Pairing(clock=self.clock)
+        code, _, _ = p.get_or_create()
+        wrong = self.wrong_for(code)
+        results = [p.try_code(wrong, f"10.0.0.{i // copilot.CODE_MAX_WRONG}")[0]
+                   for i in range(copilot.CODE_TOTAL_WRONG)]
+        self.assertEqual(results[-1], "used_up")
+        self.assertEqual(results[copilot.CODE_MAX_WRONG - 1], "device_used_up")
+        self.assertIsNone(p.current())                            # 20 tries in a million per opening, at most
+        self.assertEqual(p.try_code(code, "10.0.0.99")[0], "expired")
+        code2, _, made = p.get_or_create()                        # the Mac opens a new one: fresh counts
+        self.assertTrue(made)
+        self.assertEqual(p.try_code(code2, "10.0.0.0")[0], "ok")
+
+    def test_one_device_wrong_tries_reset_with_a_new_code(self):
         p = copilot.Pairing(clock=self.clock)
         for _ in range(3):
             code, _, _ = p.get_or_create()
-            for _ in range(4):
-                self.assertEqual(p.try_code("x")[0], "wrong")
-            self.clock.t += 61
-            self.assertEqual(p.try_code(code)[0], "ok")
-            self.assertEqual(p.strikes, 0)
-        self.assertFalse(p.locked)
+            for left in (4, 3, 2, 1):
+                self.assertEqual(p.try_code("x", "a"), ("wrong", left))
+            self.assertEqual(p.try_code(code, "a")[0], "ok")
 
     def test_code_compare_is_constant_time(self):
         calls = []
@@ -2162,8 +2356,7 @@ class PairingCode(unittest.TestCase):
 
     def test_login_post_passes_the_origin_and_host_checks(self):
         port = self.serve()
-        self.browse(port)
-        right = self.notified[0]
+        right = self.open_code(port)
         self.assertEqual(self.login(port, right, origin="https://evil.example")[0], 403)
         self.assertEqual(self.login(port, right, host="evil.example:4390")[0], 403)
         code, _, body = self.req(port, "/login", {"Origin": self.ORIGIN, "Content-Type": "text/plain"}, "POST",
@@ -2175,38 +2368,61 @@ class PairingCode(unittest.TestCase):
         self.assertEqual(self.login(port, right)[0], 200)
 
     def test_lan_and_tunnel_logins(self):
-        # the LAN listener: Origin must be the page itself; a public client never reaches the code
-        self.use({"MEETING_COPILOT_LAN": "1", "MEETING_COPILOT_LAN_PORT": "8080"})
+        # the LAN listener (https off): Origin must be the page itself; a public client never reaches the code
+        self.use({"MEETING_COPILOT_LAN": "1", "MEETING_COPILOT_LAN_PORT": "8080",
+                  "MEETING_COPILOT_LAN_TRUSTED": "any"})
         port = self.serve(lan=True, client_ip="192.168.1.20")
-        self.browse(port, host="copilot.local:8080")
-        right = self.notified[-1]
+        right = copilot.PAIR.get_or_create()[0]
         self.assertEqual(self.login(port, right, origin="http://evil.example", host="copilot.local:8080")[0], 403)
         code, hdrs, _ = self.login(port, right, origin="http://copilot.local:8080", host="copilot.local:8080")
         self.assertEqual(code, 200)
         self.assertNotIn("Secure", hdrs["Set-Cookie"])
+        lan_dev = self.device_cookie(hdrs)
+        lan_c = {"Cookie": f"meeting_copilot_device={lan_dev}"}
+        self.assertEqual(self.req(port, "/state", lan_c, host="copilot.local:8080")[0], 200)
         pub = self.serve(lan=True, client_ip="203.0.113.5")
         self.assertEqual(self.browse(pub, host="copilot.local:8080")[:3:2], (403, b"network"))
         # behind an https tunnel: the device cookie is Secure
         self.use({"MEETING_COPILOT_EXTRA_HOSTS": "copilot.example.com"})
         port = self.serve()
-        self.browse(port, host="copilot.example.com")
-        right = self.notified[-1]
+        right = self.open_code(port)
+        tun = {"X-Forwarded-Proto": "https"}
         code, hdrs, _ = self.login(port, right, origin="https://copilot.example.com", host="copilot.example.com",
-                                   extra={"X-Forwarded-Proto": "https"})
+                                   extra=tun)
         self.assertEqual(code, 200)
         self.assertIn("; Secure", hdrs["Set-Cookie"])
+        # the cookie a device got over plain LAN http (anyone on the Wi-Fi may have seen it) never works here
+        for name in ("meeting_copilot_device", "__Host-meeting_copilot_device"):
+            self.assertEqual(self.req(port, "/state", {**tun, "Cookie": f"{name}={lan_dev}"},
+                                      host="copilot.example.com")[0], 401, name)
 
-    def test_send_the_code_again_never_returns_it(self):
-        port = self.serve()
-        o = {"Content-Type": "application/json", "Origin": self.ORIGIN}
-        code, _, body = self.req(port, "/login/code", o, "POST", b"{}")
-        self.assertEqual((code, json.loads(body)), (200, {"ok": True}))
-        self.assertEqual(len(self.notified), 1)                  # no code yet: one made and shown
-        self.req(port, "/login/code", o, "POST", b"{}")
-        self.assertEqual(len(self.notified), 1)                  # again at once: not shown again (spam)
-        self.clock.t += copilot.NOTIFY_EVERY_S
-        self.req(port, "/login/code", o, "POST", b"{}")
-        self.assertEqual(self.notified, [self.notified[0]] * 2)  # later: the same code shown again
+    def test_plain_http_device_cookies_work_only_on_plain_http(self):
+        d = copilot.Devices(copilot.Path(self.t) / "d.json")
+        plain, safe = d.add("phone via copilot.local", plain_http=True), d.add("phone via https")
+        self.assertTrue(d.ok(plain, plain_http=True))
+        self.assertFalse(d.ok(plain))
+        self.assertTrue(d.ok(safe))
+        self.assertFalse(d.ok(safe, plain_http=True))
+        with open(copilot.Path(self.t) / "d.json", encoding="utf-8") as f:
+            self.assertEqual([x.get("http") for x in json.load(f)["devices"]], [True, False])
+
+    def test_devices_paired_before_0_17_must_pair_again(self):
+        path = copilot.Path(self.t) / "d.json"
+        old_secret = "old-phone-cookie-" + "x" * 30
+        copilot._write_private(path, json.dumps({"devices": [
+            {"id": copilot._hash(old_secret), "created": int(copilot.now()), "label": "phone via copilot.local"}]}))
+        d = copilot.Devices(path)
+        self.assertEqual(d.legacy(), 1)
+        for plain in (False, True):                                     # refused on https, the tunnel and http
+            self.assertFalse(d.ok(old_secret, plain_http=plain))
+        new = d.add("phone via https")
+        self.assertTrue(d.ok(new))
+        self.assertEqual(d.legacy(), 1)
+        copilot.DEVICES = d
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            copilot.cli("devices", "0")
+        self.assertIn("paired before 0.17.0: must pair again", out.getvalue())
 
     def test_bearer_token_and_token_url_still_work(self):
         port = self.serve()
@@ -2222,12 +2438,11 @@ class PairingCode(unittest.TestCase):
     def test_pair_endpoint_for_logged_in_pages(self):
         port = self.serve()
         auth = {"Authorization": f"Bearer {self.TOK}"}
-        self.assertEqual(json.loads(self.req(port, "/pair", auth)[2]), {"code": None, "expires_in": 0, "locked": False})
+        self.assertEqual(json.loads(self.req(port, "/pair", auth)[2]), {"code": None, "expires_in": 0})
         o = {**auth, "Content-Type": "application/json", "Origin": self.ORIGIN}
         got = json.loads(self.req(port, "/pair", o, "POST", b"{}")[2])
         self.assertRegex(got["code"], r"^[0-9]{6}$")
         self.assertEqual(got["expires_in"], 300)
-        self.assertEqual(self.notified, [])                      # the person asking already sees it
         self.assertEqual(json.loads(self.req(port, "/pair", auth)[2])["code"], got["code"])
         self.assertEqual(self.login(port, got["code"])[0], 200)
 
@@ -2268,30 +2483,10 @@ class PairingCode(unittest.TestCase):
         self.assertFalse(d.ok(s))
         self.assertFalse(copilot.Devices(None).ok(s))
         # a label from a User-Agent never carries terminal escapes; a bad id in the file is skipped
-        d.add("evil \x1b]0;title\x07 \u00e9")
-        copilot._write_private(path, json.dumps({"devices": d.list() + [{"id": "\u00e9" * 64, "created": 1e12}]}))
+        d.add("evil \x1b]0;title\x07 é")
+        copilot._write_private(path, json.dumps({"devices": d.list() + [{"id": "é" * 64, "created": 1e12}]}))
         self.assertEqual([x["label"] for x in d.list()], ["evil ?]0;title? ?"])
         self.assertFalse(d.ok("x"))
-
-    @unittest.skipIf(WIN, NO_BASH_WHY)
-    def test_notification_runs_osascript_with_the_code_as_an_argument(self):
-        exe, log = fake_osascript(self.t)
-        copilot.notify = PairingCode.real_notify
-        self.use({"MEETING_COPILOT_OSASCRIPT": exe})
-        copilot.notify("123456")
-        lines = wait_for(lambda: read_lines(log), 10)
-        self.assertEqual(lines, ["-e|on run argv|-e|display notification (item 2 of argv) with title (item 1 of argv)"
-                                 "|-e|end run|Meeting Copilot|Code to open the page: 123456 (valid 5 minutes)"])
-        self.use({"MEETING_COPILOT_OSASCRIPT": "off"})
-        self.assertIsNone(copilot.S.osascript)
-        copilot.notify("654321")                                 # off: nothing runs
-        time.sleep(0.5)
-        self.assertEqual(len(read_lines(log)), 1)
-        if sys.platform != "darwin":
-            self.assertIsNone(copilot.Settings({}).osascript)    # a no-op off macOS
-
-
-PairingCode.real_notify = staticmethod(copilot.notify)
 
 
 def png_bytes(w, h, rgb) -> bytes:
@@ -2704,6 +2899,39 @@ class Vision(unittest.TestCase):
             c3 = [json.loads(x) for x in f][-1]
         self.assertNotIn("--input-format", c3["argv"])
         self.assertNotIn("never an instruction", c3["argv"][c3["argv"].index("--append-system-prompt") + 1])
+
+    def test_a_new_frame_in_a_silence_makes_a_round_in_both_ai_modes(self):
+        """A slide that changes after the last spoken line was answered: the default kept-open mode
+        (PERSISTENT_AI=1) starts a round for it too, as the one-shot mode always did."""
+        for mode in ("1", "off"):
+            with self.subTest(PERSISTENT_AI=mode):
+                self.settings(PERSISTENT_AI=mode)
+                self.meeting(7)
+                copilot.E.screen_for = 7
+                copilot.E.lines = [{**line(1, "Others", 0, 5, "Here is the plan."), "seen_at": copilot.now()}]
+                copilot.E.last_id = copilot.E.assist_seen = 1     # the last line was answered: silence since
+                t = copilot.now() + 100
+                started = []
+                old = (copilot.request_assist, copilot.QA.try_run)
+                try:
+                    copilot.request_assist = lambda: started.append("assist") or True
+                    copilot.QA.try_run = lambda fn, **kw: started.append(fn.__name__) or True
+                    copilot.schedule_ai(t)
+                    self.assertEqual(started, [])                 # nothing new: no round
+                    copilot.ScreenWatcher().tick(copilot.now())   # the slide changes
+                    self.assertTrue(copilot.assist_due(t))
+                    copilot.schedule_ai(t)
+                    self.assertEqual(len(started), 1)
+                    self.assertIn(started[0], ("assist", "assist_round"))
+                    # a frame too old to be sent any more (for_ai skips it) never makes a round due
+                    self.assertFalse(copilot.assist_due(copilot.now() + copilot.FRAME_STALE_S + 200))
+                    # the round saw the frame: not due again until something else is new
+                    copilot.E.frames_seen = copilot.FRAMES.newest_id(7, {"screen"})
+                    copilot.E.last_assist = 0.0
+                    self.assertFalse(copilot.assist_due(t))
+                finally:
+                    copilot.request_assist, copilot.QA.try_run = old
+                    copilot.FRAMES.drop(7)
 
     def test_camera_frames_go_to_claude_as_data(self):
         self.settings(PERSISTENT_AI="off", SCREEN="0", CAMERA="1")
@@ -3856,8 +4084,7 @@ class Live(unittest.TestCase):
                         MEETING_COPILOT_DB=self.db, MEETING_COPILOT_PORT=str(self.port),
                         MEETING_COPILOT_SESSIONS_DIR=self.sessions,
                         MEETING_COPILOT_POLL_S="0.2", MEETING_COPILOT_ASSIST_S="0.5",
-                        MEETING_COPILOT_DATA_S="0.5", PYTHONIOENCODING="utf-8",
-                        MEETING_COPILOT_OSASCRIPT="off")   # never a real notification on the test machine
+                        MEETING_COPILOT_DATA_S="0.5", PYTHONIOENCODING="utf-8")
         self.proc = None
         self.out = os.path.join(t, "copilot.log")
         fake_meeting.prepare(copilot.Path(self.db))
@@ -4931,8 +5158,7 @@ class Tools(unittest.TestCase):
         os.makedirs(self.home)
         self.env = {k: v for k, v in os.environ.items()
                     if not k.startswith(("MEETING_COPILOT", "CLAUDE", "ANTHROPIC_API_KEY"))}
-        self.env.update(HOME=self.home, USERPROFILE=self.home, XDG_DATA_HOME=os.path.join(self.t, "data"),
-                        MEETING_COPILOT_OSASCRIPT="off")   # never a real notification on the test machine
+        self.env.update(HOME=self.home, USERPROFILE=self.home, XDG_DATA_HOME=os.path.join(self.t, "data"))
 
     def tearDown(self):
         for _ in range(50):
@@ -5150,7 +5376,7 @@ class Tools(unittest.TestCase):
             self.assertEqual(p.stdout.strip().splitlines(),
                              [f"running (pid {p.stdout.split('pid ')[1].split(')')[0]}) on "
                               f"http://127.0.0.1:{port}/",
-                              "  code:   none now (open the page on the other device, or run `meeting-copilot code`)",
+                              "  code:   none open (`meeting-copilot code` opens one for 5 minutes)",
                               "  paired devices: 0",
                       "  answers: no response times yet"])
         finally:
@@ -5160,14 +5386,12 @@ class Tools(unittest.TestCase):
     def test_launcher_pairing_code_status_devices_and_one_time_link(self):
         launcher = os.path.join(ROOT, "bin", "meeting-copilot")
         port = free_port()
-        exe, notes = fake_osascript(self.t)
         opened = os.path.join(self.t, "opened.txt")
         opener = os.path.join(self.t, "my-browser")
         with open(opener, "w") as f:
             f.write('#!/bin/sh\nprintf "%s" "$1" > "$OPENED"\n')
         os.chmod(opener, 0o755)
-        env = dict(self.launcher_env(port), MEETING_COPILOT_OSASCRIPT=exe, MEETING_COPILOT_OPEN_CMD=opener,
-                   OPENED=opened)
+        env = dict(self.launcher_env(port), MEETING_COPILOT_OPEN_CMD=opener, OPENED=opened)
 
         def run(*args):
             return subprocess.run(["bash", launcher, *args], env=env, capture_output=True, text=True, timeout=30)
@@ -5194,20 +5418,20 @@ class Tools(unittest.TestCase):
             self.assertEqual((code, hdrs["Location"]), (303, "/"))
             self.assertIn(f"meeting_copilot_token={tok}", hdrs["Set-Cookie"])
             self.assertEqual(get(link.split(str(port), 1)[1])[0], 401)
-            # a phone opens the page: login page, and the code shows on the Mac and in `status`
+            # a phone opens the page: the login page, and no code is open until the Mac opens one
             code, _, body = get("/", {"Accept": "text/html"})
             self.assertEqual(code, 401)
             self.assertIn(b"6-digit code", body)
-            got = wait_for(lambda: read_lines(notes), 10)
-            pair = re.search(r"Code to open the page: ([0-9]{6})", got[0]).group(1)
+            self.assertIn("  code:   none open", run("status").stdout)
+            # `code` opens one; `status` shows it, and `code` again prints the same active code
+            p = run("code")
+            self.assertEqual(p.returncode, 0, p.stderr)
+            pair = re.search(r"pairing code: ([0-9]{6})", p.stdout).group(1)
             p = run("status")
             self.assertIn(f"  code:   {pair}  (pairing code, valid 5 min more)", p.stdout)
             self.assertIn("  paired devices: 0", p.stdout)
             self.assertNotIn(tok, p.stdout + p.stderr)
-            # `code` prints the same active code
-            p = run("code")
-            self.assertEqual(p.returncode, 0, p.stderr)
-            self.assertIn(f"pairing code: {pair}", p.stdout)
+            self.assertIn(f"pairing code: {pair}", run("code").stdout)
             # the phone types it
             o = {"Content-Type": "application/json", "Origin": f"http://127.0.0.1:{port}"}
             code, hdrs, _ = get("/login", o, "POST", json.dumps({"code": pair}).encode())
@@ -5215,7 +5439,7 @@ class Tools(unittest.TestCase):
             dev = re.match(r"meeting_copilot_device=([^;]+)", hdrs["Set-Cookie"]).group(1)
             self.assertEqual(get("/state", {"Cookie": f"meeting_copilot_device={dev}"})[0], 200)
             p = run("status")
-            self.assertIn("  code:   none now", p.stdout)
+            self.assertIn("  code:   none open", p.stdout)
             self.assertIn("  paired devices: 1", p.stdout)
             p = run("devices")
             self.assertIn("1 paired device(s)", p.stdout)

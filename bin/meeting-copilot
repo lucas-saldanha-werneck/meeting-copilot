@@ -8,7 +8,7 @@
 #   meeting-copilot log                                   show the end of the log
 #   meeting-copilot bench [N] [--yes]                     time N real suggestion rounds, with and without an image
 #   meeting-copilot cert [--renew]                        the https certificate for the phone camera (see README)
-#   A browser that is not logged in asks for the 6-digit code shown on the Mac (notification, status).
+#   A browser that is not logged in asks for a 6-digit code that only the Mac opens (`meeting-copilot code`).
 set -u
 
 # Resolve the real script location, also when called through a symlink in ~/.local/bin.
