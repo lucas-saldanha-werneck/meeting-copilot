@@ -8,7 +8,7 @@ A live meeting copilot for macOS. While a meeting is recording in the [Muesli](h
 - **Relevant facts** (optional): looked up in folders of notes you choose and/or MCP tools you allow.
 - **Warnings** (no AI): long monologue, talking most of the last 5 minutes, few questions, speaking too fast.
 
-The AI runs through `claude -p` (Claude Code), so it uses your Claude Code login. Suggestions about every 25 s, fact search about every 45 s.
+The AI runs through `claude -p` (Claude Code), so it uses your Claude Code login. Suggestions about every 25 s, fact search about every 45 s (with a TypeSafe key an answer takes about 1-5 s instead of 10-19 s: see [Fast fact search](#fast-fact-search)).
 
 ### The kept-open AI process (suggestions)
 
@@ -181,6 +181,11 @@ Every key:
 | `MEETING_COPILOT_MODEL` | `sonnet` | Model for suggestions (`MEETING_COPILOT_DATA_MODEL` for fact search) |
 | `MEETING_COPILOT_SEARCH_DIRS` | empty | Folders the AI may search for facts, separated by `:` |
 | `MEETING_COPILOT_MCP_CONFIG` | empty | An MCP config file (`{"mcpServers": {...}}`) for fact search |
+| `MEETING_COPILOT_FACT_MODE` | `fast` with a TypeSafe key and search folders, else `tools` | `fast`: Jev gate, text search, Jev pick, small-model check (see [Fast fact search](#fast-fact-search)); `tools`: only the AI with tools |
+| `MEETING_COPILOT_FACT_GATE_MIN` / `FACT_PICK_MIN` | `0.5` / `0.8` | How sure Jev must be that a fact is asked / that its pick is the fact (0 to 1) |
+| `MEETING_COPILOT_FACT_CHECK_MODEL` / `FACT_CHECK_EFFORT` | `haiku` / `low` | The model that reads the lines when Jev is unsure (`off`: the AI with tools then), and its `--effort` |
+| `MEETING_COPILOT_FACT_WARM` | `1` | Start the next small-model call ahead |
+| `MEETING_COPILOT_FACT_SNIPPETS` / `FACT_SKIP` | `10` / `*.mbox,*.gz` | Lines Jev and the small model see / file name patterns the text search skips |
 | `MEETING_COPILOT_MCP_TOOLS` | empty | Comma-separated allowlist of tools from that file, e.g. `mcp__notes__search`. Required: without it MCP stays off |
 | `MEETING_COPILOT_SESSIONS_DIR` | `~/.local/share/meeting-copilot/sessions` | Where each meeting's transcript and suggestions are saved when it ends (`MEETING_COPILOT_SAVE_SESSIONS=0` to turn off) |
 | `MEETING_COPILOT_SAVE_FORMAT` | `json` | `markdown`: save a readable `<Muesli export name>-copilot.md` (suggestions, corrections, facts, warnings; no transcript) instead of the JSON. It waits up to `MEETING_COPILOT_MUESLI_WAIT_S` seconds (600) for Muesli's auto-export, reads its name from Muesli's export log and links to it. The file says it is AI-written: keep it out of folders the fact search reads, or it can come back as a "fact" |
@@ -229,6 +234,39 @@ The transcript often writes "Solarix" as "solar X".
 ```
 
 Only allow read-only MCP tools: the fact search runs during your meeting without asking you.
+
+### Fast fact search
+
+The AI with tools reads your notes in 8-9 tool rounds: 10-19 s per answer. The text search itself takes
+0.1-0.5 s. With a TypeSafe key (`MEETING_COPILOT_TYPESAFE_KEY` or `MEETING_COPILOT_TYPESAFE_KEY_FILE`, the
+same key as the Look gate) and search folders, each fact round goes this way instead (`MEETING_COPILOT_FACT_MODE=fast`,
+the default then; `tools` keeps only the old way):
+
+1. **Is a fact asked?** One call to [Jev](https://typesafe.ai) with the new lines (and the ones before, as
+   context): a yes/no probability, plus, in the same call, how much each candidate word names the fact. Below
+   `FACT_GATE_MIN` (0.5): nothing is searched and nothing is shown.
+2. **Search words** come from the new lines with plain rules (no stopwords, no accents, a final s cut);
+   the words Jev rates below 0.7 leave the search ("custou", "nota"), the others count as much as Jev says.
+3. **Text search** of the search folders on this machine: ripgrep when installed (`rg` on the PATH or in
+   Homebrew's folders), else a slower Python search. Files matching `FACT_SKIP` (`*.mbox,*.gz`) and hidden
+   files are skipped. A line scores the rarity of each word in it, plus each word in its file or folder name
+   (a WhatsApp export named after a company); the best `FACT_SNIPPETS` (10) go on, each with the line above
+   and below.
+4. **Jev picks** the line with the fact (or none). At least `FACT_PICK_MIN` (0.8) sure: that line and its
+   file (`wiki/acme.md:4`) are shown as the fact, with no other AI call.
+5. **Unsure:** one call to `FACT_CHECK_MODEL` (`haiku`, `--effort low`, no tools, one turn) with the lines
+   writes the answer through your fact-search prompt (its `{sources}` say "read NOTES FOUND"), or `EMPTY`.
+   With `FACT_WARM=1` the next such call is started ahead, so it does not wait for claude to start.
+
+The AI with tools still runs when this cannot answer: Jev out (no key, a timeout, an HTTP error), no line
+found, or the small-model call failed (or `FACT_CHECK_MODEL=off` and Jev was unsure). The log line of each
+round has the stages, for example `data ok in 0.6s (found) fast: gate=0.95/0.2s terms=4 search=0.18s/10
+pick=s0:0.98/0.2s picked $0.00013`; the words and the lines stay out of the log. Jev costs about US$0.00001
+per 300 words sent. `tools/bench_facts.py questions.json` runs the same questions through both ways on your
+own notes and prints seconds, cost and right or wrong.
+
+The text search runs on this Mac even with `MEETING_COPILOT_REMOTE`: the notes are local, ripgrep there takes
+0.1-0.5 s, and the same search on the server through ssh took 0.35-1 s (no ripgrep in the container).
 
 ### Your own prompt
 
@@ -490,7 +528,7 @@ With neither search folders nor MCP, the "Relevant facts" panel says fact search
 ## Privacy
 
 - The Muesli database is opened read-only and never written.
-- The transcript of the last 3 minutes, your goals and the items already shown are sent to Claude through `claude -p` (on the kept-open process: once, then only the new lines each round). With screen sharing or the phone camera turned on for a meeting, the newest frames go too (see "Screen and camera"). In Look mode, after you tap **Look**, the newest camera frames and the questions you type go to Claude (see "Look mode"). With a TypeSafe key set, the newest Look frame also goes to TypeSafe (Jev) for the gate. Nothing else leaves the machine.
+- The transcript of the last 3 minutes, your goals and the items already shown are sent to Claude through `claude -p` (on the kept-open process: once, then only the new lines each round). With screen sharing or the phone camera turned on for a meeting, the newest frames go too (see "Screen and camera"). In Look mode, after you tap **Look**, the newest camera frames and the questions you type go to Claude (see "Look mode"). With a TypeSafe key set, the newest Look frame also goes to TypeSafe (Jev) for the gate, and in the fast fact search (`MEETING_COPILOT_FACT_MODE=fast`) the transcript of the last 3 minutes, the candidate search words and the lines found in your notes (with their file names) go to TypeSafe. Nothing else leaves the machine.
 - With `MEETING_COPILOT_REMOTE`, that same AI input goes over ssh to the machine you name, and the fact search reads that machine's copy of your search folders (see [Run the AI on a server](#run-the-ai-on-a-server)).
 - Sessions (full transcript plus suggestions) are saved as JSON files readable only by your user. A meeting saved again (the copilot restarted, or the meeting stopped and recorded again) gets a new file with `-2`, `-3`, and so on, so nothing earlier is overwritten.
 - The fact search may read files only inside the search folders: Read, Grep and Glob are allowed with a path rule for each folder, so a request in the meeting to open any other file is refused. The AI runs in an empty folder of its own and loads no Claude Code settings files, so no hook planted in a search folder runs with it.

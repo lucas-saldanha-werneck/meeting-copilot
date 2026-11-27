@@ -3710,6 +3710,324 @@ class Vision(unittest.TestCase):
         self.assertEqual(content[2]["source"]["data"], "iVBORw==")
 
 
+def fact_notes(root) -> str:
+    """A small notes folder: the answer in a wiki page, noise around it, and copies the search must skip."""
+    notes = os.path.join(root, "notes")
+    for rel, text in {
+        "wiki/acme.md": "# ACME\n\nCustomer since 2024.\n- ACME tax ID: 12.345.678/0001-90 (Receita)\nOwner: Ana\n",
+        "wiki/other.md": "Some page about the garden.\nThe tax rules changed in 2025.\n",
+        "raw/orçamento-jardim.md": "Orçamento do jardim: R$ 800 por mês.\n",
+        "raw/whatsapp-acme/2026-09.md": "10:00 eu: oi\n10:01 eu: CNPJ: 98.765.432/0001-10\n",
+        "raw/mail/acme.mbox": "ACME tax ID 00.000.000/0000-00 in a raw mail\n",
+        "raw/mail/acme.md.gz": "ACME tax ID 11.111.111/1111-11\n",
+        "raw/.hidden/acme.md": "ACME tax ID 22.222.222/2222-22\n",
+    }.items():
+        path = os.path.join(notes, *rel.split("/"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+    return notes
+
+
+class FactSearch(unittest.TestCase):
+    """The text search of the fast fact search (no AI): words, patterns, ranking, skipped files."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.notes = fact_notes(os.path.realpath(self.tmp.name))
+        self.dirs = [copilot.Path(self.notes, "wiki"), copilot.Path(self.notes, "raw")]
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_terms_drop_filler_words_accents_and_plural(self):
+        self.assertEqual(copilot.fact_terms(["E qual é mesmo o CNPJ da LuxVolt pra eu colocar na nota?"]),
+                         ["cnpj", "luxvolt", "nota"])
+        self.assertEqual(copilot.fact_terms(["Quando vencem os contratos do Orçamento 2026?"]),
+                         ["vencem", "contrato", "orcamento", "2026"])
+        self.assertEqual(copilot.fact_terms(["What is the tax ID of ACME?"]), ["tax", "acme"])  # "ID": 2 letters
+        self.assertEqual(copilot.fact_terms(["apt 602 b2"]), ["apt", "602", "b2"])
+        self.assertEqual(copilot.fact_terms(["one two three four five six seven eight nine ten"], 3),
+                         ["two", "three", "four"])
+        # newest line first: its words come first
+        self.assertEqual(copilot.fact_terms(["price of ACME", "garden"])[:2], ["price", "acme"])
+
+    def test_pattern_finds_the_word_with_or_without_accents(self):
+        rx = re.compile(copilot.term_pattern("orcamento"), re.IGNORECASE)
+        for text in ("Orçamento do jardim", "ORCAMENTO", "orçamentos"):
+            self.assertTrue(rx.search(text), text)
+        self.assertIsNone(rx.search("ornamento"))
+        self.assertEqual(copilot.term_pattern("a.b"), "[aáàâãä]\\.b")
+
+    def check_search(self, rg):
+        out = copilot.fact_search(["tax", "acme"], self.dirs, ["*.mbox", "*.gz"], 10, rg=rg)
+        self.assertEqual(out[0]["path"], "wiki/acme.md")
+        self.assertEqual(out[0]["line"], 4)
+        self.assertIn("12.345.678/0001-90", out[0]["text"])
+        self.assertEqual(out[0]["context"].splitlines(), ["Customer since 2024.",
+                                                          "- ACME tax ID: 12.345.678/0001-90 (Receita)",
+                                                          "Owner: Ana"])
+        text = " ".join(s["text"] for s in out)
+        for skipped in ("00.000.000", "11.111.111", "22.222.222"):   # .mbox, .gz, hidden folder
+            self.assertNotIn(skipped, text)
+        # a word only in the file's folder name still counts ("whatsapp-acme"), and accents do not matter
+        out = copilot.fact_search(["cnpj", "acme"], self.dirs, ["*.mbox"], 10, rg=rg)
+        self.assertEqual((out[0]["path"], out[0]["line"]), ("raw/whatsapp-acme/2026-09.md", 2))
+        out = copilot.fact_search(["orcamento"], self.dirs, [], 10, rg=rg)
+        self.assertEqual(out[0]["path"], "raw/orçamento-jardim.md")
+        self.assertEqual(copilot.fact_search(["zzzz"], self.dirs, [], 10, rg=rg), [])
+        self.assertEqual(copilot.fact_search([], self.dirs, [], 10, rg=rg), [])
+        self.assertEqual(len(copilot.fact_search(["the", "acme", "tax"], self.dirs, [], 2, rg=rg)), 2)
+
+    def test_search_without_ripgrep(self):
+        self.check_search(None)
+
+    @unittest.skipUnless(copilot.find_rg(), "ripgrep is not installed here")
+    def test_search_with_ripgrep(self):
+        self.check_search(copilot.find_rg())
+
+    def test_weights_rank_the_named_word_first(self):
+        # "garden" alone is in other.md and the orçamento page; a weight near 0 for "rules" leaves other.md
+        # behind the page that has the word Jev rated high
+        out = copilot.fact_search(["rules", "jardim"], self.dirs, [], 10, rg=None, weights=[0.05, 1.0])
+        self.assertEqual(out[0]["path"], "raw/orçamento-jardim.md")
+        out = copilot.fact_search(["rules", "jardim"], self.dirs, [], 10, rg=None, weights=[1.0, 0.05])
+        self.assertEqual(out[0]["path"], "wiki/other.md")
+
+
+@unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
+class FactFast(unittest.TestCase):
+    """data_round with MEETING_COPILOT_FACT_MODE=fast, a fake Jev on localhost and the fake claude."""
+
+    KEY = "sk-test-fact-secret-42"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        t = self.t = os.path.realpath(self.tmp.name)
+        self.notes = fact_notes(t)
+        self.claude_log = os.path.join(t, "claude.jsonl")
+        self.claude = os.path.join(t, "claude")
+        with open(self.claude, "w") as f:
+            f.write(f'#!/bin/sh\nexec "{PY}" "{ROOT}/tests/fake_claude.py" "$@"\n')
+        os.chmod(self.claude, 0o755)
+        self.old = (copilot.S, copilot.E, dict(os.environ), copilot.GATE_URL)
+        os.environ.update({"FAKE_CLAUDE_LOG": self.claude_log, copilot.TYPESAFE_KEY_ENV: self.KEY})
+        copilot.E = copilot.State()
+        self.jev = {"gate": 0.95, "weights": {}, "pick": "s0", "p": 0.95, "status": 200}
+        self.hits = []
+        self.serve_jev()
+        self.settings()
+        copilot.E.reset({"id": 3, "title": "T", "start": "2026-11-27T10:00:00Z"})
+
+    def tearDown(self):
+        copilot.FACT_SPARE.stop()
+        copilot.S, copilot.E, env, copilot.GATE_URL = self.old
+        os.environ.clear()
+        os.environ.update(env)
+        self.tmp.cleanup()
+
+    def serve_jev(self):
+        hits, jev = self.hits, self.jev
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_POST(h):
+                body = json.loads(h.rfile.read(int(h.headers["Content-Length"])))
+                hits.append((dict(h.headers), body))
+                answers = {}
+                for qid, q in body["questions"].items():
+                    if q["type"] == "choice":
+                        answers[qid] = {"type": "choice", "choice": jev["pick"], "confidence": jev["p"],
+                                        "probabilities": {jev["pick"]: jev["p"]}}
+                    elif qid == "q":
+                        answers[qid] = {"type": "noul", "noul": jev["gate"]}
+                    else:
+                        word = re.search(r'word "([^"]+)"', q["instructions"]).group(1)
+                        answers[qid] = {"type": "noul", "noul": jev["weights"].get(word, 0.9)}
+                out = json.dumps({"model": "jev-test", "answers": answers,
+                                  "usage": {"input_tokens": 1000, "output_tokens": 20}}).encode()
+                h.send_response(jev["status"])
+                h.send_header("Content-Type", "application/json")
+                h.end_headers()
+                h.wfile.write(out)
+
+            def log_message(h, *a):
+                pass
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        copilot.GATE_URL = f"http://127.0.0.1:{srv.server_address[1]}/v1/systemone"
+
+    def settings(self, **extra):
+        cfg = {"MEETING_COPILOT_DATA_DIR": os.path.join(self.t, "data"), "MEETING_COPILOT_CLAUDE": self.claude,
+               "MEETING_COPILOT_API_CREDIT": "off", "MEETING_COPILOT_PERSISTENT_AI": "0",
+               "MEETING_COPILOT_FACT_WARM": "0",
+               "MEETING_COPILOT_SEARCH_DIRS": os.pathsep.join([os.path.join(self.notes, "wiki"),
+                                                               os.path.join(self.notes, "raw")])}
+        cfg.update({"MEETING_COPILOT_" + k: v for k, v in extra.items()})
+        copilot.S = copilot.Settings(cfg)
+        return copilot.S
+
+    def say(self, *texts):
+        for text in texts:
+            i = copilot.E.last_id + 1
+            copilot.E.lines.append({"id": i, "who": "Others", "start": i * 5.0, "end": i * 5.0 + 4, "text": text})
+            copilot.E.last_id = i
+
+    def round(self) -> str:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            copilot.data_round()
+        log = out.getvalue()
+        self.assertNotIn(self.KEY, log)
+        return log
+
+    def claude_calls(self) -> list[dict]:
+        if not os.path.exists(self.claude_log):
+            return []
+        with open(self.claude_log, encoding="utf-8") as f:
+            return [json.loads(x) for x in f if x.strip()]
+
+    def test_settings(self):
+        s = self.settings()
+        self.assertEqual((s.fact_mode, s.fact_gate_min, s.fact_pick_min, s.fact_check_model, s.fact_snippets,
+                          s.fact_skip, s.fact_check_effort), ("fast", 0.5, 0.8, "haiku", 10, ["*.mbox", "*.gz"], "low"))
+        self.assertEqual(self.settings(FACT_MODE="tools").fact_mode, "tools")
+        s = self.settings(FACT_GATE_MIN="0.7", FACT_PICK_MIN="2", FACT_CHECK_MODEL="off", FACT_SNIPPETS="5",
+                          FACT_SKIP="*.mbox, *.jsonl", FACT_CHECK_EFFORT="")
+        self.assertEqual((s.fact_gate_min, s.fact_pick_min, s.fact_check_model, s.fact_snippets, s.fact_skip,
+                          s.fact_check_effort), (0.7, 0.8, "", 5, ["*.mbox", "*.jsonl"], ""))
+        self.assertTrue(any("FACT_PICK_MIN" in n for n in s.notices))
+        del os.environ[copilot.TYPESAFE_KEY_ENV]
+        s = self.settings(FACT_MODE="fast")
+        self.assertEqual(s.fact_mode, "tools")                     # no key: the old search, with a note
+        self.assertTrue(any("FACT_MODE=fast needs" in n for n in s.notices))
+        self.assertEqual(self.settings().notices, [])               # not asked for: no note
+        os.environ[copilot.TYPESAFE_KEY_ENV] = self.KEY
+        self.assertEqual(self.settings(SEARCH_DIRS="").fact_mode, "tools")   # nothing to search
+
+    def test_no_fact_asked_shows_nothing_and_calls_no_ai(self):
+        self.jev["gate"] = 0.05
+        self.say("Bom dia pessoal, vamos começar?")
+        log = self.round()
+        self.assertEqual(copilot.E.data, [])
+        self.assertEqual(self.claude_calls(), [])
+        self.assertEqual(len(self.hits), 1)                        # the gate only, no pick
+        headers, body = self.hits[0]
+        self.assertEqual(headers["Authorization"], "Bearer " + self.KEY)
+        self.assertNotIn("TypeSafe-Danger-Zone-Images", headers)
+        self.assertIn("vamos começar", body["state"]["new"])
+        self.assertRegex(log, r"data ok in \d+\.\ds \(empty\) fast: gate=0\.05/\d+\.\ds terms=\d no fact asked")
+        self.assertEqual(copilot.E.data_seen, 1)
+
+    def test_sure_pick_shows_the_line_and_its_file_with_no_ai(self):
+        self.say("What is the tax ID of ACME?")
+        log = self.round()
+        self.assertEqual(self.claude_calls(), [])
+        self.assertEqual(len(copilot.E.data), 1)
+        md = copilot.E.data[0]["markdown"]
+        self.assertIn("12.345.678/0001-90", md)
+        self.assertIn("`wiki/acme.md:4`", md)
+        gate, pick = self.hits[0][1], self.hits[1][1]
+        self.assertEqual(sorted(gate["questions"]), ["q", "t0", "t1"])     # gate + one per word, one call
+        crit = pick["questions"]["q"]["criteria"]
+        self.assertIn("none", crit)
+        self.assertIn("12.345.678", crit["s0"])
+        self.assertTrue(crit["s0"].startswith("wiki/acme.md:4: "))
+        self.assertRegex(log, r"\(found\) fast: gate=0\.95/\d+\.\ds terms=2 search=\d+\.\d\ds/\d+ "
+                              r"pick=s0:0\.95/\d+\.\ds picked \$0\.00008")
+        self.assertNotIn("acme", log.lower())           # the words and the lines stay out of the log
+        # the same fact again: never shown twice
+        self.say("Sorry, the tax ID of ACME again?")
+        self.round()
+        self.assertEqual(len(copilot.E.data), 1)
+
+    def test_unsure_pick_asks_the_small_model_once_without_tools(self):
+        self.jev.update(pick="s0", p=0.4)
+        self.say("What is the tax ID of ACME?")
+        log = self.round()
+        calls = self.claude_calls()
+        self.assertEqual(len(calls), 1)
+        a = calls[0]["argv"]
+        self.assertEqual(a[a.index("--model") + 1], "haiku")
+        self.assertEqual(a[a.index("--tools") + 1], "")
+        self.assertEqual(a[a.index("--max-turns") + 1], "1")
+        self.assertEqual(a[a.index("--effort") + 1], "low")
+        self.assertNotIn("--add-dir", a)
+        self.assertNotIn("Grep", " ".join(a))
+        self.assertIn("NOTES FOUND", calls[0]["stdin"])
+        self.assertIn("[1] wiki/acme.md:4\nCustomer since 2024.", calls[0]["stdin"])
+        self.assertIn("The likeliest: [1]", calls[0]["stdin"])
+        self.assertIn("lines a text search found", a[a.index("--append-system-prompt") + 1])
+        self.assertEqual(copilot.E.data[0]["markdown"], "The current contract ends on 2027-03-31.\nSource: contracts.md")
+        self.assertRegex(log, r"pick=s0:0\.40/\d+\.\ds check=haiku/\d+\.\ds/cold/local checked")
+
+    def test_filler_words_leave_the_search(self):
+        self.jev["weights"] = {"tax": 0.95, "acme": 0.95, "garden": 0.3, "aside": 0.1}
+        self.say("Garden aside, what is the tax ID of ACME?")
+        info: dict = {}
+        with contextlib.redirect_stdout(io.StringIO()):
+            copilot.fact_fast(list(copilot.E.lines), 0, [], "msg", info)
+        self.assertEqual(info["terms"], ["tax", "acme"])
+        self.jev["weights"] = {"tax": 0.2, "acme": 0.5, "garden": 0.1, "aside": 0.1}   # all low: the 2 best stay
+        info = {}
+        with contextlib.redirect_stdout(io.StringIO()):
+            copilot.fact_fast(list(copilot.E.lines), 0, [], "msg", info)
+        self.assertEqual(info["terms"], ["acme", "tax"])
+
+    def test_jev_out_falls_back_to_the_ai_with_tools_and_logs_once(self):
+        self.jev["status"] = 500
+        self.say("What is the tax ID of ACME?")
+        log = self.round()
+        calls = self.claude_calls()
+        self.assertEqual(len(calls), 1)
+        a = calls[0]["argv"]
+        self.assertEqual(a[a.index("--max-turns") + 1], "8")
+        self.assertEqual(a[a.index("--tools") + 1], "Read,Grep,Glob")
+        self.assertIn("data: Jev failed (HTTP 500), the fact search uses the AI with tools", log)
+        self.assertIn("jev out, tools", log)
+        self.say("And the owner?")
+        self.assertNotIn("Jev failed", self.round())                 # at most one line a minute
+
+    def test_nothing_found_falls_back_to_the_ai_with_tools(self):
+        self.say("What did Zebulon quote for the yacht?")
+        log = self.round()
+        a = self.claude_calls()[0]["argv"]
+        self.assertEqual(a[a.index("--tools") + 1], "Read,Grep,Glob")
+        self.assertIn("nothing found, tools", log)
+        self.assertEqual(len(self.hits), 1)
+
+    def test_unsure_with_no_check_model_falls_back_to_the_ai_with_tools(self):
+        self.settings(FACT_CHECK_MODEL="off")
+        self.jev.update(pick="none", p=0.9)
+        self.say("What is the tax ID of ACME?")
+        log = self.round()
+        a = self.claude_calls()[0]["argv"]
+        self.assertEqual(a[a.index("--max-turns") + 1], "8")
+        self.assertIn("unsure, no check model, tools", log)
+
+    def test_tools_mode_never_asks_jev(self):
+        self.settings(FACT_MODE="tools")
+        self.say("What is the tax ID of ACME?")
+        log = self.round()
+        self.assertEqual(self.hits, [])
+        self.assertEqual(len(self.claude_calls()), 1)
+        self.assertNotIn("fast:", log)
+
+    def test_warm_check_starts_the_next_one_ahead_and_ai_off_stops_it(self):
+        self.settings(FACT_WARM="1", CONFIRM_AI="1")
+        copilot.E.ai_for = 3
+        self.jev.update(pick="s0", p=0.4)
+        self.say("What is the tax ID of ACME?")
+        self.round()
+        self.assertIsNotNone(copilot.FACT_SPARE.proc)
+        self.assertTrue(copilot.FACT_SPARE.armed)
+        copilot.E.ai_for = None
+        copilot.ai_reconcile("test")
+        self.assertIsNone(copilot.FACT_SPARE.proc)
+        self.assertFalse(copilot.FACT_SPARE.armed)
+
+
 @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
 class RemoteAI(unittest.TestCase):
     """MEETING_COPILOT_REMOTE: the AI calls on another machine through a fake ssh (tests/fake_ssh.py runs the

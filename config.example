@@ -36,6 +36,29 @@
 #MEETING_COPILOT_MCP_CONFIG=
 #MEETING_COPILOT_MCP_TOOLS=
 
+# Fast fact search (needs the TypeSafe key, see TYPESAFE_KEY_FILE below, and SEARCH_DIRS):
+# Jev (TypeSafe) says whether the new part of the conversation asks for a fact and which
+# words name it, a text search (ripgrep when installed) finds the best lines in the search
+# folders, Jev picks one, and only when Jev is unsure one call to a small model (no tools)
+# reads those lines. The AI with tools (DATA_MODEL) runs only when this cannot answer.
+# The new lines of the conversation and the lines found go to TypeSafe.
+# fast or tools (only the AI with tools). Default: fast when the key and folders are set.
+#MEETING_COPILOT_FACT_MODE=
+# Jev must be at least this sure (0 to 1) that a fact is asked, else nothing is searched.
+#MEETING_COPILOT_FACT_GATE_MIN=0.5
+# Jev's pick is shown as is (the line and its file) when Jev is at least this sure.
+#MEETING_COPILOT_FACT_PICK_MIN=0.8
+# The small model that reads the lines when Jev is less sure. off: the AI with tools then.
+#MEETING_COPILOT_FACT_CHECK_MODEL=haiku
+# Its effort (low, medium, high, xhigh, max; empty: claude's default).
+#MEETING_COPILOT_FACT_CHECK_EFFORT=low
+# 1: the next small-model call is started ahead, so it does not wait for claude to start.
+#MEETING_COPILOT_FACT_WARM=1
+# How many lines Jev and the small model see.
+#MEETING_COPILOT_FACT_SNIPPETS=10
+# File name patterns the text search skips, separated by commas.
+#MEETING_COPILOT_FACT_SKIP=*.mbox,*.gz
+
 # A text file about you that both AI calls read (name, role, projects, where your
 # notes are, words the transcript gets wrong). The first 8000 characters are used.
 #MEETING_COPILOT_CONTEXT_FILE=
@@ -239,7 +262,7 @@
 #MEETING_COPILOT_LOOK_GATE=
 # The deep pass runs when Jev's probability is at least this (0 to 1).
 #MEETING_COPILOT_LOOK_GATE_MIN=0.8
-# The TypeSafe key for the gate: put it in the environment of the copilot as
+# The TypeSafe key for the gate and the fast fact search: put it in the environment of the copilot as
 # MEETING_COPILOT_TYPESAFE_KEY, or in a file (first line, chmod 600; a file that others can
 # read is not used) and name the file here. The key is never written in this file's values,
 # the log, the page or the AI's command line or environment.
