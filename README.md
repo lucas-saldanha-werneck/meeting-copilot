@@ -209,7 +209,7 @@ Every key:
 | `MEETING_COPILOT_FACT_SEARCH` | `remote` with `REMOTE` and `REMOTE_PATHS`, else `local` | Where the fast fact search's text search runs: `remote` (ripgrep on that machine, over its copy of the folders, this Mac as the fallback) or `local`. See [Fast fact search](#fast-fact-search) |
 | `MEETING_COPILOT_FACT_RECENT_MIN` | `15` | With the remote text search, the files changed on this Mac in the last minutes (the server copy may not have them yet) are searched here at the same time, and their lines win. `0`: off |
 | `MEETING_COPILOT_FACT_SEARCH_REMOTE_S` | `3` | Seconds the remote text search may take before this Mac searches instead (and keeps searching for `REMOTE_RETRY_S`) |
-| `MEETING_COPILOT_REMOTE_RG` | `REMOTE` with `claude` made `rg` | The command that starts ripgrep on that machine, e.g. `ssh myserver docker exec -i copilot-ai rg` |
+| `MEETING_COPILOT_REMOTE_PYTHON` | `REMOTE` with `claude` made `python3` | The command that starts python3 on that machine (the search program goes in on stdin, so `docker exec` needs `-i`; ripgrep must be on its PATH), e.g. `ssh myserver docker exec -i copilot-ai python3` |
 | `MEETING_COPILOT_CONTEXT_FILE` | empty | A text file about you that both AI calls read: your name and role, your projects, what your notes folders and MCP tools hold, words the transcript tends to get wrong. The first 8000 characters are used |
 | `MEETING_COPILOT_LANGUAGE` | empty (the meeting's language) | Language for every suggestion, fact and Look answer, e.g. `Brazilian Portuguese`. The language menu on the page overrides it (see [Language](#language)) |
 | `MEETING_COPILOT_PROMPT_FILE` | empty (the built-in prompt) | A text file that replaces the built-in suggestions prompt. See [Your own prompt](#your-own-prompt) |
@@ -273,21 +273,30 @@ per 300 words sent. `tools/bench_facts.py questions.json` runs the same question
 own notes and prints seconds, cost and right or wrong.
 
 **Where the text search runs.** With `MEETING_COPILOT_REMOTE` and `REMOTE_PATHS` it runs on the server by
-default (`MEETING_COPILOT_FACT_SEARCH=remote`): ripgrep there, one ssh call per round with every word in it,
-over the server's copy of the search folders, with the line above and below each line found in the same answer
-(no second call). Paths come back as this Mac's. The same rules hold (hidden files, `FACT_SKIP`, no
-`.gitignore`, NFD text); the whole-word check and the scoring run here. Why: on an idle Mac ripgrep takes
-0.1-0.5 s, but on a busy Mac (the case the server is for) the search slows down with everything else. The
-server needs ripgrep (the `Dockerfile` in `tools/remote/` installs it; `REMOTE_RG` names another command).
-When the server search fails, takes more than `FACT_SEARCH_REMOTE_S` (3 s) or ripgrep is missing there, the
-round searches here, the log says `remote text search failed (...)`, and the next rounds search here for
+default (`MEETING_COPILOT_FACT_SEARCH=remote`): one ssh call per round runs `python3 -I -` there with
+`lib/factrank.py` on stdin (read from this Mac at each start, so the server never runs an older copy and
+nothing is installed there but python3 and ripgrep). It runs ripgrep over the server's copy of the search
+folders, does the whole-word check and the scoring there (the same code the Mac runs for a local search), and
+sends back only the best `2 x FACT_SNIPPETS` lines with the line above and below each, plus how many lines
+found each word. Paths come back as this Mac's. The same rules hold (hidden files, `FACT_SKIP`, no
+`.gitignore`, NFD text). Why: a question can find thousands of lines (up to 6.4 MB from ripgrep); sending them
+all made the Mac parse and score them, so a busy Mac was as slow with the server as without it. Now the Mac gets
+12-17 KB. Measured 27/11 on the author's notes (6 questions, search stage): idle Mac 0.40-0.56 s on the server
+against 0.15-0.5 s here (once 1.0 s); Mac with 32 busy processes (load about 150) 0.40-0.53 s on the server against
+0.37-2.52 s here and 0.38-3.31 s with the old raw answer. The server needs python3 and ripgrep (the
+`Dockerfile` in `tools/remote/` installs both; `REMOTE_PYTHON` names another command).
+When the server search fails, takes more than `FACT_SEARCH_REMOTE_S` (3 s), or python3 or ripgrep is missing
+there, the round searches here, the log says `remote text search failed (...)`, and the next rounds search here for
 `REMOTE_RETRY_S` (30 s); a search folder with no `REMOTE_PATHS` pair is always searched here.
 **The server's copy is only as new as its last sync** (`sync-notes.sh` from cron, every 10 minutes for
 example). So while the server searches, this Mac searches, at the same time, only the files in the same
 folders changed in the last `FACT_RECENT_MIN` minutes (15; `0`: off); for those files the Mac's lines replace
-the server's. Finding them is one walk of the folders (0.02-0.03 s for 7400 files; `mdfind` took 0.16-0.23 s
-and Spotlight's state for the Dropbox folder was unknown); with none, nothing more runs here. The log shows
-`search=0.45s/10/remote+2recent/0.05s` (2 recent files, searched here in 0.05 s).
+the server's. Finding those files is one walk of the folders (0.02-0.03 s for 7400 files; `mdfind` took
+0.16-0.23 s and Spotlight's state for the Dropbox folder was unknown); with none, nothing more runs here. The
+Mac then scores the server's lines and its own again over the word counts of both, so the scores compare (a
+word is rare or common across everything found, wherever it was found). The log shows
+`search=0.45s/10/remote/16.0KB+2recent/0.05s` (the server's answer was 16 KB; 2 recent files, searched here
+in 0.05 s).
 
 ### Your own prompt
 

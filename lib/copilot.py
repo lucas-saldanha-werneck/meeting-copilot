@@ -50,6 +50,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
+import factrank
 import tlscert
 
 __version__ = "0.18.0"
@@ -529,11 +530,11 @@ def _tool(value: str, name: str) -> str | None:
     return shutil.which(name) if sys.platform == "darwin" else None
 
 
-def remote_rg_command(remote: list[str]) -> list[str]:
-    """ripgrep on the remote machine: the REMOTE command with its last word claude (or /path/claude) made rg;
-    [] when REMOTE does not end in claude."""
+def remote_python_command(remote: list[str]) -> list[str]:
+    """python3 on the remote machine: the REMOTE command with its last word claude (or /path/claude) made
+    python3; [] when REMOTE does not end in claude."""
     if remote and os.path.basename(remote[-1]) == "claude":
-        return remote[:-1] + [remote[-1][:-len("claude")] + "rg"]
+        return remote[:-1] + [remote[-1][:-len("claude")] + "python3"]
     return []
 
 
@@ -854,23 +855,25 @@ class Settings:
         self.fact_check_effort = eff
         # file name patterns the text search skips (each .mbox in the notes has a .md summary next to it)
         self.fact_skip = [p.strip() for p in g("FACT_SKIP", "*.mbox,*.gz").split(",") if p.strip()]
-        # FACT_SEARCH: where that text search runs. remote (the default with REMOTE): ripgrep on the remote
-        # machine, one call per round, over its copy of the search folders (REMOTE_PATHS), so a busy Mac does not
-        # slow it down; this machine searches when it fails or takes over FACT_SEARCH_REMOTE_S. local: here.
-        # REMOTE_RG: the command that starts ripgrep there; default: REMOTE with its last word claude -> rg.
+        # FACT_SEARCH: where that text search runs. remote (the default with REMOTE): ripgrep and the ranking on
+        # the remote machine (lib/factrank.py, sent on stdin), one call per round, over its copy of the search
+        # folders (REMOTE_PATHS), so a busy Mac does not slow it down and gets only the best lines; this machine
+        # searches when it fails or takes over FACT_SEARCH_REMOTE_S. local: here.
+        # REMOTE_PYTHON: the command that starts python3 there (it needs ripgrep on its PATH and to pass stdin
+        # on, e.g. docker exec -i); default: REMOTE with its last word claude -> python3.
         where = g("FACT_SEARCH").strip().lower()
         if where not in ("", "remote", "local"):
             self.notices.append(f"MEETING_COPILOT_FACT_SEARCH must be remote or local, got: {where}")
             where = ""
         try:
-            self.remote_rg = shlex.split(g("REMOTE_RG")) or remote_rg_command(self.remote)
+            self.remote_python = shlex.split(g("REMOTE_PYTHON")) or remote_python_command(self.remote)
         except ValueError as ex:
-            self.notices.append(f"MEETING_COPILOT_REMOTE_RG could not be read ({ex}): the text search runs here")
-            self.remote_rg = []
-        can = bool(self.remote and self.remote_rg and self.remote_paths)
+            self.notices.append(f"MEETING_COPILOT_REMOTE_PYTHON could not be read ({ex}): the text search runs here")
+            self.remote_python = []
+        can = bool(self.remote and self.remote_python and self.remote_paths)
         if where == "remote" and not can:
             self.notices.append("MEETING_COPILOT_FACT_SEARCH=remote needs MEETING_COPILOT_REMOTE, REMOTE_PATHS and "
-                                "a REMOTE ending in claude (or MEETING_COPILOT_REMOTE_RG): the text search runs here")
+                                "a REMOTE ending in claude (or MEETING_COPILOT_REMOTE_PYTHON): the text search runs here")
         self.fact_search_where = "remote" if where != "local" and can else "local"
         self.fact_search_remote_s = self._num(g, "FACT_SEARCH_REMOTE_S", 3.0)
         # FACT_RECENT_MIN: with the remote search, the files changed here in the last minutes (the server's copy
@@ -1656,7 +1659,7 @@ def ssh_control_path() -> str:
 
 
 def remote_command(args: list[str], base: list[str] | None = None) -> list[str]:
-    """MEETING_COPILOT_REMOTE (or base, e.g. REMOTE_RG) plus the arguments. Through ssh the remote shell reads
+    """MEETING_COPILOT_REMOTE (or base, e.g. REMOTE_PYTHON) plus the arguments. Through ssh the remote shell reads
     the command line again, so each argument is quoted for it; ssh gets batch mode, a short connect timeout,
     keep-alives and connection sharing, unless the command sets one of those options itself."""
     base = list(S.remote if base is None else base)
@@ -2840,10 +2843,10 @@ FACT_JEV_TIMEOUT_S = 5.0
 FACT_SEARCH_TIMEOUT_S = 5.0
 FACT_CHECK_TIMEOUT_S = 25.0
 FACT_MAX_TERMS = 8
-FACT_LINE_CHARS = 300        # of one line found (a .jsonl line can be a whole conversation)
-FACT_PER_FILE = 200          # lines taken from one file
-FACT_FILE_MAX_BYTES = 20_000_000
-FACT_PATH_WEIGHT = 1.0       # a word in the file or folder name counts this much of a word in the line
+# the text search's limits and its ranking live in lib/factrank.py (the same code runs on the remote machine)
+FACT_LINE_CHARS = factrank.LINE_CHARS
+FACT_PER_FILE = factrank.PER_FILE
+FACT_FILE_MAX_BYTES = factrank.FILE_MAX_BYTES
 
 FACT_GATE_QUESTION = (
     "Does the `new` part of this meeting conversation ask for, or create a need for, one specific fact that "
@@ -2877,13 +2880,8 @@ our their what which who whom when where why how much many about just really yea
 please thanks know think remember need want tell said say get got let lets one
 """.split())
 
-FOLD_CLASS = {"a": "[aáàâãä]", "e": "[eéèêë]", "i": "[iíìîï]", "o": "[oóòôõö]", "u": "[uúùûü]", "c": "[cç]",
-              "n": "[nñ]"}
+fold, term_pattern, nfc, split_lines = factrank.fold, factrank.term_pattern, factrank.nfc, factrank.split_lines
 
-
-def fold(text: str) -> str:
-    """Lower case, without accents."""
-    return "".join(ch for ch in unicodedata.normalize("NFD", text.lower()) if not unicodedata.combining(ch))
 
 
 def fact_terms(texts: list[str], max_terms: int = FACT_MAX_TERMS) -> list[str]:
@@ -2904,26 +2902,6 @@ def fact_terms(texts: list[str], max_terms: int = FACT_MAX_TERMS) -> list[str]:
     return out
 
 
-def term_pattern(term: str, rg: bool = False) -> str:
-    """A regex that finds the term as a whole word (a plural s/es may follow), with or without accents (any
-    case, with the ignore-case flag), for Python's re on NFC text (see nfc()). rg=True: the pre-filter for
-    ripgrep, which reads the files as they are: the term anywhere (Unicode word boundaries make ripgrep 7-9
-    times slower with several patterns), each letter also followed by combining marks (an NFD "ç" is
-    c + U+0327). fact_search keeps only the lines the Python pattern finds."""
-    if rg:
-        return "".join(FOLD_CLASS[ch] + r"\p{M}*" if ch in FOLD_CLASS else re.escape(ch) for ch in term)
-    body = "".join(FOLD_CLASS.get(ch, re.escape(ch)) for ch in term)
-    return rf"\b{body}(?:e?s)?\b"
-
-
-def nfc(text: str) -> str:
-    return text if text.isascii() else unicodedata.normalize("NFC", text)
-
-
-def split_lines(text: str) -> list[str]:
-    """Lines as ripgrep numbers them: split at \\n only (a \\f or U+2028 inside a line stays in it)."""
-    return [ln[:-1] if ln.endswith("\r") else ln for ln in text.split("\n")]
-
 
 def find_rg() -> str | None:
     """ripgrep: on the PATH, else where Homebrew puts it (a copilot started at login has a short PATH)."""
@@ -2934,39 +2912,11 @@ def find_rg() -> str | None:
 
 
 def _rg_args(pats: list[str], skip: list[str], context: int = 0) -> list[str]:
-    # --no-ignore: every file a .gitignore/.ignore would hide is searched too, as the Python search does
-    # (hidden files and folders stay out in both)
-    args = ["-i", "-n", "--no-heading", "--with-filename", "--null", "--no-messages", "--color", "never",
-            "--no-ignore",
-            "--max-columns", str(FACT_LINE_CHARS), "--max-columns-preview", "--max-count", str(FACT_PER_FILE),
-            "--max-filesize", str(FACT_FILE_MAX_BYTES)]
-    if context:
-        args += ["--context", str(context)]
-    for g in skip:
-        args += ["-g", "!" + g]
-    for p in pats:
-        args += ["-e", p]
-    return args
+    return factrank.rg_args(pats, skip, context)
 
 
-def _rg_out(p: subprocess.CompletedProcess, ctx: dict | None = None) -> list[tuple[str, int, str]]:
-    """The lines ripgrep found: (path, number, text). ctx: gets {path: {number: text}} of every line printed,
-    the --context lines too (path NUL number - text; a line found has : after the number)."""
-    # 1: no line found; 2: an error, often one unreadable file among lines found (those are kept)
-    if p.returncode not in (0, 1) and not (p.returncode == 2 and p.stdout.strip()):
-        raise RuntimeError(f"rg exited {p.returncode}")
-    hits = []
-    for raw in p.stdout.decode("utf-8", "replace").split("\n"):
-        path, _, rest = raw.partition("\0")
-        m = re.match(r"(\d+)([:-])", rest)
-        if not m:
-            continue                         # the "--" between context groups, an empty last line
-        num, text = int(m.group(1)), rest[m.end():].rstrip("\r")
-        if m.group(2) == ":":
-            hits.append((path, num, nfc(text)[:FACT_LINE_CHARS]))
-        if ctx is not None:
-            ctx.setdefault(path, {})[num] = text
-    return hits
+def _rg_out(p: subprocess.CompletedProcess) -> list[tuple[str, int, str]]:
+    return factrank.rg_out(p.returncode, p.stdout)
 
 
 def _rg_hits(rg: str, pats: list[str], dirs: list[Path], skip: list[str]) -> list[tuple[str, int, str]]:
@@ -3008,17 +2958,37 @@ class FactRemote:
     why = ""
 
 
-def _rg_remote_hits(pats: list[str], dirs: list[Path], skip: list[str],
-                    ctx: dict) -> list[tuple[str, int, str]]:
-    """ripgrep on the remote machine (REMOTE_RG), one call, over the remote copy of dirs (REMOTE_PATHS), with
-    one line of context around each line found (so no second call); paths come back as this machine's."""
+_FACTRANK_SRC: list[bytes] = []
+
+
+def factrank_source() -> bytes:
+    """lib/factrank.py as this process loaded it (read once): the program the remote machine runs, so it is
+    always the same code that ranks here."""
+    if not _FACTRANK_SRC:
+        _FACTRANK_SRC.append(Path(factrank.__file__).read_bytes())
+    return _FACTRANK_SRC[0]
+
+
+def _remote_ranked(terms: list[str], weights: list[float] | None, n: int, dirs: list[Path],
+                   skip: list[str]) -> dict:
+    """ripgrep and the ranking on the remote machine (REMOTE_PYTHON runs lib/factrank.py, sent on stdin), one
+    call, over the remote copy of dirs (REMOTE_PATHS): {counts, total, hits, bytes}, the hits (the best
+    n * factrank.POOL lines, each with its context and word ids) under this machine's paths."""
     pairs = [(str(d), remote_dir(d, S.remote_paths)) for d in dirs]
-    args = remote_command(_rg_args(pats, skip, context=1) + ["--", *[r for _, r in pairs]], base=S.remote_rg)
-    p = subprocess.run(args, capture_output=True, timeout=S.fact_search_remote_s, stdin=subprocess.DEVNULL)
-    if p.returncode == 255 or p.returncode >= 126:   # ssh failed; rg not found or not runnable there
+    req = {"terms": terms, "weights": weights, "n": n, "dirs": [r for _, r in pairs], "skip": skip,
+           "timeout": S.fact_search_remote_s}
+    args = remote_command(["-I", "-", json.dumps(req, separators=(",", ":"))], base=S.remote_python)
+    p = subprocess.run(args, input=factrank_source(), capture_output=True, timeout=S.fact_search_remote_s)
+    if p.returncode != 0:      # ssh failed (255); no python3 there (127); the search failed there (3)
         raise RuntimeError(f"exit {p.returncode}: " + p.stderr.decode("utf-8", "replace").strip()[-150:])
-    there: dict = {}
-    hits = _rg_out(p, there)
+    try:
+        out = json.loads(p.stdout)
+        counts, total = [int(c) for c in out["counts"]], int(out["total"])
+        if len(counts) != len(terms):
+            raise ValueError("counts for other words")
+        raw = list(out["hits"])
+    except (ValueError, KeyError, TypeError) as ex:
+        raise RuntimeError(f"unreadable answer ({ex}): {p.stdout[:60]!r}") from None
     back = sorted(pairs, key=lambda x: -len(x[1]))       # the deepest remote folder first
 
     def local(path: str) -> str | None:
@@ -3027,23 +2997,28 @@ def _rg_remote_hits(pats: list[str], dirs: list[Path], skip: list[str],
                 rel = path[len(r):].lstrip("/")
                 return os.path.join(d, rel) if rel else d
         return None
-    out = []
-    for path, num, text in hits:
-        lp = local(path)
-        if lp:
-            out.append((lp, num, text))
-    for path, lines in there.items():
-        lp = local(path)
-        if lp:
-            ctx[lp] = lines
-    return out
+    ok = range(len(terms))
+    hits = []
+    for h in raw:
+        try:
+            lp = local(str(h["path"]))
+            hit = {"path": lp, "line": int(h["line"]), "text": str(h["text"]),
+                   "ids": [int(i) for i in h["ids"]], "pids": [int(i) for i in h["pids"]],
+                   "context": str(h.get("context", ""))}
+        except (KeyError, TypeError, ValueError):
+            continue
+        if lp and all(i in ok for i in hit["ids"] + hit["pids"]):
+            hits.append(hit)
+    return {"counts": counts, "total": total, "hits": hits, "bytes": len(p.stdout)}
 
 
 def _search_hits(terms: list[str], dirs: list[Path], skip: list[str], rg: str | None, remote: bool,
-                 ctx: dict, info: dict | None) -> list[tuple[str, int, str]]:
-    """The lines found: on the remote machine for the folders it has a copy of (when remote and it answers),
-    here for the rest and as the fallback. info["search_where"]: remote, local, local-remote-failed (it failed
-    this round) or local-remote-out (it failed in the last REMOTE_RETRY_S, or the remote AI is out).
+                 info: dict | None, weights: list[float] | None = None,
+                 n: int = 10) -> tuple[list[tuple[str, int, str]], dict | None]:
+    """(lines found here, the remote machine's ranked answer or None). The remote machine searches and ranks
+    the folders it has a copy of (when remote and it answers; see _remote_ranked), this machine the rest and
+    everything when it fails. info["search_where"]: remote, local, local-remote-failed (it failed this round)
+    or local-remote-out (it failed in the last REMOTE_RETRY_S, or the remote AI is out).
     The server's copy lags behind (synced every few minutes), so while it searches, the files here changed in
     the last FACT_RECENT_MIN minutes are searched here at the same time; for those files this machine's lines
     replace the server's."""
@@ -3057,6 +3032,7 @@ def _search_hits(terms: list[str], dirs: list[Path], skip: list[str], rg: str | 
         return _rg_hits(rg, rg_pats, places, skip) if rg else _py_hits(py_pats, places, skip)
     here, where = list(dirs), "local"
     hits: list[tuple[str, int, str]] = []
+    ranked: dict | None = None
     there = [d for d in dirs if remote_dir(d, S.remote_paths)] if remote else []
     if there:
         if _mono() < FactRemote.off_until or not REMOTE.use():
@@ -3077,7 +3053,7 @@ def _search_hits(terms: list[str], dirs: list[Path], skip: list[str], rg: str | 
             if th:
                 th.start()
             try:
-                hits = _rg_remote_hits(rg_pats, there, skip, ctx)
+                ranked = _remote_ranked(terms, weights, n, there, skip)
                 here, where = [d for d in dirs if d not in there], "remote"
             except (OSError, RuntimeError, subprocess.SubprocessError) as ex:
                 why = (f"no answer in {S.fact_search_remote_s:g} s" if isinstance(ex, subprocess.TimeoutExpired)
@@ -3086,26 +3062,25 @@ def _search_hits(terms: list[str], dirs: list[Path], skip: list[str], rg: str | 
                 where = "local-remote-failed"
                 print(f"{clock(now())} data: remote text search failed ({why}), searching here "
                       f"(the next try there in {S.remote_retry_s:g} s)", flush=True)
-                hits = []
-                ctx.clear()
             if th:
                 th.join(FACT_SEARCH_TIMEOUT_S + 1)
-            if where == "remote" and th:
+            if ranked is not None and th:
                 if "error" in recent:
                     raise recent["error"]           # the round fails as a local search failure would
                 if "files" not in recent:
                     raise RuntimeError("the search of the recent files did not finish")
                 mine = set(recent["files"])
                 if mine:
-                    hits = [h for h in hits if h[0] not in mine] + recent["hits"]
-                    for path in mine:
-                        ctx.pop(path, None)         # their context is read from this machine's file
+                    ranked["hits"] = [h for h in ranked["hits"] if h["path"] not in mine]
+                    hits = list(recent["hits"])
                 if info is not None:
                     info["recent"], info["recent_s"] = len(mine), recent["s"]
+            if ranked is not None and info is not None:
+                info["remote_bytes"] = ranked["bytes"]
     hits += here_hits(here)
     if info is not None:
         info["search_where"] = where
-    return hits
+    return hits, ranked
 
 
 def _py_hits(pats: list[str], dirs: list[Path], skip: list[str]) -> list[tuple[str, int, str]]:
@@ -3148,73 +3123,38 @@ def _py_hits(pats: list[str], dirs: list[Path], skip: list[str]) -> list[tuple[s
 def fact_search(terms: list[str], dirs: list[Path], skip: list[str], n: int = 10,
                 rg: str | None = "auto", weights: list[float] | None = None, remote: bool = False,
                 info: dict | None = None) -> list[dict]:
-    """The n best lines for these words in the folders: [{path, line, text, context, score}], best first. A
-    line scores the rarity (in this search) of each word in it, plus half that for a word only in its file's
+    """The n best lines for these words in the folders: [{path, line, text, score, context}], best first. A
+    line scores the rarity (in this search) of each word in it, plus as much for a word only in its file's
     path (a WhatsApp export named after the company), each times its weight (Jev: how much the word names
-    what is asked; 1 without Jev); near-identical lines count once. remote: ripgrep runs on the remote machine
-    (FACT_SEARCH=remote), this machine's search when it fails; info gets search_where."""
-    import math
+    what is asked; 1 without Jev); near-identical lines count once (factrank.rank). remote: ripgrep and the
+    ranking run on the remote machine (FACT_SEARCH=remote), which sends only its best lines and the counts of
+    each word; with this machine's own lines (recent files, folders the server has no copy of) every line is
+    scored again over the counts of both, so the scores compare. This machine's search when it fails; info
+    gets search_where."""
     if not terms or not dirs:
         return []
-    pats = [term_pattern(t) for t in terms]
-    ctx: dict[str, dict[int, str]] = {}      # the lines around each line found, when the remote search sent them
-    hits = _search_hits(terms, dirs, skip, rg, remote, ctx, info)
-    if not hits:
+    hits, ranked = _search_hits(terms, dirs, skip, rg, remote, info, weights, n)
+    cands, counts = factrank.describe(hits, terms)
+    total = len(hits)
+    if ranked is not None:
+        cands += ranked["hits"]
+        counts = [a + b for a, b in zip(counts, ranked["counts"])]
+        total += ranked["total"]
+    if not cands:
         return []
-    rxs = [re.compile(p, re.IGNORECASE) for p in pats]
     roots = [str(d) for d in dirs]
-    seen_in = [[i for i, r in enumerate(rxs) if r.search(text)] for _, _, text in hits]
-    count = [0] * len(rxs)
-    for ids in seen_in:
-        for i in ids:
-            count[i] += 1
-    w = weights if weights and len(weights) == len(rxs) else [1.0] * len(rxs)
-    idf = [w[i] * math.log(1 + len(hits) / (1 + c)) for i, c in enumerate(count)]
-    scored = []
-    path_terms: dict[str, list[int]] = {}
-    for (path, num, text), ids in zip(hits, seen_in):
-        if path not in path_terms:
-            name = nfc(os.path.basename(os.path.dirname(path)) + "/" + os.path.basename(path))
-            path_terms[path] = [i for i, r in enumerate(rxs) if r.search(name)]
-        score = sum(idf[i] for i in ids) + FACT_PATH_WEIGHT * sum(idf[i] for i in path_terms[path] if i not in ids)
-        if not ids or score <= 0:
-            continue
+    out = []
+    best = factrank.rank(cands, counts, total, weights, n, roots)
+    factrank.add_contexts(best)         # the line above and below; the remote machine sent its lines' own
+    for c in best:
+        path = c["path"]
         rank = next((k for k, r in enumerate(roots) if path.startswith(r)), len(roots))
-        scored.append((-score, rank, path, num, text))
-    scored.sort()
-    out, keys = [], set()
-    for neg, rank, path, num, text in scored:
-        key = fold(" ".join(text.split()))[:120]
-        if key in keys:
-            continue
-        keys.add(key)
         root = roots[rank] if rank < len(roots) else ""
         shown = os.path.relpath(path, os.path.dirname(root)) if root else path
-        out.append({"path": Path(shown).as_posix(), "line": num, "text": text.strip(), "score": round(-neg, 3),
-                    "file": path})
-        if len(out) >= n:
-            break
-    files: dict[str, list[str]] = {}    # one line of context above and below; each file read once
-    for s in out:
-        path = s.pop("file")
-        if path in ctx:
-            near = ctx[path]
-            s["context"] = "\n".join(nfc(near[k].strip())[:FACT_LINE_CHARS] for k in range(s["line"] - 1,
-                                                                                            s["line"] + 2)
-                                     if near.get(k, "").strip())
-            continue
-        if path not in files:
-            try:
-                with open(path, encoding="utf-8", errors="replace", newline="") as f:
-                    files[path] = split_lines(f.read())
-            except OSError:
-                files[path] = []
-        s["context"] = _context(files[path], s["line"])
+        out.append({"path": Path(shown).as_posix(), "line": c["line"], "text": c["text"].strip(),
+                    "score": c["score"], "context": c["context"]})
     return out
 
-
-def _context(lines: list[str], num: int) -> str:
-    return "\n".join(nfc(ln.strip())[:FACT_LINE_CHARS] for ln in lines[max(0, num - 2):num + 1] if ln.strip())
 
 
 def _parts(lines: list[dict], seen: int) -> tuple[str, str]:
@@ -3358,6 +3298,7 @@ def fact_log(info: dict) -> str:
     if "search_s" in info:
         parts.append(f"search={info['search_s']:.2f}s/{info['found']}"
                      + (f"/{info['search_where']}" if S.remote and info.get("search_where") else "")
+                     + (f"/{info['remote_bytes'] / 1000:.1f}KB" if "remote_bytes" in info else "")
                      + (f"+{info['recent']}recent/{info.get('recent_s', 0):.2f}s" if info.get("recent") else ""))
     if "pick_s" in info:
         parts.append(f"pick={'failed' if info.get('pick_err') else info.get('pick') or '-'}:"
@@ -5877,7 +5818,7 @@ def main(argv=None) -> None:
         print(f"AI calls run on the remote machine ({shlex.join(S.remote)}), and here while it does not answer",
               flush=True)
         if S.fact_mode == "fast" and S.fact_search_where == "remote":
-            print(f"the fact text search runs there too ({shlex.join(S.remote_rg)}), here when it fails",
+            print(f"the fact text search runs there too ({shlex.join(S.remote_python)}), here when it fails",
                   flush=True)
     if not S.claude:
         msg = ("claude command not found: only the speaking metrics and warnings will work "
