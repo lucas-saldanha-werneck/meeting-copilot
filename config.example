@@ -41,8 +41,11 @@
 # words name it, a text search (ripgrep when installed) finds the best lines in the search
 # folders, Jev picks one, and only when Jev is unsure one call to a small model (no tools)
 # reads those lines. The AI with tools (DATA_MODEL) runs only when this cannot answer.
-# The new lines of the conversation and the lines found go to TypeSafe.
-# fast or tools (only the AI with tools). Default: fast when the key and folders are set.
+# The transcript of the last 3 minutes, the search words and the lines found in your
+# notes (with their file names) go to TypeSafe, so it is off unless set here (the
+# copilot says so at start). With MCP_CONFIG/MCP_TOOLS, a fact the notes do not have
+# (the small model says EMPTY) still goes to the AI with tools, which has the MCP tools.
+# fast or tools (only the AI with tools). Default: tools.
 #MEETING_COPILOT_FACT_MODE=
 # Jev must be at least this sure (0 to 1) that a fact is asked, else nothing is searched.
 #MEETING_COPILOT_FACT_GATE_MIN=0.5
@@ -192,7 +195,8 @@
 #MEETING_COPILOT_FACT_SEARCH_REMOTE_S=3
 # The command that starts python3 there (it gets the search program on stdin, so
 # docker exec needs -i; ripgrep must be on its PATH). Empty: REMOTE with its last
-# word claude made python3 (ssh myserver docker exec -i copilot-ai python3).
+# word (claude or /path/claude) made plain python3, found on that machine's PATH
+# (ssh myserver docker exec -i copilot-ai python3).
 #MEETING_COPILOT_REMOTE_PYTHON=
 
 # Intervals in seconds: suggestions, fact search, reading the transcript.

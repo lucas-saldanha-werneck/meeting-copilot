@@ -532,9 +532,10 @@ def _tool(value: str, name: str) -> str | None:
 
 def remote_python_command(remote: list[str]) -> list[str]:
     """python3 on the remote machine: the REMOTE command with its last word claude (or /path/claude) made
-    python3; [] when REMOTE does not end in claude."""
+    plain python3, found on that machine's PATH (claude's folder, /usr/local/bin for a npm install, need not
+    have a python3); [] when REMOTE does not end in claude."""
     if remote and os.path.basename(remote[-1]) == "claude":
-        return remote[:-1] + [remote[-1][:-len("claude")] + "python3"]
+        return remote[:-1] + ["python3"]
     return []
 
 
@@ -829,7 +830,8 @@ class Settings:
         # The fast fact search (see fact_fast): Jev asks "is a fact wanted?", a plain text search of the search
         # folders finds lines, Jev picks one, and only when Jev is unsure one call to a small model (no tools)
         # reads the lines. fast: that, with the AI-with-tools search as the fallback; tools: only the old one.
-        # Default fast when the TypeSafe key is there and there are search folders.
+        # Default tools: fast sends the transcript, the search words and the lines found to TypeSafe, so it
+        # runs only when asked for (and with the TypeSafe key and search folders).
         mode = g("FACT_MODE").strip().lower()
         if mode not in ("", "fast", "tools"):
             self.notices.append(f"MEETING_COPILOT_FACT_MODE must be fast or tools, got: {mode}")
@@ -837,7 +839,7 @@ class Settings:
         if mode == "fast" and not (has_key and self.search_dirs):
             self.notices.append("MEETING_COPILOT_FACT_MODE=fast needs a TypeSafe key and search folders: "
                                 "the fact search uses the AI with tools")
-        self.fact_mode = "fast" if mode != "tools" and has_key and self.search_dirs else "tools"
+        self.fact_mode = "fast" if mode == "fast" and has_key and self.search_dirs else "tools"
         self.fact_gate_min = self._share(g, "FACT_GATE_MIN", 0.5)     # Jev: "a fact is wanted" at least this sure
         self.fact_pick_min = self._share(g, "FACT_PICK_MIN", 0.8)     # Jev's pick shown as is at least this sure
         check = cfg.get("MEETING_COPILOT_FACT_CHECK_MODEL")          # "" / off: no small-model call
@@ -2839,6 +2841,9 @@ def is_empty(text: str) -> bool:
 # FACT_PICK_MIN, one FACT_CHECK_MODEL call (no tools, one turn) reads the lines and answers. The old way
 # runs only when this cannot answer (Jev out, no line found, the small-model call failed).
 
+FACT_FAST_NOTICE = ("fast fact search on (MEETING_COPILOT_FACT_MODE=fast): each fact round sends TypeSafe (Jev) "
+                    "the transcript of the last 3 minutes, the search words and the lines found in your notes, "
+                    "with their file names")
 FACT_JEV_TIMEOUT_S = 5.0
 FACT_SEARCH_TIMEOUT_S = 5.0
 FACT_CHECK_TIMEOUT_S = 25.0
@@ -2943,7 +2948,10 @@ def recent_files(dirs: list[Path], skip: list[str], minutes: float) -> list[str]
                     if e.is_dir(follow_symlinks=False):
                         stack.append(e.path)
                     elif e.is_file() and not any(fnmatch.fnmatch(e.name, g) for g in skip):
-                        st = e.stat()
+                        try:
+                            st = e.stat()
+                        except OSError:
+                            continue          # gone since the listing (Dropbox replacing it): the rest still count
                         if st.st_mtime >= cut and st.st_size <= FACT_FILE_MAX_BYTES:
                             out.append(e.path)
         except OSError:
@@ -2969,15 +2977,29 @@ def factrank_source() -> bytes:
     return _FACTRANK_SRC[0]
 
 
+FACT_REQ_MAX_BYTES = 100_000     # the request is one argument there (Linux: at most 128 KB for one)
+
+
 def _remote_ranked(terms: list[str], weights: list[float] | None, n: int, dirs: list[Path],
-                   skip: list[str]) -> dict:
+                   skip: list[str], exclude: list[str] | None = None) -> dict:
     """ripgrep and the ranking on the remote machine (REMOTE_PYTHON runs lib/factrank.py, sent on stdin), one
     call, over the remote copy of dirs (REMOTE_PATHS): {counts, total, hits, bytes}, the hits (the best
-    n * factrank.POOL lines, each with its context and word ids) under this machine's paths."""
+    n * factrank.POOL lines, each with its context and word ids) under this machine's paths. exclude: files
+    this machine searches itself (its recent files), left out there, lines and counts. A warning there
+    (ripgrep's exit 2 with nothing found) is logged; the answer still counts."""
     pairs = [(str(d), remote_dir(d, S.remote_paths)) for d in dirs]
     req = {"terms": terms, "weights": weights, "n": n, "dirs": [r for _, r in pairs], "skip": skip,
            "timeout": S.fact_search_remote_s}
-    args = remote_command(["-I", "-", json.dumps(req, separators=(",", ":"))], base=S.remote_python)
+    ex = [r for r in (remote_dir(Path(f), S.remote_paths) for f in exclude or []) if r]
+    if ex:
+        req["exclude"] = ex
+    arg = json.dumps(req, separators=(",", ":"))
+    if len(arg.encode()) > FACT_REQ_MAX_BYTES and ex:
+        del req["exclude"]       # too many recent files to name: their lines may count twice this round
+        arg = json.dumps(req, separators=(",", ":"))
+        print(f"{clock(now())} data: {len(ex)} recent files are too many to leave out of the remote search; "
+              "their lines may count twice this round", flush=True)
+    args = remote_command(["-I", "-", arg], base=S.remote_python)
     p = subprocess.run(args, input=factrank_source(), capture_output=True, timeout=S.fact_search_remote_s)
     if p.returncode != 0:      # ssh failed (255); no python3 there (127); the search failed there (3)
         raise RuntimeError(f"exit {p.returncode}: " + p.stderr.decode("utf-8", "replace").strip()[-150:])
@@ -2987,8 +3009,11 @@ def _remote_ranked(terms: list[str], weights: list[float] | None, n: int, dirs: 
         if len(counts) != len(terms):
             raise ValueError("counts for other words")
         raw = list(out["hits"])
-    except (ValueError, KeyError, TypeError) as ex:
+        warning = str(out.get("warning") or "")
+    except (ValueError, KeyError, TypeError, AttributeError) as ex:
         raise RuntimeError(f"unreadable answer ({ex}): {p.stdout[:60]!r}") from None
+    if warning:
+        print(f"{clock(now())} data: remote text search: {warning[:200]}", flush=True)
     back = sorted(pairs, key=lambda x: -len(x[1]))       # the deepest remote folder first
 
     def local(path: str) -> str | None:
@@ -3009,7 +3034,7 @@ def _remote_ranked(terms: list[str], weights: list[float] | None, n: int, dirs: 
             continue
         if lp and all(i in ok for i in hit["ids"] + hit["pids"]):
             hits.append(hit)
-    return {"counts": counts, "total": total, "hits": hits, "bytes": len(p.stdout)}
+    return {"counts": counts, "total": total, "hits": hits, "bytes": len(p.stdout), "warning": warning}
 
 
 def _search_hits(terms: list[str], dirs: list[Path], skip: list[str], rg: str | None, remote: bool,
@@ -3021,7 +3046,8 @@ def _search_hits(terms: list[str], dirs: list[Path], skip: list[str], rg: str | 
     or local-remote-out (it failed in the last REMOTE_RETRY_S, or the remote AI is out).
     The server's copy lags behind (synced every few minutes), so while it searches, the files here changed in
     the last FACT_RECENT_MIN minutes are searched here at the same time; for those files this machine's lines
-    replace the server's."""
+    replace the server's (the server leaves them out, lines and counts, so none counts twice). When that
+    search here fails, the server's answer is used without them (logged), not thrown away."""
     rg_pats = [term_pattern(t, rg=True) for t in terms]
     py_pats = [term_pattern(t) for t in terms]
     rg = find_rg() if rg == "auto" else rg
@@ -3039,21 +3065,21 @@ def _search_hits(terms: list[str], dirs: list[Path], skip: list[str], rg: str | 
             where = "local-remote-out"
         else:
             recent: dict = {}
+            t_recent = _mono()
+            # the walk first (0.02-0.03 s for 7400 files), so the server is told which files to leave out
+            files = recent_files(there, skip, S.fact_recent_min) if S.fact_recent_min > 0 else []
 
             def search_recent() -> None:
                 try:
-                    t = _mono()
-                    files = recent_files(there, skip, S.fact_recent_min)
-                    recent["files"] = files
                     recent["hits"] = here_hits(files)
-                    recent["s"] = _mono() - t
                 except (OSError, RuntimeError, subprocess.SubprocessError) as ex:
                     recent["error"] = ex
-            th = threading.Thread(target=search_recent, daemon=True) if S.fact_recent_min > 0 else None
+                recent["s"] = _mono() - t_recent
+            th = threading.Thread(target=search_recent, daemon=True) if files else None
             if th:
                 th.start()
             try:
-                ranked = _remote_ranked(terms, weights, n, there, skip)
+                ranked = _remote_ranked(terms, weights, n, there, skip, exclude=files)
                 here, where = [d for d in dirs if d not in there], "remote"
             except (OSError, RuntimeError, subprocess.SubprocessError) as ex:
                 why = (f"no answer in {S.fact_search_remote_s:g} s" if isinstance(ex, subprocess.TimeoutExpired)
@@ -3064,17 +3090,22 @@ def _search_hits(terms: list[str], dirs: list[Path], skip: list[str], rg: str | 
                       f"(the next try there in {S.remote_retry_s:g} s)", flush=True)
             if th:
                 th.join(FACT_SEARCH_TIMEOUT_S + 1)
-            if ranked is not None and th:
-                if "error" in recent:
-                    raise recent["error"]           # the round fails as a local search failure would
-                if "files" not in recent:
-                    raise RuntimeError("the search of the recent files did not finish")
-                mine = set(recent["files"])
-                if mine:
-                    ranked["hits"] = [h for h in ranked["hits"] if h["path"] not in mine]
+            if ranked is not None and S.fact_recent_min > 0:
+                mine = set(files)
+                # the server left these files out; any line of them it still sent (an older copy) goes
+                ranked["hits"] = [h for h in ranked["hits"] if h["path"] not in mine]
+                if "hits" in recent:
                     hits = list(recent["hits"])
+                elif files:
+                    # the server answered: its lines still count, only the recent files are missing this round
+                    err = recent.get("error")
+                    why = (" ".join(str(err).split())[:200] or type(err).__name__) if err else "did not finish"
+                    print(f"{clock(now())} data: search of the {len(files)} recent file(s) here failed ({why}); "
+                          "using the server's answer without them", flush=True)
+                    if info is not None:
+                        info["recent_err"] = True
                 if info is not None:
-                    info["recent"], info["recent_s"] = len(mine), recent["s"]
+                    info["recent"], info["recent_s"] = len(files), recent.get("s", _mono() - t_recent)
             if ranked is not None and info is not None:
                 info["remote_bytes"] = ranked["bytes"]
     hits += here_hits(here)
@@ -3111,7 +3142,7 @@ def _py_hits(pats: list[str], dirs: list[Path], skip: list[str]) -> list[tuple[s
                 for i, ln in enumerate(split_lines(data.decode("utf-8", "replace")), 1):
                     ln = nfc(ln)
                     if rx.search(ln):
-                        hits.append((path, i, ln[:FACT_LINE_CHARS]))
+                        hits.append((path, i, ln[:factrank.SCAN_CHARS]))   # describe() cuts it for showing
                         n += 1
                         if n >= FACT_PER_FILE:
                             break
@@ -3134,7 +3165,7 @@ def fact_search(terms: list[str], dirs: list[Path], skip: list[str], n: int = 10
     if not terms or not dirs:
         return []
     hits, ranked = _search_hits(terms, dirs, skip, rg, remote, info, weights, n)
-    cands, counts = factrank.describe(hits, terms)
+    cands, counts = factrank.describe(hits, terms, [str(d) for d in dirs])
     total = len(hits)
     if ranked is not None:
         cands += ranked["hits"]
@@ -3182,7 +3213,10 @@ def fact_jev_error(why: str, then: str = "the fact search uses the AI with tools
 
 def fact_fast(lines: list[dict], seen: int, shown: list[str], msg: str, info: dict) -> str | None:
     """The fast fact search for one data round: the fact's markdown, "" when there is nothing to show, None when
-    it cannot tell (the old search runs then). info gets the stages: gate, terms, search, pick, check, cost."""
+    it cannot tell (the old search runs then). info gets the stages: gate, terms, search, pick, check, cost.
+    Jev's gate says no fact is asked: "" (no AI, no MCP). A fact is asked but the notes do not have it (no line
+    found, Jev unsure with no check model, the check model says EMPTY): None when MCP tools are configured,
+    so the old search with them still gets a chance (see fact_mcp_on)."""
     before, new = _parts(lines, seen)
     if not new:
         return ""
@@ -3244,8 +3278,9 @@ def fact_fast(lines: list[dict], seen: int, shown: list[str], msg: str, info: di
     try:
         a = res["answers"]["q"]
         pick = a["choice"]
-        prob = float((a.get("probabilities") or {}).get(pick, a.get("confidence", 0.0)))
-    except (LookupError, TypeError, ValueError):
+        probs = a.get("probabilities")
+        prob = float(probs[pick] if isinstance(probs, dict) and pick in probs else a.get("confidence", 0.0))
+    except (LookupError, TypeError, ValueError, AttributeError):
         fact_jev_error(why or "bad answer", "the small model reads the lines" if S.fact_check_model
                        else "the fact search uses the AI with tools")
         info["pick_err"] = True
@@ -3285,7 +3320,18 @@ def fact_fast(lines: list[dict], seen: int, shown: list[str], msg: str, info: di
         info["stage"] = "check failed (error result)"
         return None
     info["stage"] = "checked"
+    if is_empty(text) and fact_mcp_on():
+        # a fact is asked and the notes did not have it: the MCP tools (a chat history) may; the old search
+        # with them runs next (data_round)
+        info["stage"] = "checked: EMPTY, MCP next"
+        return None
     return "" if is_empty(text) else text
+
+
+def fact_mcp_on() -> bool:
+    """MCP tools configured (MCP_CONFIG with an MCP_TOOLS list): the fast search hands a fact it could not
+    find in the notes to the AI with tools, which also has those."""
+    return bool(S.mcp_config and S.mcp_tools)
 
 
 def fact_log(info: dict) -> str:
@@ -3344,9 +3390,9 @@ def data_round(queued: float | None = None) -> None:
     t0 = now()
     info: dict = {}
     text = fact_fast(lines, seen, shown, msg, info) if S.fact_mode == "fast" else None
-    if text is None:                    # the old way: the AI searches with tools
+    if text is None:                    # the old way: the AI searches with tools (and MCP tools, if any)
         if info:
-            info["stage"] = (info.get("stage") or "jev out") + ", tools"
+            info["stage"] = (info.get("stage") or "jev out") + (", tools+MCP" if fact_mcp_on() else ", tools")
         text = fact_tools(msg)[0]
     ts = now()
     with E.lock:
@@ -5814,6 +5860,8 @@ def main(argv=None) -> None:
                          "Install and run Muesli, or point MEETING_COPILOT_DB / --db at its muesli.db.")
     for n in S.notices:
         print(f"note: {n}", flush=True)
+    if S.fact_mode == "fast":
+        print(FACT_FAST_NOTICE, flush=True)
     if S.remote:
         print(f"AI calls run on the remote machine ({shlex.join(S.remote)}), and here while it does not answer",
               flush=True)

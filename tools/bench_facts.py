@@ -46,7 +46,7 @@ def one(mode: str, q: str) -> dict:
         if text is None:
             text, out = copilot.fact_tools(msg)
             cost = (cost or 0.0) + (out.get("total_cost_usd") or 0.0)
-            info["stage"] = (info.get("stage") or "jev out") + ", tools"
+            info["stage"] = (info.get("stage") or "jev out") + (", tools+MCP" if copilot.fact_mcp_on() else ", tools")
     else:
         text, out = copilot.fact_tools(msg)
         cost = out.get("total_cost_usd")
@@ -64,6 +64,8 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         cfg = copilot.load_config()
         cfg["MEETING_COPILOT_DATA_DIR"] = tmp
+        if args.mode != "tools":
+            cfg["MEETING_COPILOT_FACT_MODE"] = "fast"     # opt-in in the config; here it is what is measured
         copilot.S = copilot.Settings(cfg)
         copilot.REMOTE.reset()
         if copilot.S.fact_mode != "fast" and args.mode != "tools":

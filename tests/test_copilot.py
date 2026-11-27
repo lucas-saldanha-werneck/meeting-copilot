@@ -3874,6 +3874,44 @@ class FactSearch(unittest.TestCase):
         fake(1, "")
         self.assertEqual(copilot.fact_search(["tax"], self.dirs, [], 10, rg=rg), [])
 
+    def check_long_line(self, rg):
+        # review 2, item 1: a fact far into a long line (a .jsonl conversation) is found, and shown as a
+        # window around its words, not the line's start; no ripgrep "omitted" mark
+        self.write("raw/chat.jsonl", '{"m":"tax ' + "a" * 4000 + ' the ACME tax ID is 77.777.777/0001-77 ok '
+                   + "b" * 3000 + '"}\nnext line\n')
+        out = copilot.fact_search(["tax", "acme"], self.dirs, ["*.mbox", "*.gz"], 10, rg=rg)
+        hit = [s for s in out if s["path"] == "raw/chat.jsonl"]
+        self.assertEqual(len(hit), 1, out)
+        text = hit[0]["text"]
+        self.assertIn("ACME tax ID is 77.777.777/0001-77", text)
+        self.assertTrue(text.startswith("...") and text.endswith("..."), text[:20])
+        self.assertLessEqual(len(text), copilot.FACT_LINE_CHARS + 6)
+        self.assertNotIn("omitted", text)
+        self.assertIn("77.777.777", hit[0]["context"].splitlines()[0])      # the context shows the same window
+        self.assertEqual(hit[0]["context"].splitlines()[1], "next line")
+
+    def test_long_line_without_ripgrep(self):
+        self.check_long_line(None)
+
+    @unittest.skipUnless(copilot.find_rg(), "ripgrep is not installed here")
+    def test_long_line_with_ripgrep(self):
+        self.check_long_line(copilot.find_rg())
+
+    def test_clip_and_omitted_mark(self):
+        fr = copilot.factrank
+        self.assertEqual(fr.rg_out(0, b"/n/a.md\x001:abc" + fr.OMITTED.encode() + b"\n"), [("/n/a.md", 1, "abc")])
+        self.assertEqual(fr.clip("short", []), "short")
+        text = "x " * 1000 + "acme tax 9" + " y" * 1000
+        a = text.index("acme")
+        out = fr.clip(text, [(a, a + 4, [1]), (a + 5, a + 8, [0])], 50)
+        self.assertIn("acme tax 9", out)
+        self.assertTrue(out.startswith("...") and out.endswith("..."))
+        # the window with the most words wins over the first match
+        text = "tax " + "z " * 500 + "acme tax 8" + " q" * 500
+        b = text.index("acme")
+        out = fr.clip(text, [(0, 3, [0]), (b, b + 4, [1]), (b + 5, b + 8, [0])], 40)
+        self.assertIn("acme tax 8", out)
+
     def test_weights_rank_the_named_word_first(self):
         # "garden" alone is in other.md and the orçamento page; a weight near 0 for "rules" leaves other.md
         # behind the page that has the word Jev rated high
@@ -3909,10 +3947,15 @@ class FactSearchRemote(unittest.TestCase):
         self.ssh, self.rg = os.path.join(rbin, "ssh"), os.path.join(rbin, "rg")
         self.ssh_log, self.down, self.hang = (os.path.join(t, n) for n in ("ssh.jsonl", "down", "hang"))
         self.script(self.ssh, f'exec "{PY}" "{ROOT}/tests/fake_ssh.py" "$@"')
-        self.python = os.path.join(rbin, "python3")
+        # the "remote" python3 is plain python3 on that machine's PATH (review 2, item 9): a pbin first on
+        # the PATH the fake ssh hands on, with only python3 in it (its rg comes from rbin)
+        pbin = os.path.join(t, "pbin")
+        os.makedirs(pbin)
+        self.python = os.path.join(pbin, "python3")
         self.script(self.python, f'PATH="{rbin}:$PATH" exec "{PY}" "$@"')
         self.old = (copilot.S, dict(os.environ), copilot.FactRemote.off_until)
-        os.environ.update(FAKE_SSH_LOG=self.ssh_log, FAKE_SSH_DOWN=self.down, FAKE_SSH_HANG=self.hang)
+        os.environ.update(FAKE_SSH_LOG=self.ssh_log, FAKE_SSH_DOWN=self.down, FAKE_SSH_HANG=self.hang,
+                          PATH=pbin + os.pathsep + os.environ.get("PATH", ""))
         copilot.REMOTE.reset()
         copilot.FactRemote.off_until = 0.0
 
@@ -3954,7 +3997,8 @@ class FactSearchRemote(unittest.TestCase):
     def test_settings(self):
         s = self.settings()
         self.assertEqual(s.fact_search_where, "remote")
-        self.assertEqual(s.remote_python, [self.ssh, "myserver", self.python])
+        # REMOTE ends in /path/claude: python3 is plain python3 there, not claude's folder (review 2, item 9)
+        self.assertEqual(s.remote_python, [self.ssh, "myserver", "python3"])
         self.assertEqual(self.settings(FACT_SEARCH="local").fact_search_where, "local")
         self.assertEqual(self.settings(REMOTE="").fact_search_where, "local")
         self.assertEqual(self.settings(REMOTE_PATHS="").fact_search_where, "local")
@@ -3966,6 +4010,9 @@ class FactSearchRemote(unittest.TestCase):
         self.assertEqual((s.fact_search_where, s.remote_python), ("remote", [self.ssh, "myserver", "py3"]))
         self.assertTrue(any("FACT_SEARCH must be" in n for n in self.settings(FACT_SEARCH="vps").notices))
         self.assertEqual(copilot.remote_python_command(["ssh", "h", "docker", "exec", "-i", "c", "claude"]),
+                         ["ssh", "h", "docker", "exec", "-i", "c", "python3"])
+        self.assertEqual(copilot.remote_python_command(["ssh", "h", "docker", "exec", "-i", "c",
+                                                        "/usr/local/bin/claude"]),
                          ["ssh", "h", "docker", "exec", "-i", "c", "python3"])
 
     def test_paths_and_context_come_back_from_one_call(self):
@@ -3981,8 +4028,9 @@ class FactSearchRemote(unittest.TestCase):
         by = {s["path"]: s for s in found}
         self.assertEqual(by["wiki/acme.md"]["context"].splitlines(),
                          ["Customer since 2024.", "- ACME tax ID: 12.345.678/0001-90 (Receita)", "Owner: Ana"])
-        # only-there.md is not on this machine: its context came in the same answer (the server file's lines)
-        self.assertEqual(by["raw/only-there.md"]["context"].splitlines(), ["before", "zorblax serial: 42", "after"])
+        # only-there.md is not on this machine: its context came in the same answer (the server file's lines
+        # around it; the middle one is the line as found and shown)
+        self.assertEqual(by["raw/only-there.md"]["context"].splitlines(), ["before", "tax zorblax 42", "after"])
         self.assertEqual(by["raw/only-there.md"]["text"], "tax zorblax 42")
         with open(os.path.join(self.t, "rg-args")) as f:
             args = f.read()
@@ -4048,15 +4096,20 @@ class FactSearchRemote(unittest.TestCase):
         self.assertIn("exit 3", log)
         self.assertIn("FileNotFoundError", log)
         copilot.FactRemote.off_until = 0.0
+        self.settings(REMOTE_PYTHON=f"{self.ssh} myserver {self.python}")
         os.remove(self.python)                            # no python3 there: exit 127
         found, where, log = self.search(["tax", "acme"])
         self.assertEqual((where, found[0]["path"]), ("local-remote-failed", "wiki/acme.md"))
         self.assertIn("exit 127", log)
         self.script(self.python, f'PATH="{os.path.dirname(self.rg)}:$PATH" exec "{PY}" "$@"')
-        # rg there exits 2 with nothing found: an error, searched here
+        # rg there exits 2 with nothing found (a search folder missing there): no line, a warning in the log,
+        # and the remote search stays on (review 2, item 8)
         copilot.FactRemote.off_until = 0.0
         self.script(self.rg, "exit 2")
-        self.assertEqual(self.search(["tax", "acme"])[1], "local-remote-failed")
+        found, where, log = self.search(["tax", "acme"])
+        self.assertEqual((where, found), ("remote", []))
+        self.assertIn("remote text search: rg exited 2 with no output", log)
+        self.assertEqual(copilot.FactRemote.off_until, 0.0)
 
     def test_local_setting_never_calls_the_machine(self):
         self.settings(FACT_SEARCH="local")
@@ -4184,6 +4237,118 @@ class FactSearchRemote(unittest.TestCase):
         self.assertIn("raw/fresh.md", [s["path"] for s in there])
         self.assertIn("raw/only-there.md", [s["path"] for s in there])
 
+    def test_long_line_fact_found_there_with_a_small_answer(self):
+        # review 2, item 1, remote: the fact at character 6000 of a line is found there and the answer stays small
+        self.real_rg()
+        with open(os.path.join(self.server, "raw", "chat.jsonl"), "w", encoding="utf-8") as f:
+            for i in range(50):
+                f.write('{"m":"' + "w" * 6000 + f' zorblax serial {i:04d} ' + "v" * 20000 + '"}\n')
+        self.settings()
+        info = {}
+        found = copilot.fact_search(["zorblax", "serial"], self.dirs, [], 5, remote=True, info=info)
+        self.assertEqual(info["search_where"], "remote")
+        texts = [s["text"] for s in found if s["path"] == "raw/chat.jsonl"]
+        self.assertTrue(texts and all(re.search(r"zorblax serial \d{4}", t) for t in texts), texts)
+        self.assertLess(info["remote_bytes"], 15_000)
+
+    def test_failed_recent_search_keeps_the_server_answer(self):
+        # review 2, item 2: the search of the recent files here fails; the server's answer is used, logged
+        self.real_rg()
+        with open(os.path.join(self.notes, "raw", "fresh.md"), "w", encoding="utf-8") as f:
+            f.write("zorblax counter: 7\n")
+        self.settings()
+        info, out = {}, io.StringIO()
+        with unittest.mock.patch.object(copilot, "_rg_hits", side_effect=RuntimeError("rg exited 2")), \
+                unittest.mock.patch.object(copilot, "_py_hits", side_effect=RuntimeError("rg exited 2")), \
+                contextlib.redirect_stdout(out):
+            found = copilot.fact_search(["zorblax"], self.dirs, [], 10, remote=True, info=info)
+        self.assertEqual((info["search_where"], info["recent"], info.get("recent_err")), ("remote", 1, True))
+        self.assertEqual([s["path"] for s in found], ["raw/only-there.md"])
+        self.assertIn("search of the 1 recent file(s) here failed (rg exited 2); using the server's answer", out.getvalue())
+
+    def test_recent_files_are_not_counted_twice(self):
+        # review 2, item 6: a recent file the server copy also has is left out there (lines and counts), so
+        # the merged scores equal a local search over everything
+        self.real_rg()
+        shutil.copy(os.path.join(self.server, "raw", "only-there.md"), os.path.join(self.notes, "raw"))
+        old = time.time() - 3600
+        os.utime(os.path.join(self.notes, "raw", "only-there.md"), (old, old))
+        os.utime(os.path.join(self.notes, "wiki", "acme.md"), None)          # edited here just now, same text
+        self.settings()
+        info = {}
+        there = copilot.fact_search(["tax", "acme", "zorblax"], self.dirs, [], 8, remote=True, info=info)
+        self.assertEqual((info["search_where"], info["recent"]), ("remote", 1))
+        with open(self.ssh_log) as f:
+            req = json.loads(json.loads(f.readlines()[-1])["argv"][-1].strip("'"))
+        self.assertEqual(req["exclude"], [os.path.join(self.server, "wiki", "acme.md")])
+        self.settings(FACT_SEARCH="local")
+        here = copilot.fact_search(["tax", "acme", "zorblax"], self.dirs, [], 8)
+        self.assertEqual(there, here)
+        self.assertEqual(there[0]["path"], "wiki/acme.md")
+
+    def test_recent_files_survive_a_file_that_vanishes(self):
+        # review 2, item 5: one entry whose stat fails (gone since the listing) does not skip the folder
+        for name in ("a.md", "b.md", "c.md"):
+            with open(os.path.join(self.notes, "raw", name), "w") as f:
+                f.write("x\n")
+        real = os.scandir
+
+        class Gone:
+            def __init__(self, e):
+                self.e, self.name, self.path = e, e.name, e.path
+
+            def is_dir(self, **k):
+                return self.e.is_dir(**k)
+
+            def is_file(self, **k):
+                return self.e.is_file(**k)
+
+            def stat(self, **k):
+                if self.name in gone:
+                    raise FileNotFoundError(self.path)
+                return self.e.stat(**k)
+
+        @contextlib.contextmanager
+        def scandir(d):
+            with real(d) as it:
+                yield [Gone(e) for e in it]
+        # the first file listed (whatever the order) and a middle one vanish: the others are still checked
+        for first in (True, False):
+            with real(os.path.join(self.notes, "raw")) as it:
+                gone = {next(e.name for e in it if e.is_file())} if first else {"b.md"}
+            with unittest.mock.patch.object(copilot.os, "scandir", scandir):
+                got = copilot.recent_files(self.dirs, [], 15)
+            want = [os.path.join(self.notes, "raw", n) for n in ("a.md", "b.md", "c.md") if n not in gone]
+            self.assertEqual(got, want, gone)
+
+    def test_file_directly_in_a_search_folder_scores_the_same_both_ways(self):
+        # review 2, item 7: the search folder is "acme-notes" here and "copy" there; a file directly in it gets
+        # no word from that folder's name on either side, so the scores match
+        self.real_rg()
+        here_dir = os.path.join(self.t, "acme-notes")
+        there_dir = os.path.join(self.t, "srv", "copy")
+        for d in (here_dir, there_dir):
+            os.makedirs(os.path.join(d, "sub"))
+            with open(os.path.join(d, "contacts.md"), "w") as f:
+                f.write("Customer tax ID 55\n")
+            with open(os.path.join(d, "sub", "acme.md"), "w") as f:
+                f.write("tax paid\n")
+            for root, _, files in os.walk(d):
+                for name in files:
+                    os.utime(os.path.join(root, name), (time.time() - 3600,) * 2)
+        self.dirs = [copilot.Path(here_dir)]
+        cfg = dict(SEARCH_DIRS=here_dir, REMOTE_PATHS=f"{here_dir}={there_dir}")
+        self.settings(**cfg)
+        info = {}
+        there = copilot.fact_search(["tax", "acme"], self.dirs, [], 5, remote=True, info=info)
+        self.assertEqual(info["search_where"], "remote")
+        self.settings(FACT_SEARCH="local", **cfg)
+        here = copilot.fact_search(["tax", "acme"], self.dirs, [], 5)
+        self.assertEqual(there, here)
+        by = {s["path"]: s["score"] for s in here}
+        self.assertEqual(by["acme-notes/contacts.md"], round(math.log(1 + 2 / 3), 3))   # no "acme" bonus
+        self.assertGreater(by["acme-notes/sub/acme.md"], by["acme-notes/contacts.md"])  # file name still counts
+
     def test_answer_size_and_unreadable_answer(self):
         self.real_rg()
         with open(os.path.join(self.server, "raw", "big.md"), "w", encoding="utf-8") as f:
@@ -4277,7 +4442,7 @@ class FactFast(unittest.TestCase):
     def settings(self, **extra):
         cfg = {"MEETING_COPILOT_DATA_DIR": os.path.join(self.t, "data"), "MEETING_COPILOT_CLAUDE": self.claude,
                "MEETING_COPILOT_API_CREDIT": "off", "MEETING_COPILOT_PERSISTENT_AI": "0",
-               "MEETING_COPILOT_FACT_WARM": "0",
+               "MEETING_COPILOT_FACT_WARM": "0", "MEETING_COPILOT_FACT_MODE": "fast",
                "MEETING_COPILOT_SEARCH_DIRS": os.pathsep.join([os.path.join(self.notes, "wiki"),
                                                                os.path.join(self.notes, "raw")])}
         cfg.update({"MEETING_COPILOT_" + k: v for k, v in extra.items()})
@@ -4309,6 +4474,9 @@ class FactFast(unittest.TestCase):
         self.assertEqual((s.fact_mode, s.fact_gate_min, s.fact_pick_min, s.fact_check_model, s.fact_snippets,
                           s.fact_skip, s.fact_check_effort), ("fast", 0.5, 0.8, "haiku", 10, ["*.mbox", "*.gz"], "low"))
         self.assertEqual(self.settings(FACT_MODE="tools").fact_mode, "tools")
+        # fast is opt-in (review 2, item 4): it sends the transcript and note lines to TypeSafe
+        self.assertEqual(self.settings(FACT_MODE="").fact_mode, "tools")
+        self.assertIn("TypeSafe", copilot.FACT_FAST_NOTICE)
         s = self.settings(FACT_GATE_MIN="0.7", FACT_PICK_MIN="2", FACT_CHECK_MODEL="off", FACT_SNIPPETS="5",
                           FACT_SKIP="*.mbox, *.jsonl", FACT_CHECK_EFFORT="")
         self.assertEqual((s.fact_gate_min, s.fact_pick_min, s.fact_check_model, s.fact_snippets, s.fact_skip,
@@ -4318,7 +4486,7 @@ class FactFast(unittest.TestCase):
         s = self.settings(FACT_MODE="fast")
         self.assertEqual(s.fact_mode, "tools")                     # no key: the old search, with a note
         self.assertTrue(any("FACT_MODE=fast needs" in n for n in s.notices))
-        self.assertEqual(self.settings().notices, [])               # not asked for: no note
+        self.assertEqual(self.settings(FACT_MODE="").notices, [])   # not asked for: no note
         os.environ[copilot.TYPESAFE_KEY_ENV] = self.KEY
         self.assertEqual(self.settings(SEARCH_DIRS="").fact_mode, "tools")   # nothing to search
 
@@ -4443,6 +4611,76 @@ class FactFast(unittest.TestCase):
         a = self.claude_calls()[0]["argv"]
         self.assertEqual(a[a.index("--max-turns") + 1], "8")
         self.assertIn("unsure, no check model, tools", log)
+
+    def mcp_settings(self):
+        mcp = os.path.join(self.t, "mcp.json")
+        with open(mcp, "w") as f:
+            f.write('{"mcpServers": {}}')
+        return self.settings(MCP_CONFIG=mcp, MCP_TOOLS="mcp__chat__history")
+
+    def test_empty_check_hands_over_to_mcp_tools(self):
+        # review 2, item 3: a fact is asked, the notes do not have it (the check says EMPTY): with MCP tools
+        # configured the old search with them runs, so a chat history can still answer
+        self.mcp_settings()
+        os.environ["FAKE_CLAUDE_EMPTY_ONCE"] = os.path.join(self.t, "empty-once")
+        self.jev.update(pick="none", p=0.9)
+        self.say("What is the tax ID of ACME?")
+        log = self.round()
+        calls = self.claude_calls()
+        self.assertEqual(len(calls), 2)
+        check, tools = calls[0]["argv"], calls[1]["argv"]
+        self.assertEqual(check[check.index("--max-turns") + 1], "1")
+        self.assertEqual(tools[tools.index("--max-turns") + 1], "8")
+        self.assertIn("mcp__chat__history", tools[tools.index("--allowedTools") + 1])
+        self.assertIn("checked: EMPTY, MCP next, tools+MCP", log)
+        self.assertIn("2027-03-31", copilot.E.data[0]["markdown"])
+
+    def test_empty_check_without_mcp_shows_nothing(self):
+        os.environ["FAKE_CLAUDE_EMPTY_ONCE"] = os.path.join(self.t, "empty-once")
+        self.jev.update(pick="none", p=0.9)
+        self.say("What is the tax ID of ACME?")
+        log = self.round()
+        self.assertEqual(len(self.claude_calls()), 1)
+        self.assertEqual(copilot.E.data, [])
+        self.assertRegex(log, r"checked( \$|$)")
+
+    def test_no_fact_asked_with_mcp_calls_no_tools(self):
+        self.mcp_settings()
+        self.jev["gate"] = 0.05
+        self.say("Bom dia pessoal, vamos começar?")
+        log = self.round()
+        self.assertEqual(self.claude_calls(), [])
+        self.assertIn("no fact asked", log)
+        self.assertNotIn("tools", log)
+
+    def test_nothing_found_with_mcp_says_so(self):
+        self.mcp_settings()
+        self.say("What did Zebulon quote for the yacht?")
+        log = self.round()
+        a = self.claude_calls()[0]["argv"]
+        self.assertIn("mcp__chat__history", a[a.index("--allowedTools") + 1])
+        self.assertIn("nothing found, tools+MCP", log)
+
+    def test_odd_pick_answers_do_not_break_the_round(self):
+        # review 2, item 10: "probabilities" not a dict, an answer that is not a dict
+        for answer in ({"choice": "s0", "probabilities": [0.9], "confidence": 0.95},
+                       {"choice": "s0", "probabilities": "x", "confidence": 0.95}):
+            with unittest.mock.patch.object(copilot, "jev_ask", side_effect=[
+                    ({"answers": {"q": {"noul": 0.95}, "t0": {"noul": 0.9}, "t1": {"noul": 0.9}}}, ""),
+                    ({"answers": {"q": answer}}, "")]):
+                info: dict = {}
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.say("What is the tax ID of ACME?")
+                    out = copilot.fact_fast(list(copilot.E.lines), copilot.E.last_id - 1, [], "msg", info)
+                self.assertEqual((info["pick"], info["pick_p"], info["stage"]), ("s0", 0.95, "picked"), answer)
+                self.assertIn("12.345.678", out)
+        with unittest.mock.patch.object(copilot, "jev_ask", side_effect=[
+                ({"answers": {"q": {"noul": 0.95}, "t0": {"noul": 0.9}, "t1": {"noul": 0.9}}}, ""),
+                ({"answers": {"q": ["s0"]}}, "")]):
+            info = {}
+            with contextlib.redirect_stdout(io.StringIO()):
+                copilot.fact_fast(list(copilot.E.lines), copilot.E.last_id - 1, [], "msg", info)
+            self.assertTrue(info["pick_err"])
 
     def test_tools_mode_never_asks_jev(self):
         self.settings(FACT_MODE="tools")
@@ -4996,6 +5234,23 @@ class Live(unittest.TestCase):
         self.assertTrue(calls)
         self.assertTrue(all(is_assist(c) for c in calls))
         self.assertIn("fact search is off", self.log())
+
+    def test_fast_fact_search_says_what_goes_to_typesafe(self):
+        # review 2, item 4: fast is opt-in; when it is on, the start-up log says what is sent to TypeSafe
+        notes = os.path.join(self.t, "notes")
+        os.makedirs(notes)
+        self.start(MEETING_COPILOT_SEARCH_DIRS=notes, MEETING_COPILOT_TYPESAFE_KEY="sk-test-fast-1",
+                   MEETING_COPILOT_FACT_MODE="fast")
+        self.assertTrue(wait_for(lambda: "meeting-copilot on http" in self.log()), self.log())
+        self.assertIn(copilot.FACT_FAST_NOTICE, self.log())
+        self.assertNotIn("sk-test-fast-1", self.log())
+
+    def test_fast_fact_search_is_off_unless_asked(self):
+        notes = os.path.join(self.t, "notes")
+        os.makedirs(notes)
+        self.start(MEETING_COPILOT_SEARCH_DIRS=notes, MEETING_COPILOT_TYPESAFE_KEY="sk-test-fast-1")
+        self.assertTrue(wait_for(lambda: "meeting-copilot on http" in self.log()), self.log())
+        self.assertNotIn("fast fact search on", self.log())
 
     @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
     def test_context_file_and_language_go_to_claude(self):
