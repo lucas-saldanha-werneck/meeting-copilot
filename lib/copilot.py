@@ -53,7 +53,7 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 import factrank
 import tlscert
 
-__version__ = "0.18.0"
+__version__ = "0.18.1"
 
 HERE = Path(__file__).resolve().parent
 PAGE = HERE / "page.html"
@@ -1687,6 +1687,10 @@ def claude_command(system_prompt: str, model: str, *, schema: dict | None = None
     # With the wrapper, it runs the same `claude` this tool would have run (CLAUDE_CREDITO_REAL). Not for the
     # remote machine: it runs claude with its own login.
     env = {**os.environ, "CLAUDE_CREDITO_REAL": S.claude} if S.credit and not remote else None
+    # Without the wrapper (it puts the token in itself) the call goes straight to `claude`, on the subscription:
+    # give it the wrapper's stored long-lived token, if there is one, so it does not need the interactive login.
+    if not S.credit and not remote:
+        env = CREDIT.sub_env()
     if TYPESAFE_KEY_ENV in os.environ:      # the Look gate's key is none of claude's business
         env = {k: v for k, v in (env or os.environ).items() if k != TYPESAFE_KEY_ENV}
     # With frames, the message goes in as stream-json (the only input format of `claude -p` that carries
@@ -2275,6 +2279,30 @@ class Credit:
                 k = ""
         return k if k.startswith("sk-ant-") else ""
 
+    def oauth_token(self, cfg: dict) -> str:
+        """The long-lived subscription token the wrapper keeps in the Keychain (`claude-credito
+        --credit-store-oauth`, from `claude setup-token`); "" when there is none, when the caller already
+        set CLAUDE_CODE_OAUTH_TOKEN, or when CLAUDE_CREDITO_OAUTH=off. Like the wrapper, it is used only on the
+        subscription. It has no claude.ai connectors and no Remote Control (neither is used here), and
+        `claude --bare` ignores it (not used here either)."""
+        if cfg.get("CLAUDE_CREDITO_OAUTH", "on") == "off" or self.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
+            return ""
+        if cfg.get("CLAUDE_CREDITO_KEYCHAIN", "on") == "off" or not os.access("/usr/bin/security", os.X_OK):
+            return ""
+        try:
+            t = subprocess.run(["/usr/bin/security", "find-generic-password", "-s", "claude-credito",
+                                "-a", "oauth-token", "-w"], capture_output=True, text=True,
+                               timeout=5).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return t if t.startswith("sk-ant-oat01-") else ""
+
+    def sub_env(self, cfg: dict | None = None) -> dict | None:
+        """The environment for a call that runs on the subscription: ours plus the stored long-lived token, so
+        it does not depend on the interactive login (which expires). None = ours as it is (no token stored)."""
+        t = self.oauth_token(self.cfg() if cfg is None else cfg)
+        return {**self.environ, "CLAUDE_CODE_OAUTH_TOKEN": t} if t else None
+
     def state_dir(self, cfg: dict) -> Path:
         v = cfg.get("CLAUDE_CREDITO_STATE")
         if v:
@@ -2294,14 +2322,14 @@ class Credit:
             return None, "api (your ANTHROPIC_API_KEY)", None
         cfg = self.cfg()
         if cfg.get("CLAUDE_CREDITO", "on") == "off":
-            return None, "subscription (CLAUDE_CREDITO=off)", None
+            return self.sub_env(cfg), "subscription (CLAUDE_CREDITO=off)", None
         key = self.key(cfg)
         if not key:
-            return None, "subscription (no API key stored)", None
+            return self.sub_env(cfg), "subscription (no API key stored)", None
         pause = self.pause_file(cfg, key)
         try:
             if now() - pause.stat().st_mtime < self.pause_s(cfg):
-                return None, "subscription (API credit paused)", None
+                return self.sub_env(cfg), "subscription (API credit paused)", None
         except OSError:
             pass
         return {**self.environ, "ANTHROPIC_API_KEY": key}, "api credit", pause
@@ -2424,7 +2452,7 @@ class AssistSession:
         # on the remote machine while it answers: its own login, no credit wrapper
         remote = REMOTE.use()
         env, mode, pause = (None, "the remote machine", None) if remote else \
-            CREDIT.choose() if S.credit else (None, "subscription", None)
+            CREDIT.choose() if S.credit else (CREDIT.sub_env(), "subscription", None)
         prompt = self.system_prompt()   # read once: what it runs with is what self.prompt says
         p = subprocess.Popen(self.cmd(prompt, remote), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", bufsize=1,
