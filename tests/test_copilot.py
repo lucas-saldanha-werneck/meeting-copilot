@@ -2119,7 +2119,7 @@ class PairingCode(unittest.TestCase):
         copilot.DEVICES = copilot.Devices(copilot.Path(self.t) / "devices.json")
 
     def use(self, cfg):
-        copilot.S = copilot.Settings(cfg)
+        copilot.S = copilot.Settings({"MEETING_COPILOT_OSASCRIPT": "off", **cfg})   # never a real notification
         copilot.S.token = self.TOK
 
     def serve(self, lan=False, client_ip=None):
@@ -2173,12 +2173,12 @@ class PairingCode(unittest.TestCase):
         self.assertIn("frame-ancestors 'none'", hdrs["Content-Security-Policy"])
         self.assertNotIn(self.TOK.encode(), body)
         self.assertIsNone(copilot.PAIR.current())
-        # the old "show the code on the Mac again" button: no code made, it says what to do
         o = {"Content-Type": "application/json", "Origin": self.ORIGIN}
+        # "Request a code" (0.19.0) opens one for the Mac's screen; it is never in the answer
         code, _, body = self.req(port, "/login/code", o, "POST", b"{}")
-        self.assertEqual(code, 409)
-        self.assertIn(b"meeting-copilot code", body)
-        self.assertIsNone(copilot.PAIR.current())
+        self.assertEqual(code, 200)
+        self.assertNotIn(copilot.PAIR.current()[0].encode(), body)
+        self.assertFalse(json.loads(body)["shown"])               # OSASCRIPT=off in these tests
         # a code the Mac opened is never on the login page
         right = self.open_code(port)
         self.assertNotIn(right.encode(), self.browse(port)[2])
@@ -2524,6 +2524,292 @@ MEETING_WINDOWS = [
 
 
 @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
+class MacLoginAndCodeRequest(unittest.TestCase):
+    """0.19.0: this Mac's own browser on the LAN address needs no code (never the tunnel), http->https for a Mac
+    that trusts the CA, `cert trust`, and the login page's "Request a code" (shown on the Mac's screen only)."""
+
+    TOK = "t" * 40
+    MAC = "192.168.1.10"      # this Mac's LAN address (MEETING_COPILOT_LAN_IP in LanHttps.use)
+
+    def setUp(self):
+        LanHttps.setUp(self)
+        for name in ("PAIR", "DEVICES"):
+            self.addCleanup(setattr, copilot, name, getattr(copilot, name))
+        self.clock = Clock()
+        copilot.PAIR = copilot.Pairing(clock=self.clock)
+        copilot.DEVICES = copilot.Devices(copilot.Path(self.t) / "devices.json")
+        copilot._MAC_TRUST.update(tag="", ok=False, at=0.0)
+        self.addCleanup(copilot._MAC_TRUST.update, tag="", ok=False, at=0.0)
+        self.runs = []        # the macOS commands the copilot ran (osascript, security), never really run
+        self.rc = 0
+        real = subprocess.run
+
+        def fake_run(cmd, *a, **kw):
+            if cmd and cmd[0] in ("/fake/osascript", "/fake/security"):
+                self.runs.append(list(cmd))
+                return subprocess.CompletedProcess(cmd, self.rc)
+            return real(cmd, *a, **kw)
+
+        patcher = unittest.mock.patch.object(copilot.subprocess, "run", fake_run)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def use(self, **extra):
+        LanHttps.use(self, **{"LAN_NAME": "copilot", "OSASCRIPT": "/fake/osascript", "SECURITY": "/fake/security",
+                              **extra})
+
+    def req(self, *a, **kw):
+        return LanHttps.req(self, *a, **kw)
+
+    def serve(self, tls=True, client_ip=MAC, local_ip=MAC, lan=True):
+        """client_ip: the device's address as the copilot sees it; local_ip: the address it reached (this Mac's
+        own address on that connection). The test server runs on 127.0.0.1, so both are pretended."""
+        if lan:
+            base = copilot._TlsServer if tls else copilot._LanServer
+            page = copilot._TlsPage if tls else copilot._LanPage
+        else:
+            base, page, tls = copilot._Server, copilot.Page, False
+
+        class Pg(page):
+            def _local_ip(s):
+                return local_ip
+
+        class Srv(base):
+            def get_request(s):
+                sock, addr = super().get_request()
+                return sock, (client_ip, addr[1])
+
+        srv = Srv(("127.0.0.1", 0), Pg, copilot.tls_context()) if tls else Srv(("127.0.0.1", 0), Pg)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return srv.server_address[1]
+
+    def test_settings(self):
+        self.assertTrue(copilot.S.lan_mac_login)                   # on by default
+        self.assertEqual((copilot.S.osascript, copilot.S.security), ("/fake/osascript", "/fake/security"))
+        self.use(LAN_MAC_LOGIN="0", OSASCRIPT="off", SECURITY="off")
+        self.assertEqual((copilot.S.lan_mac_login, copilot.S.osascript, copilot.S.security), (False, None, None))
+
+    def test_the_mac_itself_is_logged_in_on_the_lan_listener(self):
+        port = self.serve()
+        h = "copilot.local:8443"
+        code, hdrs, body = self.req(port, "/", h, {"Sec-Fetch-Mode": "navigate"}, auth=False)
+        self.assertEqual(code, 200)
+        self.assertNotIn(b"6-digit code", body)                  # the page itself, not the login page
+        self.assertIsNone(hdrs["Set-Cookie"])                    # nothing to steal: no cookie, no device saved
+        self.assertEqual(copilot.DEVICES.list(), [])
+        self.assertEqual(self.req(port, "/state", h, auth=False)[0], 200)
+        post = {"Content-Type": "application/json", "Origin": "https://copilot.local:8443"}
+        self.assertEqual(self.req(port, "/mute", h, post, "POST", b'{"kind":"x"}', auth=False)[0], 200)
+        # the Host and Origin checks still run first: no DNS rebinding, no cross-site POST
+        self.assertEqual(self.req(port, "/state", "evil.example:8443", auth=False)[0], 403)
+        self.assertEqual(self.req(port, "/mute", h, {**post, "Origin": "https://evil.example"}, "POST",
+                                  b'{"kind":"x"}', auth=False)[0], 403)
+        # the token-only launcher link stays token-only
+        self.assertEqual(self.req(port, "/login-link", h, auth=False)[0], 403)
+
+    def test_never_a_forwarded_request_loopback_another_device_or_the_loopback_listener(self):
+        h = "copilot.local:8443"
+        port = self.serve()
+        for name in ("Cf-Connecting-IP", "X-Forwarded-For", "Forwarded", "Cf-Ray", "X-Real-IP", "Via"):
+            self.assertEqual(self.req(port, "/state", h, {name: "203.0.113.5"}, auth=False)[0], 401, name)
+        self.use(CLIENT_IP_HEADER="X-Visitor")                    # your tunnel's own header too
+        self.assertEqual(self.req(port, "/state", h, {"X-Visitor": "203.0.113.5"}, auth=False)[0], 401)
+        self.use()
+        # a device that is not this Mac
+        other = self.serve(client_ip="192.168.1.20")
+        self.assertEqual(self.req(other, "/state", h, auth=False)[0], 401)
+        # loopback on the LAN listener (a tunnel pointed at localhost:443 would come from there)
+        lo = self.serve(client_ip="127.0.0.1", local_ip="127.0.0.1")
+        self.assertEqual(self.req(lo, "/state", "localhost:8443", auth=False)[0], 401)
+        # the loopback listener, where the tunnel's public visitors arrive: never, from any address
+        for ip in ("127.0.0.1", self.MAC):
+            lp = self.serve(lan=False, client_ip=ip, local_ip=ip)
+            self.assertEqual(self.req(lp, "/state", "127.0.0.1:4390", auth=False, tls=False)[0], 401, ip)
+        # turned off
+        self.use(LAN_MAC_LOGIN="0")
+        self.assertEqual(self.req(port, "/state", h, auth=False)[0], 401)
+
+    def test_plain_lan_http_without_https_logs_the_mac_in(self):
+        self.use(LAN_HTTPS="0")
+        port = self.serve(tls=False)
+        self.assertEqual(self.req(port, "/state", "copilot.local:8080", auth=False, tls=False)[0], 200)
+        phone = self.serve(tls=False, client_ip="192.168.1.20")
+        self.assertEqual(self.req(phone, "/state", "copilot.local:8080", auth=False, tls=False)[0], 401)
+
+    def test_http_listener_sends_the_mac_to_https_or_to_its_own_set_up(self):
+        self.addCleanup(copilot.HTTPS_UP.__setitem__, "port", 0)
+        copilot.HTTPS_UP["port"] = 8443
+        port = self.serve(tls=False)
+        nav = {"Sec-Fetch-Mode": "navigate", "Accept": "text/html"}
+        h = "copilot.local:8080"
+        # the Mac does not trust the CA yet: /setup, and there a Mac section instead of the phone steps
+        self.rc = 1
+        code, hdrs, _ = self.req(port, "/", h, nav, auth=False, tls=False)
+        self.assertEqual((code, hdrs["Location"]), (302, "/setup"))
+        verify = self.runs[-1]
+        self.assertEqual(verify[:2], ["/fake/security", "verify-cert"])
+        self.assertIn("copilot.local", verify)
+        self.assertIn(str(copilot.tls_dir() / "server.crt"), verify)
+        code, _, body = self.req(port, "/setup", h, auth=False, tls=False)
+        self.assertEqual(code, 200)
+        self.assertIn(b"meeting-copilot cert trust", body)
+        self.assertIn(b"Set up this Mac", body)
+        self.assertNotIn(b"mobileconfig", body)
+        self.assertNotIn(b"<!--", body)
+        # a phone gets the phone steps and no Mac section
+        phone = self.serve(tls=False, client_ip="192.168.1.20")
+        code, _, body = self.req(phone, "/setup", h, auth=False, tls=False)
+        self.assertIn(b"mobileconfig", body)
+        self.assertIn(b"Set up this phone", body)
+        self.assertNotIn(b"cert trust", body)
+        self.assertEqual(self.req(phone, "/", h, nav, auth=False, tls=False)[1]["Location"], "/setup")
+        # `cert trust` done: the Mac goes straight to https (the "no" was kept only a few seconds)
+        self.rc = 0
+        copilot._MAC_TRUST.update(at=0.0)
+        code, hdrs, _ = self.req(port, "/?x=1", h, nav, auth=False, tls=False)
+        self.assertEqual((code, hdrs["Location"]), (302, "https://copilot.local:8443/?x=1"))
+        n = len(self.runs)
+        self.req(port, "/", h, nav, auth=False, tls=False)
+        self.assertEqual(len(self.runs), n)                       # the answer is kept: not asked on every page
+        # still nothing over plain http itself: a script from the Mac is refused, a phone is not sent on
+        self.assertEqual(self.req(port, "/state", h, auth=False, tls=False)[0], 403)
+        self.assertEqual(self.req(phone, "/", h, nav, auth=False, tls=False)[1]["Location"], "/setup")
+        self.assertEqual(self.req(port, "/", h, {**nav, "X-Forwarded-For": "203.0.113.5"}, auth=False,
+                                  tls=False)[1]["Location"], "/setup")
+
+    def test_cert_trust_adds_the_ca_to_the_login_keychain(self):
+        home = os.path.join(self.t, "home")
+        with unittest.mock.patch.dict(os.environ, {"HOME": home}), contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(copilot.cert_trust_cli(), 0)
+        keychain = os.path.join(home, "Library", "Keychains", "login.keychain-db")
+        self.assertEqual(self.runs[-1], ["/fake/security", "add-trusted-cert", "-r", "trustRoot", "-p", "ssl", "-k",
+                                         keychain, str(copilot.tls_dir() / "ca.crt")])
+        self.assertIn("https://copilot.local:8443/", out.getvalue())
+        self.rc = 1                                               # cancelled in the macOS dialog
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(copilot.cert_trust_cli(), 1)
+        self.assertIn("did not add", err.getvalue())
+        self.use(SECURITY="off")                                  # not a Mac
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(copilot.cert_trust_cli(), 1)
+        self.assertIn("needs macOS", err.getvalue())
+
+    def test_request_a_code_rules(self):
+        p = copilot.PAIR
+        result, code, left = p.request()
+        self.assertEqual((result, left), ("ok", copilot.CODE_TTL_S))
+        self.assertRegex(code, r"^[0-9]{6}$")
+        self.assertEqual(p.request()[:2], ("wait", None))          # one per 30 s
+        self.clock.t += copilot.CODE_REQUEST_GAP_S
+        self.assertEqual(p.request()[:2], ("ok", code))           # an open code is kept, never replaced
+        # wrong tries on it are never reset by asking again
+        p.try_code(PairingCode.wrong_for(code), "a")
+        self.clock.t += copilot.CODE_REQUEST_GAP_S
+        self.assertEqual(p.request()[:2], ("ok", code))
+        self.assertEqual(p.wrong, 1)
+        # 5 an hour
+        for _ in range(2):
+            self.clock.t += copilot.CODE_REQUEST_GAP_S
+            self.assertEqual(p.request()[0], "ok")
+        self.clock.t += copilot.CODE_REQUEST_GAP_S
+        result, _, wait = p.request()
+        self.assertEqual(result, "wait")
+        self.assertGreater(wait, 3000)
+        # 20 a day
+        fresh = copilot.Pairing(clock=self.clock)
+        for i in range(copilot.CODE_REQUESTS_PER_DAY):
+            self.assertEqual(fresh.request()[0], "ok", i)
+            self.clock.t += 3600 / copilot.CODE_REQUESTS_PER_HOUR
+        result, _, wait = fresh.request()
+        self.assertEqual(result, "wait")
+        self.assertGreater(wait, 3600)
+
+    def test_wrong_tries_on_requested_codes_stop_the_requests_until_the_mac_acts(self):
+        p = copilot.PAIR
+        for n in range(copilot.CODE_TOTAL_WRONG):
+            if p.current() is None:
+                self.clock.t += 3600                              # past the hourly limit
+                self.assertEqual(p.request()[0], "ok", n)
+            code = p.current()[0]
+            self.assertIn(p.try_code(PairingCode.wrong_for(code), f"dev{n}")[0], ("wrong", "used_up"))
+        self.clock.t += 3600
+        self.assertEqual(p.request()[0], "locked")                # at most 20 guesses without the Mac
+        self.clock.t += copilot.CODE_REQUEST_LOCK_S
+        self.assertEqual(p.request()[0], "ok")                    # a day later
+        # wrong tries on a code the Mac opened do not count; the Mac opening a code lifts the stop
+        p.request_wrong = copilot.CODE_TOTAL_WRONG
+        p.request_wrong_at = self.clock.t
+        self.clock.t += 3600
+        self.assertEqual(p.request()[0], "locked")
+        p.get_or_create()
+        self.assertEqual(p.request()[0], "ok")
+        p.request_wrong = copilot.CODE_TOTAL_WRONG - 1           # a device logging in lifts it too
+        self.assertEqual(p.try_code(p.current()[0], "ok-dev")[0], "ok")
+        self.assertEqual(p.request_wrong, 0)
+
+    def test_request_button_shows_the_code_on_the_mac_only(self):
+        phone = self.serve(client_ip="192.168.1.20")
+        h = "copilot.local:8443"
+        post = {"Content-Type": "application/json", "Origin": "https://copilot.local:8443",
+                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) Safari"}
+        code, hdrs, body = self.req(phone, "/login/code", h, post, "POST", b"{}", auth=False)
+        self.assertEqual(code, 200)
+        right = copilot.PAIR.current()[0]
+        self.assertNotIn(right.encode(), body)                    # never in the answer
+        self.assertIsNone(hdrs["Set-Cookie"])
+        got = json.loads(body)
+        self.assertEqual((got["ok"], got["shown"]), (True, True))
+        self.assertIn("Mac's screen", got["message"])
+        note = self.runs[-1]
+        self.assertEqual(note[0], "/fake/osascript")
+        self.assertIn(right, note[-3])                            # the code, as an argument (not in the script)
+        self.assertIn("iPhone at 192.168.1.20", note[-1])
+        self.assertFalse(any(right in part for part in note[:-3]))
+        # asked again at once: refused, no second notification
+        n = len(self.runs)
+        code, _, body = self.req(phone, "/login/code", h, post, "POST", b"{}", auth=False)
+        self.assertEqual(code, 429)
+        self.assertEqual(json.loads(body)["retry_in"], copilot.CODE_REQUEST_GAP_S)
+        self.assertEqual(len(self.runs), n)
+        # the code from the notification logs the phone in
+        code, hdrs, _ = self.req(phone, "/login", h, post, "POST", json.dumps({"code": right}).encode(), auth=False)
+        self.assertEqual(code, 200)
+        self.assertIn("meeting_copilot_device=", hdrs["Set-Cookie"])
+        # the Origin check still runs: another site cannot press the button
+        self.clock.t += 3600
+        self.assertEqual(self.req(phone, "/login/code", h, {**post, "Origin": "https://evil.example"}, "POST",
+                                  b"{}", auth=False)[0], 403)
+        # no osascript: a code is still open, the answer says where to find it, still without it
+        self.use(OSASCRIPT="off")
+        code, _, body = self.req(phone, "/login/code", h, post, "POST", b"{}", auth=False)
+        self.assertEqual(code, 200)
+        got = json.loads(body)
+        self.assertFalse(got["shown"])
+        self.assertIn("meeting-copilot status", got["message"])
+        self.assertNotIn(copilot.PAIR.current()[0].encode(), body)
+
+    def test_request_button_through_the_tunnel(self):
+        self.use(EXTRA_HOSTS="copilot.example.com", CLIENT_IP_HEADER="Cf-Connecting-IP")
+        port = self.serve(lan=False, client_ip="127.0.0.1", local_ip="127.0.0.1")
+        h = {"Content-Type": "application/json", "Origin": "https://copilot.example.com",
+             "X-Forwarded-Proto": "https", "Cf-Connecting-IP": "203.0.113.5", "User-Agent": "x Android y"}
+        code, _, body = self.req(port, "/login/code", "copilot.example.com", h, "POST", b"{}", auth=False,
+                                 tls=False)
+        self.assertEqual(code, 200)
+        self.assertNotIn(copilot.PAIR.current()[0].encode(), body)
+        self.assertIn("Android at 203.0.113.5 via copilot.example.com", self.runs[-1][-1])
+        # and a tunnel visitor is never logged in as the Mac
+        self.assertEqual(self.req(port, "/state", "copilot.example.com", h, auth=False, tls=False)[0], 401)
+
+    def test_login_page_has_the_button(self):
+        body = copilot.LOGIN_PAGE.read_text(encoding="utf-8")
+        self.assertIn('id="ask"', body)
+        self.assertIn("Request a code", body)
+        self.assertIn('"/login/code"', body)
+
+
 class Vision(unittest.TestCase):
     """Screen capture, frames and response times, in-process, with fake screencapture/window list/claude.
     Never a real screencapture: the commands are always the fakes in tests/fake_screen.py."""

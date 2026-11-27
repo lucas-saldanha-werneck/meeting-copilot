@@ -16,6 +16,8 @@
           padding: 12px; background: var(--bg); color: var(--txt); border: 1px solid var(--line); border-radius: 8px; }
   button { width: 100%; margin-top: 12px; padding: 10px; font: inherit; font-weight: 600; border: 0; border-radius: 8px;
            background: var(--say); color: var(--bg); cursor: pointer; }
+  button.alt { background: transparent; color: var(--say); border: 1px solid var(--line); }
+  button:disabled { opacity: .5; cursor: default; }
   p.hint { font-size: 13px; margin: 14px 0 0; }
   code { font: 13px ui-monospace, Menlo, monospace; color: var(--txt); }
   #msg { min-height: 1.4em; margin: 10px 0 0; color: var(--warn); }
@@ -29,9 +31,11 @@
   <input id="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]*" maxlength="7" required autofocus
          aria-label="6-digit code">
   <button type="submit">Open</button>
+  <button type="button" class="alt" id="ask">Request a code</button>
   <div id="msg" role="status"></div>
-  <p class="hint">No code yet? On the Mac, run <code>meeting-copilot code</code>, or tap "Pair a device" on a page
-    that is already logged in. A code is valid for 5 minutes.</p>
+  <p class="hint">No code yet? Tap "Request a code": it shows on the Mac's screen, never here. Or on the Mac, run
+    <code>meeting-copilot code</code>, or tap "Pair a device" on a page that is already logged in. A code is valid
+    for 5 minutes.</p>
 </form>
 <script>
 const msg = (text, ok) => { const m = document.getElementById("msg"); m.textContent = text; m.className = ok ? "ok" : ""; };
@@ -55,6 +59,18 @@ document.getElementById("f").onsubmit = async ev => {
   try { e = await r.json(); } catch {}
   msg(e.error || "That did not work. Try again.");
   document.getElementById("code").select();
+};
+document.getElementById("ask").onclick = async () => {
+  const b = document.getElementById("ask");
+  b.disabled = true;
+  let r, e = {};
+  try { r = await post("/login/code", {}); } catch { b.disabled = false; return msg("The copilot is not answering."); }
+  try { e = await r.json(); } catch {}
+  // the answer never has the code: it is on the Mac's screen only
+  msg(e.message || e.error || "That did not work. Try again.", r.ok);
+  const wait = r.ok ? 30 : Math.min(Number(e.retry_in) || 30, 3600);
+  setTimeout(() => { b.disabled = false; }, wait * 1000);
+  if (r.ok) document.getElementById("code").focus();
 };
 </script>
 </body>
