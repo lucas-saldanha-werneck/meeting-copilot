@@ -42,6 +42,11 @@ suggestions use one `claude` process per meeting that stays open (`--input-forma
   writes the wrapper's own pause file for that key (so the wrapper and other tools also move to the
   subscription), adds a line to the wrapper's log, restarts the process on the subscription and sends the
   same round again. The wrapper's settings (`CLAUDE_CREDITO*`, its config file) are honored.
+  Calls that run on the subscription (the kept-open process while the key is paused, and every call when the
+  wrapper is not used) get the wrapper's long-lived subscription token (`claude-credito --credit-store-oauth`,
+  made with `claude setup-token`) as `CLAUDE_CODE_OAUTH_TOKEN`, when one is stored in the Keychain, so they
+  do not stop when the interactive login expires. `CLAUDE_CREDITO_OAUTH=off` turns this off. The token has no
+  claude.ai connectors and no Remote Control; the copilot uses neither.
 - `/state` has `ai_rounds`: the last rounds' timings in seconds from the request (`sent`, `first_byte`,
   `result`), with `turn`, `seeded`, `attempts` and `tokens`. `tools/bench_live.py` measures rounds.
 

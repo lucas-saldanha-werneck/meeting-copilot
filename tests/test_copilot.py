@@ -348,6 +348,33 @@ class Logic(unittest.TestCase):
                                         "CLAUDE_CREDITO_PAUSE_S": "0"}).choose()
             self.assertEqual(env["ANTHROPIC_API_KEY"], "sk-ant-conf-2222")
 
+    def test_credit_gives_the_stored_subscription_token_to_subscription_calls_only(self):
+        tok = "sk-ant-oat01-" + "t" * 20     # not a real token
+        with tempfile.TemporaryDirectory() as d:
+            base = {"CLAUDE_CREDITO_STATE": os.path.join(d, "state"), "CLAUDE_CREDITO_CONFIG": os.path.join(d, "none"),
+                    "XDG_CONFIG_HOME": os.path.join(d, "cfg"), "HOME": d}
+            def keychain(out):     # the Keychain has the token and no API key
+                return lambda cmd, **kw: subprocess.CompletedProcess(
+                    cmd, 0, stdout=out + "\n" if "oauth-token" in cmd else "")
+            with unittest.mock.patch.object(copilot.subprocess, "run", side_effect=keychain(tok)), \
+                 unittest.mock.patch.object(copilot.os, "access", return_value=True):
+                # no API key: the subscription, with the token
+                env, mode, _ = copilot.Credit(base).choose()
+                self.assertEqual((env["CLAUDE_CODE_OAUTH_TOKEN"], mode), (tok, "subscription (no API key stored)"))
+                self.assertEqual(copilot.Credit(base).sub_env()["CLAUDE_CODE_OAUTH_TOKEN"], tok)
+                # switched off, or a token already set by the caller: left alone
+                self.assertIsNone(copilot.Credit({**base, "CLAUDE_CREDITO_OAUTH": "off"}).sub_env())
+                self.assertIsNone(copilot.Credit({**base, "CLAUDE_CODE_OAUTH_TOKEN": "x"}).sub_env())
+                # something that is not a setup-token token is ignored
+                with unittest.mock.patch.object(copilot.subprocess, "run", side_effect=keychain("not-a-token")):
+                    self.assertIsNone(copilot.Credit(base).sub_env())
+                # on the API credit the child gets the key and no token
+                with open(os.path.join(d, "conf"), "w") as f:
+                    f.write("CLAUDE_CREDITO_KEY=sk-ant-conf-3333\n")
+                env, mode, _ = copilot.Credit({**base, "CLAUDE_CREDITO_CONFIG": os.path.join(d, "conf")}).choose()
+                self.assertEqual(mode, "api credit")
+                self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", env)
+
     @unittest.skipIf(WIN, "Windows finds commands on PATH by extension (PATHEXT); the tool is macOS-only")
     def test_api_credit_on_means_the_default_wrapper_name(self):
         with tempfile.TemporaryDirectory() as d:
