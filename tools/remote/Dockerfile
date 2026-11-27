@@ -4,7 +4,8 @@
 FROM node:22-slim
 # Pin the Claude Code version you run on your Mac, so both answer the same way.
 ARG CLAUDE_VERSION=latest
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+# ripgrep + python3: the fast fact search runs its text search and ranking here (MEETING_COPILOT_FACT_SEARCH=remote)
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates ripgrep python3 \
  && rm -rf /var/lib/apt/lists/* \
  && npm i -g "@anthropic-ai/claude-code@${CLAUDE_VERSION}" && npm cache clean --force
 COPY entry.sh /usr/local/bin/copilot-ai-entry

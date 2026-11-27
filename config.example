@@ -36,6 +36,32 @@
 #MEETING_COPILOT_MCP_CONFIG=
 #MEETING_COPILOT_MCP_TOOLS=
 
+# Fast fact search (needs the TypeSafe key, see TYPESAFE_KEY_FILE below, and SEARCH_DIRS):
+# Jev (TypeSafe) says whether the new part of the conversation asks for a fact and which
+# words name it, a text search (ripgrep when installed) finds the best lines in the search
+# folders, Jev picks one, and only when Jev is unsure one call to a small model (no tools)
+# reads those lines. The AI with tools (DATA_MODEL) runs only when this cannot answer.
+# The transcript of the last 3 minutes, the search words and the lines found in your
+# notes (with their file names) go to TypeSafe, so it is off unless set here (the
+# copilot says so at start). With MCP_CONFIG/MCP_TOOLS, a fact the notes do not have
+# (the small model says EMPTY) still goes to the AI with tools, which has the MCP tools.
+# fast or tools (only the AI with tools). Default: tools.
+#MEETING_COPILOT_FACT_MODE=
+# Jev must be at least this sure (0 to 1) that a fact is asked, else nothing is searched.
+#MEETING_COPILOT_FACT_GATE_MIN=0.5
+# Jev's pick is shown as is (the line and its file) when Jev is at least this sure.
+#MEETING_COPILOT_FACT_PICK_MIN=0.8
+# The small model that reads the lines when Jev is less sure. off: the AI with tools then.
+#MEETING_COPILOT_FACT_CHECK_MODEL=haiku
+# Its effort (low, medium, high, xhigh, max; empty: claude's default).
+#MEETING_COPILOT_FACT_CHECK_EFFORT=low
+# 1: the next small-model call is started ahead, so it does not wait for claude to start.
+#MEETING_COPILOT_FACT_WARM=1
+# How many lines Jev and the small model see.
+#MEETING_COPILOT_FACT_SNIPPETS=10
+# File name patterns the text search skips, separated by commas.
+#MEETING_COPILOT_FACT_SKIP=*.mbox,*.gz
+
 # A text file about you that both AI calls read (name, role, projects, where your
 # notes are, words the transcript gets wrong). The first 8000 characters are used.
 #MEETING_COPILOT_CONTEXT_FILE=
@@ -152,6 +178,26 @@
 # checked again while it is out.
 #MEETING_COPILOT_REMOTE_FIRST_BYTE_S=6
 #MEETING_COPILOT_REMOTE_RETRY_S=30
+# Where the fast fact search's text search (ripgrep) and its ranking run. remote: on
+# that machine, one call per round over its copy of the search folders (REMOTE_PATHS),
+# so a busy Mac does not slow it down and gets only the best lines; needs python3 and
+# ripgrep there (tools/remote/Dockerfile has both).
+# That copy is only as new as its last sync (sync-notes.sh: every 10 minutes), so
+# the files changed here in the last FACT_RECENT_MIN minutes are searched here at the
+# same time (this machine's lines win for them). local: everything here.
+# Default: remote when REMOTE and REMOTE_PATHS are set.
+#MEETING_COPILOT_FACT_SEARCH=
+# Minutes: with the remote search, files changed here this recently are also searched
+# here. 0: off (only the server copy).
+#MEETING_COPILOT_FACT_RECENT_MIN=15
+# Seconds the remote search may take; slower, failed (or python3/ripgrep missing there) and
+# this round and the next ones for REMOTE_RETRY_S search here instead.
+#MEETING_COPILOT_FACT_SEARCH_REMOTE_S=3
+# The command that starts python3 there (it gets the search program on stdin, so
+# docker exec needs -i; ripgrep must be on its PATH). Empty: REMOTE with its last
+# word (claude or /path/claude) made plain python3, found on that machine's PATH
+# (ssh myserver docker exec -i copilot-ai python3).
+#MEETING_COPILOT_REMOTE_PYTHON=
 
 # Intervals in seconds: suggestions, fact search, reading the transcript.
 #MEETING_COPILOT_ASSIST_S=25
@@ -239,7 +285,7 @@
 #MEETING_COPILOT_LOOK_GATE=
 # The deep pass runs when Jev's probability is at least this (0 to 1).
 #MEETING_COPILOT_LOOK_GATE_MIN=0.8
-# The TypeSafe key for the gate: put it in the environment of the copilot as
+# The TypeSafe key for the gate and the fast fact search: put it in the environment of the copilot as
 # MEETING_COPILOT_TYPESAFE_KEY, or in a file (first line, chmod 600; a file that others can
 # read is not used) and name the file here. The key is never written in this file's values,
 # the log, the page or the AI's command line or environment.

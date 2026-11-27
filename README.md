@@ -8,7 +8,7 @@ A live meeting copilot for macOS. While a meeting is recording in the [Muesli](h
 - **Relevant facts** (optional): looked up in folders of notes you choose and/or MCP tools you allow.
 - **Warnings** (no AI): long monologue, talking most of the last 5 minutes, few questions, speaking too fast.
 
-The AI runs through `claude -p` (Claude Code), so it uses your Claude Code login. Suggestions about every 25 s, fact search about every 45 s.
+The AI runs through `claude -p` (Claude Code), so it uses your Claude Code login. Suggestions about every 25 s, fact search about every 45 s (with a TypeSafe key an answer takes about 1-5 s instead of 10-19 s: see [Fast fact search](#fast-fact-search)).
 
 ### The kept-open AI process (suggestions)
 
@@ -181,6 +181,11 @@ Every key:
 | `MEETING_COPILOT_MODEL` | `sonnet` | Model for suggestions (`MEETING_COPILOT_DATA_MODEL` for fact search) |
 | `MEETING_COPILOT_SEARCH_DIRS` | empty | Folders the AI may search for facts, separated by `:` |
 | `MEETING_COPILOT_MCP_CONFIG` | empty | An MCP config file (`{"mcpServers": {...}}`) for fact search |
+| `MEETING_COPILOT_FACT_MODE` | `tools` | `fast` (needs a TypeSafe key and search folders; it sends the transcript, the search words and the lines found to TypeSafe): Jev gate, text search, Jev pick, small-model check (see [Fast fact search](#fast-fact-search)); `tools`: only the AI with tools |
+| `MEETING_COPILOT_FACT_GATE_MIN` / `FACT_PICK_MIN` | `0.5` / `0.8` | How sure Jev must be that a fact is asked / that its pick is the fact (0 to 1) |
+| `MEETING_COPILOT_FACT_CHECK_MODEL` / `FACT_CHECK_EFFORT` | `haiku` / `low` | The model that reads the lines when Jev is unsure (`off`: the AI with tools then), and its `--effort` |
+| `MEETING_COPILOT_FACT_WARM` | `1` | Start the next small-model call ahead |
+| `MEETING_COPILOT_FACT_SNIPPETS` / `FACT_SKIP` | `10` / `*.mbox,*.gz` | Lines Jev and the small model see / file name patterns the text search skips |
 | `MEETING_COPILOT_MCP_TOOLS` | empty | Comma-separated allowlist of tools from that file, e.g. `mcp__notes__search`. Required: without it MCP stays off |
 | `MEETING_COPILOT_SESSIONS_DIR` | `~/.local/share/meeting-copilot/sessions` | Where each meeting's transcript and suggestions are saved when it ends (`MEETING_COPILOT_SAVE_SESSIONS=0` to turn off) |
 | `MEETING_COPILOT_SAVE_FORMAT` | `json` | `markdown`: save a readable `<Muesli export name>-copilot.md` (suggestions, corrections, facts, warnings; no transcript) instead of the JSON. It waits up to `MEETING_COPILOT_MUESLI_WAIT_S` seconds (600) for Muesli's auto-export, reads its name from Muesli's export log and links to it. The file says it is AI-written: keep it out of folders the fact search reads, or it can come back as a "fact" |
@@ -201,6 +206,10 @@ Every key:
 | `MEETING_COPILOT_REMOTE_PATHS` | empty | `local=remote` folder pairs (separated by `:`) that map the search folders to their copies on that machine |
 | `MEETING_COPILOT_REMOTE_MCP_CONFIG` | empty | The MCP config file on that machine (`MCP_TOOLS` applies to it); empty: no MCP tools while the AI runs there |
 | `MEETING_COPILOT_REMOTE_FIRST_BYTE_S`, `_REMOTE_RETRY_S` | `6`, `30` | A one-shot call there that prints nothing for this long runs here instead; how often the machine is checked again while it is out (doubling after each failed check, at most 5 min) |
+| `MEETING_COPILOT_FACT_SEARCH` | `remote` with `REMOTE` and `REMOTE_PATHS`, else `local` | Where the fast fact search's text search runs: `remote` (ripgrep on that machine, over its copy of the folders, this Mac as the fallback) or `local`. See [Fast fact search](#fast-fact-search) |
+| `MEETING_COPILOT_FACT_RECENT_MIN` | `15` | With the remote text search, the files changed on this Mac in the last minutes (the server copy may not have them yet) are searched here at the same time, and their lines win. `0`: off |
+| `MEETING_COPILOT_FACT_SEARCH_REMOTE_S` | `3` | Seconds the remote text search may take before this Mac searches instead (and keeps searching for `REMOTE_RETRY_S`) |
+| `MEETING_COPILOT_REMOTE_PYTHON` | `REMOTE` with its last word (`claude` or `/path/claude`) made plain `python3` | The command that starts python3 on that machine (the search program goes in on stdin, so `docker exec` needs `-i`; ripgrep must be on its PATH), e.g. `ssh myserver docker exec -i copilot-ai python3` |
 | `MEETING_COPILOT_CONTEXT_FILE` | empty | A text file about you that both AI calls read: your name and role, your projects, what your notes folders and MCP tools hold, words the transcript tends to get wrong. The first 8000 characters are used |
 | `MEETING_COPILOT_LANGUAGE` | empty (the meeting's language) | Language for every suggestion, fact and Look answer, e.g. `Brazilian Portuguese`. The language menu on the page overrides it (see [Language](#language)) |
 | `MEETING_COPILOT_PROMPT_FILE` | empty (the built-in prompt) | A text file that replaces the built-in suggestions prompt. See [Your own prompt](#your-own-prompt) |
@@ -229,6 +238,79 @@ The transcript often writes "Solarix" as "solar X".
 ```
 
 Only allow read-only MCP tools: the fact search runs during your meeting without asking you.
+
+### Fast fact search
+
+The AI with tools reads your notes in 8-9 tool rounds: 10-19 s per answer. The text search itself takes
+0.1-0.5 s. With a TypeSafe key (`MEETING_COPILOT_TYPESAFE_KEY` or `MEETING_COPILOT_TYPESAFE_KEY_FILE`, the
+same key as the Look gate) and search folders, set `MEETING_COPILOT_FACT_MODE=fast` and each fact round goes
+this way instead. It is off unless you set it (`tools`, the default, keeps only the old way), because each round
+then sends TypeSafe the transcript of the last 3 minutes, the search words and the lines found in your notes
+(with their file names); the copilot prints a line saying so when it starts with `fast` on:
+
+1. **Is a fact asked?** One call to [Jev](https://typesafe.ai) with the new lines (and the ones before, as
+   context): a yes/no probability, plus, in the same call, how much each candidate word names the fact. Below
+   `FACT_GATE_MIN` (0.5): nothing is searched and nothing is shown.
+2. **Search words** come from the new lines with plain rules (no stopwords, no accents, a final s cut);
+   the words Jev rates below 0.7 leave the search ("custou", "nota"), the others count as much as Jev says.
+3. **Text search** of the search folders: on the server with `MEETING_COPILOT_REMOTE` (see below), else on
+   this machine with ripgrep when installed (`rg` on the PATH or in Homebrew's folders), else a slower Python
+   search. Files matching `FACT_SKIP` (`*.mbox,*.gz`) and hidden
+   files and folders are skipped; `.gitignore` and `.ignore` files are not followed (both searches read the
+   same files). A word counts as a whole word, with or without accents, a plural `s`/`es` allowed, anywhere in
+   the line (up to 200 000 characters: a fact deep in a long `.jsonl` line is found); a long line is shown as
+   the 300-character window with the most of the words, cut with `...`. A line
+   scores the rarity of each word in it, plus each word in its file or folder name (a WhatsApp export named
+   after a company); the best `FACT_SNIPPETS` (10) go on.
+4. **Jev picks** the line with the fact (or none), seeing each line alone. At least `FACT_PICK_MIN` (0.8)
+   sure: that line and its file (`wiki/acme.md:4`) are shown as the fact, with no other AI call.
+5. **Unsure** (or the pick call failed): one call to `FACT_CHECK_MODEL` (`haiku`, `--effort low`, no tools,
+   one turn) with the lines, each with the line above and below, writes the answer through your fact-search
+   prompt (its `{sources}` say "read NOTES FOUND"), or `EMPTY`.
+   With `FACT_WARM=1` the next such call is started ahead, so it does not wait for claude to start.
+
+The AI with tools still runs when this cannot answer: the first Jev call out (no key, a timeout, an HTTP
+error; the log says `Jev failed (...), the fact search uses the AI with tools`), no line found, or the small-model call failed (or `FACT_CHECK_MODEL=off` and Jev was unsure).
+**With MCP tools** (`MCP_CONFIG` and `MCP_TOOLS`, a WhatsApp history for example) it also runs when the gate says a
+fact is asked but the notes do not have it: the small model answered `EMPTY` (the log says
+`checked: EMPTY, MCP next, tools+MCP`), so the MCP tools still get a chance. When the gate says no fact is asked,
+nothing runs, MCP or not. The log line of each
+round has the stages, for example `data ok in 0.6s (found) fast: gate=0.95/0.2s terms=4 search=0.18s/10
+pick=s0:0.98/0.2s picked $0.00013` (with `REMOTE`, `search=0.45s/10/remote`: where it ran); the words and the lines stay out of the log. Jev costs about US$0.00001
+per 300 words sent. `tools/bench_facts.py questions.json` runs the same questions through both ways on your
+own notes and prints seconds, cost and right or wrong.
+
+**Where the text search runs.** With `MEETING_COPILOT_REMOTE` and `REMOTE_PATHS` it runs on the server by
+default (`MEETING_COPILOT_FACT_SEARCH=remote`): one ssh call per round runs `python3 -I -` there with
+`lib/factrank.py` on stdin (read from this Mac at each start, so the server never runs an older copy and
+nothing is installed there but python3 and ripgrep). It runs ripgrep over the server's copy of the search
+folders, does the whole-word check and the scoring there (the same code the Mac runs for a local search), and
+sends back only the best `2 x FACT_SNIPPETS` lines with the line above and below each, plus how many lines
+found each word. Paths come back as this Mac's. The same rules hold (hidden files, `FACT_SKIP`, no
+`.gitignore`, NFD text). Why: a question can find thousands of lines (up to 6.4 MB from ripgrep); sending them
+all made the Mac parse and score them, so a busy Mac was as slow with the server as without it. Now the Mac gets
+12-17 KB. Measured 27/11 on the author's notes (6 questions, search stage): idle Mac 0.40-0.56 s on the server
+against 0.15-0.5 s here (once 1.0 s); Mac with 32 busy processes (load about 150) 0.40-0.53 s on the server against
+0.37-2.52 s here and 0.38-3.31 s with the old raw answer. The server needs python3 and ripgrep (the
+`Dockerfile` in `tools/remote/` installs both; `REMOTE_PYTHON` names another command).
+`REMOTE_PYTHON` defaults to `REMOTE` with its last word made plain `python3`, found on the server's PATH.
+ripgrep's exit 2 with nothing printed there (a search folder missing on the server) counts as no line found,
+with a `remote text search: rg exited 2 ...` line in the log; the server stays in use.
+When the server search fails, takes more than `FACT_SEARCH_REMOTE_S` (3 s), or python3 or ripgrep is missing
+there, the round searches here, the log says `remote text search failed (...)`, and the next rounds search here for
+`REMOTE_RETRY_S` (30 s); a search folder with no `REMOTE_PATHS` pair is always searched here.
+**The server's copy is only as new as its last sync** (`sync-notes.sh` from cron, every 10 minutes for
+example). So while the server searches, this Mac searches, at the same time, only the files in the same
+folders changed in the last `FACT_RECENT_MIN` minutes (15; `0`: off); for those files the Mac's lines replace
+the server's: the Mac names them in the request and the server leaves them out, lines and word counts, so no
+line counts twice. Finding those files is one walk of the folders before the server call (0.02-0.03 s for 7400
+files; `mdfind` took 0.16-0.23 s and Spotlight's state for the Dropbox folder was unknown); with none, nothing
+more runs here. If the search of those files here fails, the server's answer is still used (without them this
+round) and the log says `search of the N recent file(s) here failed`. The
+Mac then scores the server's lines and its own again over the word counts of both, so the scores compare (a
+word is rare or common across everything found, wherever it was found). The log shows
+`search=0.45s/10/remote/16.0KB+2recent/0.05s` (the server's answer was 16 KB; 2 recent files, searched here
+in 0.05 s).
 
 ### Your own prompt
 
@@ -455,8 +537,8 @@ MEETING_COPILOT_REMOTE_MCP_CONFIG=/home/node/mcp.json
   has `where=`, and `/state` has `remote` (`on`, `why`, `since`) and `where` in each round.
   `tools/bench_live.py --remote "<command>"` measures rounds through it.
 
-`tools/remote/` has a container for the server: `Dockerfile` (Node and Claude Code; pin the version your Mac
-runs with `CLAUDE_VERSION`), `docker-compose.yml` (memory and CPU caps, no port, an `init` that reaps finished
+`tools/remote/` has a container for the server: `Dockerfile` (Node, Claude Code and ripgrep; pin the version
+your Mac runs with `CLAUDE_VERSION`), `docker-compose.yml` (memory and CPU caps, no port, an `init` that reaps finished
 processes, your notes copy mounted read-only at `/notes`), `entry.sh` (writes the MCP config from a template
 with `${VAR}`s taken from the container's environment) and `sync-notes.sh` (an rclone copy of your search
 folders, run from cron; a copy, not a mount, because Grep reads every file and each read on a mount is a cloud
@@ -490,7 +572,7 @@ With neither search folders nor MCP, the "Relevant facts" panel says fact search
 ## Privacy
 
 - The Muesli database is opened read-only and never written.
-- The transcript of the last 3 minutes, your goals and the items already shown are sent to Claude through `claude -p` (on the kept-open process: once, then only the new lines each round). With screen sharing or the phone camera turned on for a meeting, the newest frames go too (see "Screen and camera"). In Look mode, after you tap **Look**, the newest camera frames and the questions you type go to Claude (see "Look mode"). With a TypeSafe key set, the newest Look frame also goes to TypeSafe (Jev) for the gate. Nothing else leaves the machine.
+- The transcript of the last 3 minutes, your goals and the items already shown are sent to Claude through `claude -p` (on the kept-open process: once, then only the new lines each round). With screen sharing or the phone camera turned on for a meeting, the newest frames go too (see "Screen and camera"). In Look mode, after you tap **Look**, the newest camera frames and the questions you type go to Claude (see "Look mode"). With a TypeSafe key set, the newest Look frame also goes to TypeSafe (Jev) for the gate, and in the fast fact search (`MEETING_COPILOT_FACT_MODE=fast`) the transcript of the last 3 minutes, the candidate search words and the lines found in your notes (with their file names) go to TypeSafe. Nothing else leaves the machine.
 - With `MEETING_COPILOT_REMOTE`, that same AI input goes over ssh to the machine you name, and the fact search reads that machine's copy of your search folders (see [Run the AI on a server](#run-the-ai-on-a-server)).
 - Sessions (full transcript plus suggestions) are saved as JSON files readable only by your user. A meeting saved again (the copilot restarted, or the meeting stopped and recorded again) gets a new file with `-2`, `-3`, and so on, so nothing earlier is overwritten.
 - The fact search may read files only inside the search folders: Read, Grep and Glob are allowed with a path rule for each folder, so a request in the meeting to open any other file is refused. The AI runs in an empty folder of its own and loads no Claude Code settings files, so no hook planted in a search folder runs with it.

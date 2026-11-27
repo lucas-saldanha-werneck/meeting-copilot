@@ -12,6 +12,7 @@ suggestions JSON. It ends at the end of its input. Test knobs (environment):
   FAKE_CLAUDE_SLEEP       seconds to wait before each answer
   FAKE_CLAUDE_HANG_ONCE   a path: the first process to find it missing creates it and never answers
   FAKE_CLAUDE_BAD_ONCE    a path: the first answer to find it missing creates it and replies with prose
+  FAKE_CLAUDE_EMPTY_ONCE  a path: the first one-shot call (no schema) to find it missing creates it and answers EMPTY
   FAKE_CLAUDE_TOKENS      context tokens reported per turn (grows with each turn of the process)
   FAKE_CLAUDE_REFUSE_KEY  1: a process started with ANTHROPIC_API_KEY answers "Credit balance is too low"
   FAKE_CLAUDE_WHERE       written in every entry as "where" (default "local"; the fake remote sets "remote")
@@ -132,6 +133,8 @@ if "--json-schema" in argv:
         print(json.dumps({"type": "system", "subtype": "init"}))
         print(json.dumps({"type": "assistant", "message": {"content": []}}))
     print(json.dumps(res))
+elif first_time(os.environ.get("FAKE_CLAUDE_EMPTY_ONCE")):      # a fact check that found nothing
+    print(json.dumps({"type": "result", "subtype": "success", "result": "EMPTY"}))
 else:
     print(json.dumps({"type": "result", "subtype": "success",
                       "result": "The current contract ends on 2027-03-31.\nSource: contracts.md"}))
