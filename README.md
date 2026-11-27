@@ -249,17 +249,19 @@ the default then; `tools` keeps only the old way):
    the words Jev rates below 0.7 leave the search ("custou", "nota"), the others count as much as Jev says.
 3. **Text search** of the search folders on this machine: ripgrep when installed (`rg` on the PATH or in
    Homebrew's folders), else a slower Python search. Files matching `FACT_SKIP` (`*.mbox,*.gz`) and hidden
-   files are skipped. A line scores the rarity of each word in it, plus each word in its file or folder name
-   (a WhatsApp export named after a company); the best `FACT_SNIPPETS` (10) go on, each with the line above
-   and below.
-4. **Jev picks** the line with the fact (or none). At least `FACT_PICK_MIN` (0.8) sure: that line and its
-   file (`wiki/acme.md:4`) are shown as the fact, with no other AI call.
-5. **Unsure:** one call to `FACT_CHECK_MODEL` (`haiku`, `--effort low`, no tools, one turn) with the lines
-   writes the answer through your fact-search prompt (its `{sources}` say "read NOTES FOUND"), or `EMPTY`.
+   files and folders are skipped; `.gitignore` and `.ignore` files are not followed (both searches read the
+   same files). A word counts as a whole word, with or without accents, a plural `s`/`es` allowed. A line
+   scores the rarity of each word in it, plus each word in its file or folder name (a WhatsApp export named
+   after a company); the best `FACT_SNIPPETS` (10) go on.
+4. **Jev picks** the line with the fact (or none), seeing each line alone. At least `FACT_PICK_MIN` (0.8)
+   sure: that line and its file (`wiki/acme.md:4`) are shown as the fact, with no other AI call.
+5. **Unsure** (or the pick call failed): one call to `FACT_CHECK_MODEL` (`haiku`, `--effort low`, no tools,
+   one turn) with the lines, each with the line above and below, writes the answer through your fact-search
+   prompt (its `{sources}` say "read NOTES FOUND"), or `EMPTY`.
    With `FACT_WARM=1` the next such call is started ahead, so it does not wait for claude to start.
 
-The AI with tools still runs when this cannot answer: Jev out (no key, a timeout, an HTTP error), no line
-found, or the small-model call failed (or `FACT_CHECK_MODEL=off` and Jev was unsure). The log line of each
+The AI with tools still runs when this cannot answer: the first Jev call out (no key, a timeout, an HTTP
+error; the log says `Jev failed (...), the fact search uses the AI with tools`), no line found, or the small-model call failed (or `FACT_CHECK_MODEL=off` and Jev was unsure). The log line of each
 round has the stages, for example `data ok in 0.6s (found) fast: gate=0.95/0.2s terms=4 search=0.18s/10
 pick=s0:0.98/0.2s picked $0.00013`; the words and the lines stay out of the log. Jev costs about US$0.00001
 per 300 words sent. `tools/bench_facts.py questions.json` runs the same questions through both ways on your

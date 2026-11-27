@@ -12,6 +12,7 @@ import http.client
 import io
 import http.server
 import json
+import math
 import os
 import re
 import shlex
@@ -24,6 +25,7 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 import urllib.error
 import urllib.request
 
@@ -3757,7 +3759,21 @@ class FactSearch(unittest.TestCase):
         for text in ("Orçamento do jardim", "ORCAMENTO", "orçamentos"):
             self.assertTrue(rx.search(text), text)
         self.assertIsNone(rx.search("ornamento"))
-        self.assertEqual(copilot.term_pattern("a.b"), "[aáàâãä]\\.b")
+        self.assertEqual(copilot.term_pattern("a.b", rg=True), "[aáàâãä]\\p{M}*\\.b")
+        # a whole word, a plural allowed (review item 8)
+        rx = re.compile(copilot.term_pattern("tax"), re.IGNORECASE)
+        for text in ("Tax ID", "the taxes", "taxs."):
+            self.assertTrue(rx.search(text), text)
+        for text in ("taxi", "syntax", "taxonomy"):
+            self.assertIsNone(rx.search(text), text)
+        self.assertTrue(re.search(copilot.term_pattern("contrato"), "dois contratos", re.IGNORECASE))
+        # an NFD "ç" (c + U+0327) is found once the text is NFC (review item 5)
+        nfd = "Orc\u0327amento"
+        self.assertIsNone(rx.search(nfd))
+        self.assertTrue(re.search(copilot.term_pattern("orcamento"), copilot.nfc(nfd), re.IGNORECASE))
+
+    def test_lines_split_at_newline_only(self):
+        self.assertEqual(copilot.split_lines("a\x0cb\u2028c\r\nd\x85e\n"), ["a\x0cb\u2028c", "d\x85e", ""])
 
     def check_search(self, rg):
         out = copilot.fact_search(["tax", "acme"], self.dirs, ["*.mbox", "*.gz"], 10, rg=rg)
@@ -3781,10 +3797,69 @@ class FactSearch(unittest.TestCase):
 
     def test_search_without_ripgrep(self):
         self.check_search(None)
+        self.check_review_cases(None)
 
     @unittest.skipUnless(copilot.find_rg(), "ripgrep is not installed here")
     def test_search_with_ripgrep(self):
         self.check_search(copilot.find_rg())
+        self.check_review_cases(copilot.find_rg())
+
+    def write(self, rel, text):
+        path = os.path.join(self.notes, *rel.split("/"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+
+    def check_review_cases(self, rg):
+        # item 2: a file an .ignore names is searched all the same (as the Python search does)
+        self.write("raw/.ignore", "ignored.md\n")
+        self.write("raw/ignored.md", "zorblax serial: 777\n")
+        out = copilot.fact_search(["zorblax"], self.dirs, [], 10, rg=rg)
+        self.assertEqual([s["path"] for s in out], ["raw/ignored.md"])
+        # item 3: a form feed or U+2028 inside a line does not start a new line (ripgrep's numbering)
+        self.write("raw/feed.md", "one\x0ctwo\u2028three\r\nquuxle price: 5\r\nafter\n")
+        out = copilot.fact_search(["quuxle"], self.dirs, [], 10, rg=rg)
+        self.assertEqual((out[0]["line"], out[0]["text"]), (2, "quuxle price: 5"))
+        self.assertEqual(out[0]["context"].split("\n"), ["one\x0ctwo\u2028three", "quuxle price: 5", "after"])
+        # item 5: NFD text and an NFD folder name are found by the word without accents
+        self.write("raw/servic\u0327os/notes.md", "Orc\u0327amento final: R$ 9\n")
+        out = copilot.fact_search(["orcamento", "servico"], self.dirs, [], 10, rg=rg)
+        self.assertEqual(out[0]["text"], "Orçamento final: R$ 9")
+        # the folder name counted too: rarity of "orcamento" (2 lines) plus "servico" (only in the folder name)
+        self.assertEqual(out[0]["score"], round(math.log(1 + 2 / 3) + math.log(1 + 2 / 1), 3))
+        # item 8: "tax" is not found inside "taxi"
+        self.write("raw/taxi.md", "taxi fare 30\n")
+        self.assertNotIn("raw/taxi.md", [s["path"] for s in copilot.fact_search(["tax"], self.dirs, [], 10, rg=rg)])
+        # item 9: two lines of one file: their contexts, the file read once
+        self.write("raw/twice.md", "a\nblorpt one\nb\nc\nblorpt two\nd\n")
+        real_open, opened = open, []
+
+        def spy(path, *a, **k):
+            opened.append(str(path))
+            return real_open(path, *a, **k)
+        with unittest.mock.patch("builtins.open", spy):
+            out = copilot.fact_search(["blorpt"], self.dirs, [], 10, rg=rg)
+        self.assertEqual(sorted(s["context"] for s in out), ["a\nblorpt one\nb", "c\nblorpt two\nd"])
+        self.assertEqual(sum(p.endswith("twice.md") for p in opened), 1 if rg else 2)   # Python: search + context
+
+    @unittest.skipIf(WIN, NO_BASH_WHY)
+    def test_ripgrep_exit_2_keeps_the_lines_found(self):
+        # item 1: rg exits 2 when one file cannot be read, with the other files' lines on stdout
+        rg = os.path.join(self.tmp.name, "rg")
+        line = os.path.join(self.notes, "wiki", "acme.md")
+
+        def fake(code, out):
+            with open(rg, "w") as f:
+                f.write(f"#!/bin/sh\nprintf '{out}'\nexit {code}\n")
+            os.chmod(rg, 0o755)
+        fake(2, line + "\\0004:- ACME tax ID: 12\\n")
+        out = copilot.fact_search(["tax"], self.dirs, [], 10, rg=rg)
+        self.assertEqual([(s["path"], s["line"]) for s in out], [("wiki/acme.md", 4)])
+        fake(2, "")
+        with self.assertRaises(RuntimeError):
+            copilot.fact_search(["tax"], self.dirs, [], 10, rg=rg)
+        fake(1, "")
+        self.assertEqual(copilot.fact_search(["tax"], self.dirs, [], 10, rg=rg), [])
 
     def test_weights_rank_the_named_word_first(self):
         # "garden" alone is in other.md and the orçamento page; a weight near 0 for "rules" leaves other.md
@@ -3813,7 +3888,8 @@ class FactFast(unittest.TestCase):
         self.old = (copilot.S, copilot.E, dict(os.environ), copilot.GATE_URL)
         os.environ.update({"FAKE_CLAUDE_LOG": self.claude_log, copilot.TYPESAFE_KEY_ENV: self.KEY})
         copilot.E = copilot.State()
-        self.jev = {"gate": 0.95, "weights": {}, "pick": "s0", "p": 0.95, "status": 200}
+        self.jev = {"gate": 0.95, "weights": {}, "pick": "s0", "p": 0.95, "status": 200, "pick_status": 200,
+                    "short": False}
         self.hits = []
         self.serve_jev()
         self.settings()
@@ -3845,8 +3921,12 @@ class FactFast(unittest.TestCase):
                         answers[qid] = {"type": "noul", "noul": jev["weights"].get(word, 0.9)}
                 out = json.dumps({"model": "jev-test", "answers": answers,
                                   "usage": {"input_tokens": 1000, "output_tokens": 20}}).encode()
-                h.send_response(jev["status"])
+                choice = any(q["type"] == "choice" for q in body["questions"].values())
+                h.send_response(jev["pick_status"] if choice else jev["status"])
                 h.send_header("Content-Type", "application/json")
+                if jev["short"]:                          # a body cut short: http.client.IncompleteRead
+                    h.send_header("Content-Length", str(len(out) + 50))
+                    h.send_header("Connection", "close")
                 h.end_headers()
                 h.wfile.write(out)
 
@@ -3933,6 +4013,7 @@ class FactFast(unittest.TestCase):
         crit = pick["questions"]["q"]["criteria"]
         self.assertIn("none", crit)
         self.assertIn("12.345.678", crit["s0"])
+        self.assertNotIn("Customer since", crit["s0"])        # Jev sees the line it would show, alone
         self.assertTrue(crit["s0"].startswith("wiki/acme.md:4: "))
         self.assertRegex(log, r"\(found\) fast: gate=0\.95/\d+\.\ds terms=2 search=\d+\.\d\ds/\d+ "
                               r"pick=s0:0\.95/\d+\.\ds picked \$0\.00008")
@@ -3988,6 +4069,27 @@ class FactFast(unittest.TestCase):
         self.assertIn("jev out, tools", log)
         self.say("And the owner?")
         self.assertNotIn("Jev failed", self.round())                 # at most one line a minute
+
+    def test_jev_body_cut_short_falls_back_to_the_ai_with_tools(self):
+        # item 6: http.client.IncompleteRead is not an OSError; it must not end the round
+        self.jev["short"] = True
+        res, why = copilot.jev_ask({"state": "x", "questions": {"q": {"type": "noul", "instructions": "?"}}}, 5)
+        self.assertEqual((res, why), (None, "IncompleteRead"))
+        self.say("What is the tax ID of ACME?")
+        log = self.round()
+        self.assertIn("Jev failed (IncompleteRead), the fact search uses the AI with tools", log)
+        a = self.claude_calls()[0]["argv"]
+        self.assertEqual(a[a.index("--max-turns") + 1], "8")
+
+    def test_pick_failure_goes_to_the_small_model_and_says_so(self):
+        # item 7: the log names what really happens after a failed pick call
+        self.jev["pick_status"] = 503
+        self.say("What is the tax ID of ACME?")
+        log = self.round()
+        self.assertIn("data: Jev failed (HTTP 503), the small model reads the lines", log)
+        self.assertRegex(log, r"pick=failed:0\.00/\d+\.\ds check=haiku/")
+        a = self.claude_calls()[0]["argv"]
+        self.assertEqual(a[a.index("--max-turns") + 1], "1")
 
     def test_nothing_found_falls_back_to_the_ai_with_tools(self):
         self.say("What did Zebulon quote for the yacht?")

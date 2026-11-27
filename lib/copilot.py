@@ -1049,7 +1049,7 @@ def jev_ask(request: dict, timeout: float, images: bool = False) -> tuple[dict |
         return res, ""
     except urllib.error.HTTPError as ex:
         return None, f"HTTP {ex.code}"
-    except (OSError, ValueError) as ex:
+    except (OSError, ValueError, http.client.HTTPException) as ex:     # IncompleteRead, RemoteDisconnected...
         return None, type(ex).__name__
 
 
@@ -2870,9 +2870,25 @@ def fact_terms(texts: list[str], max_terms: int = FACT_MAX_TERMS) -> list[str]:
     return out
 
 
-def term_pattern(term: str) -> str:
-    """A regex that finds the term with or without accents (any case, with the ignore-case flag)."""
-    return "".join(FOLD_CLASS.get(ch, re.escape(ch)) for ch in term)
+def term_pattern(term: str, rg: bool = False) -> str:
+    """A regex that finds the term as a whole word (a plural s/es may follow), with or without accents (any
+    case, with the ignore-case flag), for Python's re on NFC text (see nfc()). rg=True: the pre-filter for
+    ripgrep, which reads the files as they are: the term anywhere (Unicode word boundaries make ripgrep 7-9
+    times slower with several patterns), each letter also followed by combining marks (an NFD "ç" is
+    c + U+0327). fact_search keeps only the lines the Python pattern finds."""
+    if rg:
+        return "".join(FOLD_CLASS[ch] + r"\p{M}*" if ch in FOLD_CLASS else re.escape(ch) for ch in term)
+    body = "".join(FOLD_CLASS.get(ch, re.escape(ch)) for ch in term)
+    return rf"\b{body}(?:e?s)?\b"
+
+
+def nfc(text: str) -> str:
+    return text if text.isascii() else unicodedata.normalize("NFC", text)
+
+
+def split_lines(text: str) -> list[str]:
+    """Lines as ripgrep numbers them: split at \\n only (a \\f or U+2028 inside a line stays in it)."""
+    return [ln[:-1] if ln.endswith("\r") else ln for ln in text.split("\n")]
 
 
 def find_rg() -> str | None:
@@ -2884,7 +2900,10 @@ def find_rg() -> str | None:
 
 
 def _rg_hits(rg: str, pats: list[str], dirs: list[Path], skip: list[str]) -> list[tuple[str, int, str]]:
+    # --no-ignore: every file a .gitignore/.ignore would hide is searched too, as the Python search does
+    # (hidden files and folders stay out in both)
     args = [rg, "-i", "-n", "--no-heading", "--with-filename", "--null", "--no-messages", "--color", "never",
+            "--no-ignore",
             "--max-columns", str(FACT_LINE_CHARS), "--max-columns-preview", "--max-count", str(FACT_PER_FILE),
             "--max-filesize", str(FACT_FILE_MAX_BYTES)]
     for g in skip:
@@ -2893,14 +2912,15 @@ def _rg_hits(rg: str, pats: list[str], dirs: list[Path], skip: list[str]) -> lis
         args += ["-e", p]
     args += ["--", *[str(d) for d in dirs]]
     p = subprocess.run(args, capture_output=True, timeout=FACT_SEARCH_TIMEOUT_S)
-    if p.returncode not in (0, 1):       # 1: no line found
+    # 1: no line found; 2: an error, often one unreadable file among lines found (those are kept)
+    if p.returncode not in (0, 1) and not (p.returncode == 2 and p.stdout.strip()):
         raise RuntimeError(f"rg exited {p.returncode}")
     hits = []
-    for raw in p.stdout.decode("utf-8", "replace").splitlines():
+    for raw in p.stdout.decode("utf-8", "replace").split("\n"):
         path, _, rest = raw.partition("\0")
         num, _, text = rest.partition(":")
         if num.isdigit():
-            hits.append((path, int(num), text[:FACT_LINE_CHARS]))
+            hits.append((path, int(num), nfc(text.rstrip("\r"))[:FACT_LINE_CHARS]))
     return hits
 
 
@@ -2927,7 +2947,8 @@ def _py_hits(pats: list[str], dirs: list[Path], skip: list[str]) -> list[tuple[s
                 if b"\0" in data[:8000]:
                     continue                     # a binary file
                 n = 0
-                for i, ln in enumerate(data.decode("utf-8", "replace").splitlines(), 1):
+                for i, ln in enumerate(split_lines(data.decode("utf-8", "replace")), 1):
+                    ln = nfc(ln)
                     if rx.search(ln):
                         hits.append((path, i, ln[:FACT_LINE_CHARS]))
                         n += 1
@@ -2949,7 +2970,7 @@ def fact_search(terms: list[str], dirs: list[Path], skip: list[str], n: int = 10
         return []
     pats = [term_pattern(t) for t in terms]
     rg = find_rg() if rg == "auto" else rg
-    hits = _rg_hits(rg, pats, dirs, skip) if rg else _py_hits(pats, dirs, skip)
+    hits = _rg_hits(rg, [term_pattern(t, rg=True) for t in terms], dirs, skip) if rg else _py_hits(pats, dirs, skip)
     if not hits:
         return []
     rxs = [re.compile(p, re.IGNORECASE) for p in pats]
@@ -2965,8 +2986,8 @@ def fact_search(terms: list[str], dirs: list[Path], skip: list[str], n: int = 10
     path_terms: dict[str, list[int]] = {}
     for (path, num, text), ids in zip(hits, seen_in):
         if path not in path_terms:
-            path_terms[path] = [i for i, r in enumerate(rxs) if r.search(os.path.basename(os.path.dirname(path)) + "/"
-                                                                         + os.path.basename(path))]
+            name = nfc(os.path.basename(os.path.dirname(path)) + "/" + os.path.basename(path))
+            path_terms[path] = [i for i, r in enumerate(rxs) if r.search(name)]
         score = sum(idf[i] for i in ids) + FACT_PATH_WEIGHT * sum(idf[i] for i in path_terms[path] if i not in ids)
         if not ids or score <= 0:
             continue
@@ -2985,18 +3006,21 @@ def fact_search(terms: list[str], dirs: list[Path], skip: list[str], n: int = 10
                     "file": path})
         if len(out) >= n:
             break
-    for s in out:                       # one line of context above and below
-        s["context"] = _context(s.pop("file"), s["line"])
+    files: dict[str, list[str]] = {}    # one line of context above and below; each file read once
+    for s in out:
+        path = s.pop("file")
+        if path not in files:
+            try:
+                with open(path, encoding="utf-8", errors="replace", newline="") as f:
+                    files[path] = split_lines(f.read())
+            except OSError:
+                files[path] = []
+        s["context"] = _context(files[path], s["line"])
     return out
 
 
-def _context(path: str, num: int) -> str:
-    try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            lines = f.read().splitlines()
-    except OSError:
-        return ""
-    return "\n".join(ln.strip()[:FACT_LINE_CHARS] for ln in lines[max(0, num - 2):num + 1] if ln.strip())
+def _context(lines: list[str], num: int) -> str:
+    return "\n".join(nfc(ln.strip())[:FACT_LINE_CHARS] for ln in lines[max(0, num - 2):num + 1] if ln.strip())
 
 
 def _parts(lines: list[dict], seen: int) -> tuple[str, str]:
@@ -3011,14 +3035,15 @@ def fact_prompt(remote: bool = False) -> str:
     return personalize(S.data_prompt or PROMPT_DATA, sources=FACT_SOURCES)
 
 
-def fact_jev_error(why: str) -> None:
-    """One log line about a failed Jev call of the fact search, at most one a minute."""
+def fact_jev_error(why: str, then: str = "the fact search uses the AI with tools") -> None:
+    """One log line about a failed Jev call of the fact search (and what happens instead), at most one a
+    minute."""
     t = _mono()
     with E.lock:
         if t - E.fact_jev_err_at < 60:
             return
         E.fact_jev_err_at = t
-    print(f"{clock(now())} data: Jev failed ({why}), the fact search uses the AI with tools", flush=True)
+    print(f"{clock(now())} data: Jev failed ({why}), {then}", flush=True)
 
 
 def fact_fast(lines: list[dict], seen: int, shown: list[str], msg: str, info: dict) -> str | None:
@@ -3070,8 +3095,9 @@ def fact_fast(lines: list[dict], seen: int, shown: list[str], msg: str, info: di
     if not snippets:
         info["stage"] = "nothing found"
         return None
-    # Jev picks one line
-    opts = {f"s{i}": f"{s['path']}:{s['line']}: {s['context'] or s['text']}" for i, s in enumerate(snippets)}
+    # Jev picks one line. It sees only the line itself, the same text a sure pick shows (with the neighbour
+    # lines too it was less sure and right as often: 3 of 5 sure picks against 4 of 5, 27/11)
+    opts = {f"s{i}": f"{s['path']}:{s['line']}: {s['text']}" for i, s in enumerate(snippets)}
     opts["none"] = "None of these snippets has that fact."
     t = _mono()
     res, why = jev_ask({"state": {"before": before or "(nothing)", "new": new},
@@ -3085,8 +3111,9 @@ def fact_fast(lines: list[dict], seen: int, shown: list[str], msg: str, info: di
         pick = a["choice"]
         prob = float((a.get("probabilities") or {}).get(pick, a.get("confidence", 0.0)))
     except (LookupError, TypeError, ValueError):
-        if why:
-            fact_jev_error(why)
+        fact_jev_error(why or "bad answer", "the small model reads the lines" if S.fact_check_model
+                       else "the fact search uses the AI with tools")
+        info["pick_err"] = True
     info["pick"], info["pick_p"] = pick, prob
     idx = int(pick[1:]) if isinstance(pick, str) and re.fullmatch(r"s\d+", pick) else None
     idx = idx if idx is not None and idx < len(snippets) else None
@@ -3136,7 +3163,8 @@ def fact_log(info: dict) -> str:
     if "search_s" in info:
         parts.append(f"search={info['search_s']:.2f}s/{info['found']}")
     if "pick_s" in info:
-        parts.append(f"pick={info.get('pick') or '-'}:{info.get('pick_p', 0):.2f}/{info['pick_s']:.1f}s")
+        parts.append(f"pick={'failed' if info.get('pick_err') else info.get('pick') or '-'}:"
+                     f"{info.get('pick_p', 0):.2f}/{info['pick_s']:.1f}s")
     if "check_s" in info:
         tm = info.get("check_timing") or {}
         parts.append(f"check={S.fact_check_model}/{info['check_s']:.1f}s"
