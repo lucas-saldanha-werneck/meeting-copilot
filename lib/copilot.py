@@ -24,6 +24,7 @@ import hmac
 import http.client
 import ipaddress
 import json
+import math
 import os
 import queue
 import re
@@ -53,7 +54,7 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 import factrank
 import tlscert
 
-__version__ = "0.18.0"
+__version__ = "0.19.0"
 
 HERE = Path(__file__).resolve().parent
 PAGE = HERE / "page.html"
@@ -149,16 +150,22 @@ def load_token(data_dir: Path) -> str:
 
 
 # ---------------------------------------------------------------- pairing code
-# A browser without a valid cookie gets a login page that asks for a 6-digit code. Only the Mac opens a code
+# A browser without a valid cookie gets a login page that asks for a 6-digit code. The Mac opens a code
 # (`meeting-copilot code`, or the "Pair a device" button on a page that is already logged in), and it shows
-# there (also in `meeting-copilot status`). A browser that is not logged in never makes a code nor shows
-# anything on the Mac, so nobody who merely reaches the page can spam the Mac or lock the login. A right code
-# gives that browser its own device cookie, saved hashed in <data_dir>/devices.json and revocable with
-# `meeting-copilot devices forget`. The page token keeps working (?token=, Bearer).
+# there (also in `meeting-copilot status`). The login page's "Request a code" button asks the Mac to open one:
+# the code shows only on the Mac's screen (a macOS notification), never in the answer, and these requests are
+# limited (CODE_REQUEST_*), so nobody who merely reaches the page can flood the Mac or guess without bound.
+# A right code gives that browser its own device cookie, saved hashed in <data_dir>/devices.json and revocable
+# with `meeting-copilot devices forget`. The page token keeps working (?token=, Bearer). This Mac's own
+# browser on the LAN address needs no code (see Page._mac_itself).
 
 CODE_TTL_S = 300            # a code is valid for 5 minutes
 CODE_MAX_WRONG = 5          # wrong tries per device (client address) for one code; then that device is done
 CODE_TOTAL_WRONG = 20       # wrong tries over every device for one code; then the code is thrown away
+CODE_REQUEST_GAP_S = 30     # "Request a code" on the login page: at most one request per 30 seconds,
+CODE_REQUESTS_PER_HOUR = 5  # 5 an hour,
+CODE_REQUESTS_PER_DAY = 20  # 20 a day; and after CODE_TOTAL_WRONG wrong tries on requested codes, none until
+CODE_REQUEST_LOCK_S = 24 * 3600   # the Mac opens a code, a device logs in, or this time passes
 LOGIN_LINK_TTL_S = 60       # the launcher's one-time link for the Mac's own browser
 DEVICE_COOKIE = "meeting_copilot_device"
 SECURE_PREFIX = "__Host-"   # the name of a cookie set over https (Secure, Path=/, no Domain: what __Host- requires)
@@ -200,12 +207,15 @@ def builtin_language(value: str) -> str:
 
 
 class Pairing:
-    """The pairing code: 6 random digits, one code at a time, single use, opened only from the Mac.
+    """The pairing code: 6 random digits, one code at a time, single use, shown only on the Mac.
 
     Opening while a code is valid returns the same code (two devices paired in the same 5 minutes share it).
     Each device (client address) gets CODE_MAX_WRONG wrong tries per code, so one device guessing never uses up
-    another's tries; CODE_TOTAL_WRONG wrong tries over all devices throw the code away. A code is open only
-    after an action on the Mac, so guessing gets at most CODE_TOTAL_WRONG tries in a million per opening."""
+    another's tries; CODE_TOTAL_WRONG wrong tries over all devices throw the code away. A code opened on the
+    Mac gives guessing at most CODE_TOTAL_WRONG tries in a million per opening. A code a login page requested
+    (request()) is limited in time (CODE_REQUEST_*), and CODE_TOTAL_WRONG wrong tries on requested codes stop
+    the requests until the Mac opens a code, a device logs in, or CODE_REQUEST_LOCK_S pass: still at most
+    CODE_TOTAL_WRONG guesses per action on the Mac (or per day)."""
 
     def __init__(self, clock=None) -> None:
         self.clock = clock or time.time
@@ -215,6 +225,10 @@ class Pairing:
         self.wrong = 0                      # wrong tries on this code, every device
         self.wrong_by: dict[str, int] = {}  # wrong tries on this code per device (at most CODE_TOTAL_WRONG keys)
         self.links: dict[str, float] = {}   # one-time login links: secret -> expiry
+        self.requested = False              # the open code was opened by a login page's request()
+        self.requests: list[float] = []     # when a login page requested a code (the last day)
+        self.request_wrong = 0              # wrong tries on requested codes since the last Mac action/login
+        self.request_wrong_at = 0.0         # when the last of them was made
 
     def _active(self, t: float) -> bool:
         if self.code and t < self.expires:
@@ -237,9 +251,40 @@ class Pairing:
             t = self.clock()
             made = not self._active(t) or self.wrong > 0
             if made:
-                self.code = f"{secrets.randbelow(10 ** 6):06d}"
-                self.expires, self.wrong, self.wrong_by = t + CODE_TTL_S, 0, {}
+                self._new(t)
+            self.request_wrong = 0   # an action on the Mac: a login page may request codes again
             return self.code, max(1, int(self.expires - t)), made
+
+    def _new(self, t: float, requested: bool = False) -> None:
+        self.code = f"{secrets.randbelow(10 ** 6):06d}"
+        self.expires, self.wrong, self.wrong_by, self.requested = t + CODE_TTL_S, 0, {}, requested
+
+    def request(self) -> tuple[str, str | None, int]:
+        """A login page's "Request a code": ("ok", code, seconds left) with the open code (a new one when none
+        is open; an open code is never replaced, so its wrong tries keep counting), for the Mac's screen only;
+        ("wait", None, seconds) when asked too often (CODE_REQUEST_*); ("locked", None, seconds) after
+        CODE_TOTAL_WRONG wrong tries on requested codes (until the Mac opens a code or a device logs in)."""
+        with self.lock:
+            t = self.clock()
+            if self.request_wrong >= CODE_TOTAL_WRONG:
+                left = self.request_wrong_at + CODE_REQUEST_LOCK_S - t
+                if left > 0:
+                    return "locked", None, math.ceil(left)
+                self.request_wrong = 0
+            self.requests = [r for r in self.requests if t - r < 86400]
+            waits = [self.requests[-1] + CODE_REQUEST_GAP_S - t] if self.requests else []
+            hour = [r for r in self.requests if t - r < 3600]
+            if len(hour) >= CODE_REQUESTS_PER_HOUR:
+                waits.append(hour[-CODE_REQUESTS_PER_HOUR] + 3600 - t)
+            if len(self.requests) >= CODE_REQUESTS_PER_DAY:
+                waits.append(self.requests[-CODE_REQUESTS_PER_DAY] + 86400 - t)
+            wait = max(waits, default=0)
+            if wait > 0:
+                return "wait", None, math.ceil(wait)
+            self.requests.append(t)
+            if not self._active(t):
+                self._new(t, requested=True)
+            return "ok", self.code, max(1, int(self.expires - t))
 
     def try_code(self, given: str, client: str = "") -> tuple[str, int]:
         """("ok" | "wrong" | "device_used_up" | "used_up" | "expired", number): the tries this device has left
@@ -257,9 +302,15 @@ class Pairing:
             # constant time: the code is never compared byte by byte with an early exit
             ok = hmac.compare_digest(given.encode(), self.code.encode()) and bool(_CODE_OK.match(given))
             if ok:
-                self.code = None
+                self.code, self.request_wrong = None, 0
                 return "ok", 0
             self.wrong += 1
+            if self.requested:
+                self.request_wrong += 1
+                self.request_wrong_at = t
+                if self.request_wrong >= CODE_TOTAL_WRONG:   # requests stop: the open requested code goes too
+                    self.code = None
+                    return "used_up", 0
             self.wrong_by[client] = self.wrong_by.get(client, 0) + 1
             if self.wrong >= CODE_TOTAL_WRONG:
                 self.code = None
@@ -374,12 +425,40 @@ class Devices:
 
 
 PAIR = Pairing()
-CLOSED_MSG = ("No code is open. On the Mac, run: meeting-copilot code (or tap \"Pair a device\" on a page "
-              "that is already logged in), then type the code here.")
+CLOSED_MSG = ("No code is open. Tap \"Request a code\" (it shows on the Mac's screen), or on the Mac run: "
+              "meeting-copilot code (or tap \"Pair a device\" on a page that is already logged in), then type "
+              "the code here.")
 DEVICE_USED_UP_MSG = (f"This device used its {CODE_MAX_WRONG} tries for this code. On the Mac, run: "
                       "meeting-copilot code (or tap \"Pair a device\" on a page that is already logged in) for "
                       "a new code, then type it here.")
 DEVICES = Devices(None)   # main() points it at <data_dir>/devices.json
+
+
+def device_hint(user_agent: str) -> str:
+    """A few words that name a browser's device for the notification ("iPhone", "Android", ...)."""
+    ua = user_agent or ""
+    for key, name in (("iPhone", "iPhone"), ("iPad", "iPad"), ("Android", "Android"), ("Windows", "Windows"),
+                      ("Macintosh", "Mac"), ("CrOS", "Chromebook"), ("Linux", "Linux")):
+        if key in ua:
+            return name
+    return "".join(c if " " <= c <= "~" else "?" for c in ua)[:40] or "unknown browser"
+
+
+def notify_code(code: str, who: str) -> bool:
+    """Shows a requested pairing code on the Mac's screen (a macOS notification through osascript). The text
+    goes in as arguments, never into the AppleScript source. False when it could not be shown."""
+    if not S.osascript:
+        return False
+    who = "".join(c if " " <= c <= "~" else "?" for c in who)[:120]
+    cmd = [S.osascript, "-e", "on run argv", "-e",
+           "display notification (item 1 of argv) with title (item 2 of argv) subtitle (item 3 of argv)",
+           "-e", "end run", f"Code: {code} (valid {CODE_TTL_S // 60} minutes)", "Meeting Copilot: pairing code",
+           f"Asked by {who}"]
+    try:
+        return subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              timeout=10).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def _is_path(cmd: str) -> bool:
@@ -904,6 +983,13 @@ class Settings:
                                    | (set(names) if self.lan_https_port == 443 else set()))
         self.openssl = _expand(g("OPENSSL").strip()) or shutil.which("openssl")
         self.tmutil = _tool(g("TMUTIL"), "tmutil")
+        # LAN_MAC_LOGIN: this Mac's own browser on http(s)://<name>.local is logged in with no code (a request
+        # on the LAN listeners from this Mac's own LAN address; never loopback, never a forwarded request)
+        self.lan_mac_login = _on(g("LAN_MAC_LOGIN", "1"))
+        # macOS tools: `security` (does this Mac trust the CA? `cert trust` adds it) and `osascript` (the
+        # notification with a code a login page asked for); off = none
+        self.security = _tool(g("SECURITY"), "security")
+        self.osascript = _tool(g("OSASCRIPT"), "osascript")
         dns_sd = g("DNS_SD").strip()
         self.dns_sd = _expand(dns_sd) if dns_sd else (shutil.which("dns-sd") if sys.platform == "darwin" else None)
 
@@ -4827,6 +4913,10 @@ SETUP_PAGE = HERE / "setup.html"
 HTTPS_UP = {"port": 0}     # the port of the running TLS listener (0: none), for the redirect and `status`
 SETUP_PATHS = ("/setup", "/ca.crt", "/ca.mobileconfig", "/ping")
 HTTPS_COOKIE = "mc_https"  # set by the /setup page (JavaScript) to ca_tag() once https works on that phone
+# Headers a tunnel or reverse proxy adds: a request that has one was forwarded for someone else, so it is never
+# taken for this Mac itself (Page._mac_itself), whatever address the connection came from.
+PROXY_HEADERS = ("Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "X-Real-IP", "Via",
+                 "Cf-Connecting-IP", "Cf-Ray", "Cf-Visitor", "Cf-Ipcountry", "True-Client-IP", "X-Client-IP")
 HTTP_OFF_MSG = (b"LAN https is on: this page answers over https only. Open /setup on this address to set this "
                 b"device up, then use the https address.\n")
 
@@ -4923,6 +5013,65 @@ def cert_cli(renew: bool) -> int:
         return 1
     print(f"files: {d} (server.key is mode 0600{'; the folder is excluded from Time Machine' if S.tmutil else ''})")
     print("restart the copilot (`meeting-copilot stop`, then start) to use it")
+    return 0
+
+
+_MAC_TRUST = {"tag": "", "ok": False, "at": 0.0}   # mac_trusts_ca's last answer, per CA
+_MAC_TRUST_LOCK = threading.Lock()
+MAC_TRUST_CACHE_S = 60
+
+
+def mac_trusts_ca() -> bool:
+    """Whether this Mac's browsers trust the https certificate (macOS `security verify-cert` with the ssl
+    policy for <name>.local, local keychains only): then the Mac's own browser on http://<name>.local goes on
+    to https by itself. Asked again a minute later at most."""
+    tag = ca_tag()
+    if not (S.security and tag and S.lan_name):
+        return False
+    t = now()
+    with _MAC_TRUST_LOCK:
+        # a "yes" is kept a minute; a "no" only a few seconds, so `cert trust` takes effect at once
+        if _MAC_TRUST["tag"] == tag and t - _MAC_TRUST["at"] < (MAC_TRUST_CACHE_S if _MAC_TRUST["ok"] else 5):
+            return _MAC_TRUST["ok"]
+    d = tls_dir()
+    try:
+        ok = subprocess.run([S.security, "verify-cert", "-c", str(d / "server.crt"), "-c", str(d / "ca.crt"),
+                             "-p", "ssl", "-n", f"{S.lan_name}.local", "-L", "-q"], stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        ok = False
+    with _MAC_TRUST_LOCK:
+        _MAC_TRUST.update(tag=tag, ok=ok, at=t)
+    return ok
+
+
+def cert_trust_cli() -> int:
+    """`meeting-copilot cert trust`: this Mac trusts the copilot's CA (login keychain, for https only), so its
+    browsers open https://<name>.local without a warning. macOS asks for your password or Touch ID once."""
+    ca = tls_dir() / "ca.crt"
+    if not ca.exists():
+        print("meeting-copilot: no certificate yet: run `meeting-copilot cert` first", file=sys.stderr)
+        return 1
+    if not S.security:
+        print("meeting-copilot: `cert trust` needs macOS (the security command); on another system, add "
+              f"{ca} to the system's trusted certificates by hand", file=sys.stderr)
+        return 1
+    keychain = Path.home() / "Library" / "Keychains" / "login.keychain-db"
+    print("macOS now asks for your password (or Touch ID) to trust the copilot's certificate authority. "
+          "It can vouch only for the copilot's own .local name and home network addresses.", flush=True)
+    try:
+        rc = subprocess.run([S.security, "add-trusted-cert", "-r", "trustRoot", "-p", "ssl", "-k", str(keychain),
+                             str(ca)], timeout=300).returncode
+    except (OSError, subprocess.SubprocessError) as ex:
+        print(f"meeting-copilot: {ex}", file=sys.stderr)
+        return 1
+    if rc != 0:
+        print("meeting-copilot: macOS did not add the certificate (cancelled?)", file=sys.stderr)
+        return 1
+    name = f"{S.lan_name}.local" if S.lan_name else "the LAN address"
+    port = "" if S.lan_https_port == 443 else f":{S.lan_https_port}"
+    print(f"done: this Mac trusts the copilot's certificate. Open https://{name}{port}/ (no code needed on this "
+          "Mac); http:// goes there by itself.")
     return 0
 
 
@@ -5042,6 +5191,24 @@ class Page(BaseHTTPRequestHandler):
             log_untrusted(kind, why)
         return why
 
+    def _mac_itself(self) -> bool:
+        """This Mac's own browser (or any program of this Mac), logged in with no code: the LAN listener
+        (never the loopback one, where a tunnel's public visitors arrive), reached from this Mac's own LAN
+        address (the device's address is the address it reached: a connection from the Mac to itself, which
+        no other device can make), and no proxy header (a tunnel or proxy on this Mac pointed at the LAN
+        address would forward someone else). Loopback is not enough: a tunnel may connect from 127.0.0.1.
+        The Host and Origin checks still run first (no DNS rebinding, no cross-site POST). Same reach as
+        today's `meeting-copilot code` or the token file, which any program of yours can already use. A raw
+        TCP forwarder on this Mac pointed at the LAN address (ssh -L/-R/-D, socat, ngrok tcp) adds no header
+        and does pass for the Mac: LAN_MAC_LOGIN=0 for those setups (README)."""
+        if not (S.lan_mac_login and self._lan):
+            return False
+        a, mine = _ip(str(self.client_address[0])), _ip(self._local_ip())
+        if a is None or a.is_loopback or a.is_unspecified or a != mine:
+            return False
+        names = PROXY_HEADERS + ((S.client_ip_header,) if S.client_ip_header else ())
+        return not any(self.headers.get(n) is not None for n in names)
+
     def _host_ok(self) -> bool:
         # blocks DNS rebinding: only our own host names are answered
         host = self.headers.get("Host", "")
@@ -5098,11 +5265,13 @@ class Page(BaseHTTPRequestHandler):
         return auth[7:].strip() if auth[:7].lower() == "bearer " else ""
 
     def _authed(self) -> bool:
-        """The token cookie, a paired device's cookie, or the token as `Authorization: Bearer` (scripts)."""
+        """The token cookie, a paired device's cookie, the token as `Authorization: Bearer` (scripts), or this Mac
+        itself on the LAN listener (_mac_itself)."""
         return (any(self._token_ok(v) for n in (TOKEN_COOKIE, SECURE_PREFIX + TOKEN_COOKIE) for v in self._cookies(n))
                 or any(DEVICES.ok(v, self._plain_lan) for n in (DEVICE_COOKIE, SECURE_PREFIX + DEVICE_COOKIE)
                        for v in self._cookies(n))
-                or self._token_ok(self._bearer()))
+                or self._token_ok(self._bearer())
+                or self._mac_itself())
 
     def _cookie(self, name: str, value: str) -> str:
         """Over https the cookie is Secure and has its own name (__Host-<name>): a browser never lets an http
@@ -5154,6 +5323,8 @@ class Page(BaseHTTPRequestHandler):
             # no page here, where anyone on the Wi-Fi could read them.
             if self._to_https(path):
                 return
+            if self._navigation() and self._mac_itself() and mac_trusts_ca() and self._redirect_https(path):
+                return   # this Mac trusts the certificate (`cert trust`): straight to https, no set-up page
             if self._navigation():
                 return self._send(302, b"", "text/plain", {"Location": "/setup"})
             return self._send(403, HTTP_OFF_MSG, "text/plain; charset=utf-8")
@@ -5200,6 +5371,12 @@ class Page(BaseHTTPRequestHandler):
                 body = SETUP_PAGE.read_text(encoding="utf-8")
                 body = body.replace("__NAME__", name).replace("__HTTPS_PORT__", str(S.lan_https_port))
                 body = body.replace("__CA_TAG__", ca_tag())
+                if self._mac_itself():   # this Mac: one command instead of the phone steps
+                    body = re.sub(r"<!--phone-->.*?<!--/phone-->", "", body, flags=re.S)
+                    body = body.replace("Set up this phone", "Set up this Mac")
+                else:
+                    body = re.sub(r"<!--mac-->.*?<!--/mac-->", "", body, flags=re.S)
+                body = re.sub(r"<!--/?(mac|phone)-->\n?", "", body)
                 self._send(200, body.encode(), "text/html; charset=utf-8")
             elif path == "/ca.crt":
                 self._send(200, (d / "ca.crt").read_bytes(), "application/x-x509-ca-cert",
@@ -5224,11 +5401,15 @@ class Page(BaseHTTPRequestHandler):
             self._send(302, b"", "text/plain",
                        {"Location": "/setup", "Set-Cookie": f"{HTTPS_COOKIE}=; Path=/; Max-Age=0; SameSite=Lax"})
             return True
+        return self._redirect_https(path)
+
+    def _redirect_https(self, path: str) -> bool:
+        """302 to the same path on the https listener, on the host name the browser used (no IPv6 literal)."""
         try:
             host = urlsplit("//" + self.headers.get("Host", "")).hostname or ""
         except ValueError:
             return False
-        if not host or ":" in host:
+        if not host or ":" in host or not HTTPS_UP["port"]:
             return False
         port = HTTPS_UP["port"]
         loc = f"https://{host}{'' if port == 443 else f':{port}'}/" + path.lstrip("/")
@@ -5260,6 +5441,26 @@ class Page(BaseHTTPRequestHandler):
         if result == "expired":
             return self._json(410, {"error": CLOSED_MSG})
         return self._json(401, {"error": f"Wrong code. {n} {'try' if n == 1 else 'tries'} left.", "left": n})
+
+    def _request_code(self) -> None:
+        """POST /login/code, the login page's "Request a code": opens a code (or keeps the open one) and shows
+        it on the Mac's screen only. The answer never has the code. Limited: see Pairing.request."""
+        result, code, secs = PAIR.request()
+        if result == "locked":
+            return self._json(429, {"error": "Too many wrong codes: requesting a code is off for now. On the Mac, "
+                                             "run: meeting-copilot code, then type the code here.",
+                                    "retry_in": secs})
+        if result == "wait":
+            return self._json(429, {"error": f"A code was requested a moment ago. Look at the Mac's screen, or "
+                                             f"ask again in {_left(secs)}.", "retry_in": secs})
+        who = f"{device_hint(self.headers.get('User-Agent', ''))} at {self._client_key()}"
+        shown = notify_code(code, f"{who} via {self.headers.get('Host', '')[:40]}")
+        print(f"{clock(now())} a login page requested a pairing code ({who}); "
+              f"{'shown on the screen' if shown else 'no notification: see `meeting-copilot status`'}", flush=True)
+        msg = ("The code is on the Mac's screen (a notification). Type it here." if shown else
+               "A code is open, but no notification could be shown. On the Mac, run: meeting-copilot status, "
+               "then type the code here.")
+        self._json(200, {"ok": True, "shown": shown, "message": msg, "expires_in": secs})
 
     def _frame_refused(self, raw: bytes, declared: int) -> bool:
         """Size and image type of a phone frame (camera or Look); True when refused (the answer is sent).
@@ -5394,8 +5595,7 @@ class Page(BaseHTTPRequestHandler):
         if path == "/login":
             return self._login(raw)
         if path == "/login/code":
-            # the old "show the code on the Mac again" button (a login page still open from 0.16 or before)
-            return self._json(409, {"error": CLOSED_MSG})
+            return self._request_code()
         if not authed:
             return self._deny()
         if upload:
@@ -5817,6 +6017,7 @@ def main(argv=None) -> None:
     ap.add_argument("--yes", action="store_true", help="with --bench: really call claude")
     ap.add_argument("--cert", action="store_true", help="make the local CA and the https certificate, or show them")
     ap.add_argument("--renew", action="store_true", help="with --cert: a new CA and certificate (phones reinstall)")
+    ap.add_argument("--trust", action="store_true", help="with --cert: this Mac trusts the CA (login keychain)")
     args = ap.parse_args(argv)
     seed_config()   # bin/meeting-copilot calls --get first, so any first command creates it
     cfg = load_config()
@@ -5833,7 +6034,7 @@ def main(argv=None) -> None:
         return
     if args.cert:
         S = Settings(cfg)
-        raise SystemExit(cert_cli(args.renew))
+        raise SystemExit(cert_trust_cli() if args.trust else cert_cli(args.renew))
     if args.bench is not None:
         raise SystemExit(bench(cfg, max(1, min(args.bench, 50)), args.bench_image, args.yes))
     if args.cli:

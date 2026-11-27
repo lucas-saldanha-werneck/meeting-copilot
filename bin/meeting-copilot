@@ -8,7 +8,9 @@
 #   meeting-copilot log                                   show the end of the log
 #   meeting-copilot bench [N] [--yes]                     time N real suggestion rounds, with and without an image
 #   meeting-copilot cert [--renew]                        the https certificate for the phone camera (see README)
-#   A browser that is not logged in asks for a 6-digit code that only the Mac opens (`meeting-copilot code`).
+#   meeting-copilot cert trust                            this Mac trusts that certificate (asks for your password)
+#   A browser that is not logged in asks for a 6-digit code shown on the Mac (`code`, or its "Request a code").
+#   This Mac's own browser on http(s)://<name>.local needs no code.
 set -u
 
 # Resolve the real script location, also when called through a symlink in ~/.local/bin.
@@ -47,7 +49,7 @@ while [ $# -gt 0 ]; do
     --db) args+=("--db" "$2"); shift ;;
     bench) cmd=bench; shift; args=("$@"); break ;;
     cert) cmd=cert; shift; args=("$@"); break ;;
-    -h|--help) sed -n '2,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "meeting-copilot: unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
@@ -156,14 +158,21 @@ case "$cmd" in
   devices|forget-devices)
     cli "$cmd" ;;
   cert)
-    # make the local CA + https certificate (first time), or show it; --renew replaces both
+    # make the local CA + https certificate (first time), or show it; --renew replaces both; trust: this Mac
+    # trusts the CA (macOS asks for the password once)
     renew=()
+    trust=()
     for a in ${args[@]+"${args[@]}"}; do
       case "$a" in
         --renew) renew=(--renew) ;;
+        trust) trust=(--trust) ;;
         *) echo "meeting-copilot cert: unknown argument: $a" >&2; exit 2 ;;
       esac
     done
+    if [ ${#renew[@]} -gt 0 ] && [ ${#trust[@]} -gt 0 ]; then
+      echo "meeting-copilot cert: run --renew and trust one after the other (renew first)" >&2; exit 2
+    fi
+    renew+=(${trust[@]+"${trust[@]}"})
     exec "$PY" "$APP" --cert ${renew[@]+"${renew[@]}"} ;;
   bench)
     # N rounds (default 3); without --yes it only says what it would do and cost

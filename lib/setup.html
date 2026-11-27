@@ -12,12 +12,19 @@
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px 16px; margin: 12px 0; }
   a.btn, button { display: inline-block; background: var(--say); color: #0f1218; font-weight: 600; border: 0; border-radius: 8px; padding: 10px 16px; text-decoration: none; font-size: 16px; }
   ol { padding-left: 20px; } li { margin: 4px 0; }
+  code { font: 14px ui-monospace, Menlo, monospace; background: var(--card); padding: 1px 5px; border-radius: 4px; }
   .dim { color: var(--dim); font-size: 14px; }
   #res.ok { color: var(--ok); } #res.bad { color: var(--warn); }
 </style>
 </head>
 <body>
 <h1>Set up this phone</h1>
+<!--mac-->
+<h2>This Mac</h2>
+<p>In Terminal, run <code>meeting-copilot cert trust</code>. macOS asks for your password or Touch ID once.
+  Then test below: this Mac goes to https by itself from then on, and needs no code.</p>
+<!--/mac-->
+<!--phone-->
 <div class="card">This phone will trust a certificate authority that can vouch <b>only</b> for <b>__NAME__</b> and home network addresses (192.168.x.x, 10.x.x.x, 172.16-31.x.x). It cannot vouch for any other site.</div>
 
 <h2>iPhone or iPad</h2>
@@ -35,6 +42,7 @@
   <li><b>Install a certificate</b>, then <b>CA certificate</b>, accept the warning, and pick the downloaded file.</li>
 </ol>
 <p class="dim">The exact menu names differ between phones.</p>
+<!--/phone-->
 
 <h2>Check it</h2>
 <p><button id="test">Test https</button></p>
