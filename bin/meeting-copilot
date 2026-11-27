@@ -161,13 +161,18 @@ case "$cmd" in
     # make the local CA + https certificate (first time), or show it; --renew replaces both; trust: this Mac
     # trusts the CA (macOS asks for the password once)
     renew=()
+    trust=()
     for a in ${args[@]+"${args[@]}"}; do
       case "$a" in
         --renew) renew=(--renew) ;;
-        trust) renew=(--trust) ;;
+        trust) trust=(--trust) ;;
         *) echo "meeting-copilot cert: unknown argument: $a" >&2; exit 2 ;;
       esac
     done
+    if [ ${#renew[@]} -gt 0 ] && [ ${#trust[@]} -gt 0 ]; then
+      echo "meeting-copilot cert: run --renew and trust one after the other (renew first)" >&2; exit 2
+    fi
+    renew+=(${trust[@]+"${trust[@]}"})
     exec "$PY" "$APP" --cert ${renew[@]+"${renew[@]}"} ;;
   bench)
     # N rounds (default 3); without --yes it only says what it would do and cost

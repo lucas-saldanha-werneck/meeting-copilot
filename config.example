@@ -142,7 +142,8 @@
 #MEETING_COPILOT_TMUTIL=
 # 1: this Mac's own browser on http(s)://<LAN_NAME>.local is logged in with no code (a
 # request from this Mac's LAN address; never loopback, never through a tunnel or a
-# proxy). On a Mac shared with other user accounts, set 0. Default: 1.
+# proxy). Set 0 on a Mac shared with other user accounts, or when a raw TCP forwarder
+# on this Mac points at its LAN address (ssh -L/-R/-D, socat, ngrok tcp). Default: 1.
 #MEETING_COPILOT_LAN_MAC_LOGIN=1
 # The command that checks whether this Mac trusts the https certificate, and that
 # `meeting-copilot cert trust` uses (empty: security on PATH, macOS only; off: not used).

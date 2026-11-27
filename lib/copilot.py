@@ -308,6 +308,9 @@ class Pairing:
             if self.requested:
                 self.request_wrong += 1
                 self.request_wrong_at = t
+                if self.request_wrong >= CODE_TOTAL_WRONG:   # requests stop: the open requested code goes too
+                    self.code = None
+                    return "used_up", 0
             self.wrong_by[client] = self.wrong_by.get(client, 0) + 1
             if self.wrong >= CODE_TOTAL_WRONG:
                 self.code = None
@@ -5195,7 +5198,9 @@ class Page(BaseHTTPRequestHandler):
         no other device can make), and no proxy header (a tunnel or proxy on this Mac pointed at the LAN
         address would forward someone else). Loopback is not enough: a tunnel may connect from 127.0.0.1.
         The Host and Origin checks still run first (no DNS rebinding, no cross-site POST). Same reach as
-        today's `meeting-copilot code` or the token file, which any program of yours can already use."""
+        today's `meeting-copilot code` or the token file, which any program of yours can already use. A raw
+        TCP forwarder on this Mac pointed at the LAN address (ssh -L/-R/-D, socat, ngrok tcp) adds no header
+        and does pass for the Mac: LAN_MAC_LOGIN=0 for those setups (README)."""
         if not (S.lan_mac_login and self._lan):
             return False
         a, mine = _ip(str(self.client_address[0])), _ip(self._local_ip())

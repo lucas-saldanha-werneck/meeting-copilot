@@ -2523,7 +2523,6 @@ MEETING_WINDOWS = [
 ]
 
 
-@unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
 class MacLoginAndCodeRequest(unittest.TestCase):
     """0.19.0: this Mac's own browser on the LAN address needs no code (never the tunnel), http->https for a Mac
     that trusts the CA, `cert trust`, and the login page's "Request a code" (shown on the Mac's screen only)."""
@@ -2681,9 +2680,10 @@ class MacLoginAndCodeRequest(unittest.TestCase):
 
     def test_cert_trust_adds_the_ca_to_the_login_keychain(self):
         home = os.path.join(self.t, "home")
-        with unittest.mock.patch.dict(os.environ, {"HOME": home}), contextlib.redirect_stdout(io.StringIO()) as out:
+        with unittest.mock.patch.object(copilot.Path, "home", return_value=copilot.Path(home)), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertEqual(copilot.cert_trust_cli(), 0)
-        keychain = os.path.join(home, "Library", "Keychains", "login.keychain-db")
+        keychain = str(copilot.Path(home) / "Library" / "Keychains" / "login.keychain-db")
         self.assertEqual(self.runs[-1], ["/fake/security", "add-trusted-cert", "-r", "trustRoot", "-p", "ssl", "-k",
                                          keychain, str(copilot.tls_dir() / "ca.crt")])
         self.assertIn("https://copilot.local:8443/", out.getvalue())
@@ -2734,6 +2734,7 @@ class MacLoginAndCodeRequest(unittest.TestCase):
                 self.assertEqual(p.request()[0], "ok", n)
             code = p.current()[0]
             self.assertIn(p.try_code(PairingCode.wrong_for(code), f"dev{n}")[0], ("wrong", "used_up"))
+        self.assertIsNone(p.current())                            # the 20th wrong try closed the open code
         self.clock.t += 3600
         self.assertEqual(p.request()[0], "locked")                # at most 20 guesses without the Mac
         self.clock.t += copilot.CODE_REQUEST_LOCK_S
@@ -2810,6 +2811,7 @@ class MacLoginAndCodeRequest(unittest.TestCase):
         self.assertIn('"/login/code"', body)
 
 
+@unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
 class Vision(unittest.TestCase):
     """Screen capture, frames and response times, in-process, with fake screencapture/window list/claude.
     Never a real screencapture: the commands are always the fakes in tests/fake_screen.py."""
