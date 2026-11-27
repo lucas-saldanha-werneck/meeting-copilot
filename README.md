@@ -207,6 +207,7 @@ Every key:
 | `MEETING_COPILOT_REMOTE_MCP_CONFIG` | empty | The MCP config file on that machine (`MCP_TOOLS` applies to it); empty: no MCP tools while the AI runs there |
 | `MEETING_COPILOT_REMOTE_FIRST_BYTE_S`, `_REMOTE_RETRY_S` | `6`, `30` | A one-shot call there that prints nothing for this long runs here instead; how often the machine is checked again while it is out (doubling after each failed check, at most 5 min) |
 | `MEETING_COPILOT_FACT_SEARCH` | `remote` with `REMOTE` and `REMOTE_PATHS`, else `local` | Where the fast fact search's text search runs: `remote` (ripgrep on that machine, over its copy of the folders, this Mac as the fallback) or `local`. See [Fast fact search](#fast-fact-search) |
+| `MEETING_COPILOT_FACT_RECENT_MIN` | `15` | With the remote text search, the files changed on this Mac in the last minutes (the server copy may not have them yet) are searched here at the same time, and their lines win. `0`: off |
 | `MEETING_COPILOT_FACT_SEARCH_REMOTE_S` | `3` | Seconds the remote text search may take before this Mac searches instead (and keeps searching for `REMOTE_RETRY_S`) |
 | `MEETING_COPILOT_REMOTE_RG` | `REMOTE` with `claude` made `rg` | The command that starts ripgrep on that machine, e.g. `ssh myserver docker exec -i copilot-ai rg` |
 | `MEETING_COPILOT_CONTEXT_FILE` | empty | A text file about you that both AI calls read: your name and role, your projects, what your notes folders and MCP tools hold, words the transcript tends to get wrong. The first 8000 characters are used |
@@ -282,8 +283,11 @@ When the server search fails, takes more than `FACT_SEARCH_REMOTE_S` (3 s) or ri
 round searches here, the log says `remote text search failed (...)`, and the next rounds search here for
 `REMOTE_RETRY_S` (30 s); a search folder with no `REMOTE_PATHS` pair is always searched here.
 **The server's copy is only as new as its last sync** (`sync-notes.sh` from cron, every 10 minutes for
-example): a note written in the last minutes may not be found there. Such a fact can still come from the AI
-with tools (when nothing is found) or from `MEETING_COPILOT_FACT_SEARCH=local`.
+example). So while the server searches, this Mac searches, at the same time, only the files in the same
+folders changed in the last `FACT_RECENT_MIN` minutes (15; `0`: off); for those files the Mac's lines replace
+the server's. Finding them is one walk of the folders (0.02-0.03 s for 7400 files; `mdfind` took 0.16-0.23 s
+and Spotlight's state for the Dropbox folder was unknown); with none, nothing more runs here. The log shows
+`search=0.45s/10/remote+2recent/0.05s` (2 recent files, searched here in 0.05 s).
 
 ### Your own prompt
 

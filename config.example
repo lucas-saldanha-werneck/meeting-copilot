@@ -178,10 +178,14 @@
 # Where the fast fact search's text search (ripgrep) runs. remote: on that machine,
 # one call per round over its copy of the search folders (REMOTE_PATHS), so a busy
 # Mac does not slow it down; needs ripgrep there (tools/remote/Dockerfile has it).
-# That copy is only as new as its last sync (sync-notes.sh: every 10 minutes), so a
-# note written in the last minutes may be found only by the AI with tools or by a
-# local search. local: here. Default: remote when REMOTE and REMOTE_PATHS are set.
+# That copy is only as new as its last sync (sync-notes.sh: every 10 minutes), so
+# the files changed here in the last FACT_RECENT_MIN minutes are searched here at the
+# same time (this machine's lines win for them). local: everything here.
+# Default: remote when REMOTE and REMOTE_PATHS are set.
 #MEETING_COPILOT_FACT_SEARCH=
+# Minutes: with the remote search, files changed here this recently are also searched
+# here. 0: off (only the server copy).
+#MEETING_COPILOT_FACT_RECENT_MIN=15
 # Seconds the remote search may take; slower, failed (or ripgrep missing there) and
 # this round and the next ones for REMOTE_RETRY_S search here instead.
 #MEETING_COPILOT_FACT_SEARCH_REMOTE_S=3

@@ -3886,6 +3886,10 @@ class FactSearchRemote(unittest.TestCase):
         with open(os.path.join(self.server, "raw", "only-there.md"), "w", encoding="utf-8") as f:
             f.write("before\nzorblax serial: 42\nafter\n")
         self.dirs = [copilot.Path(self.notes, "wiki"), copilot.Path(self.notes, "raw")]
+        old = time.time() - 3600                          # this machine's notes: an hour old (none recent)
+        for root, _, files in os.walk(self.notes):
+            for name in files:
+                os.utime(os.path.join(root, name), (old, old))
         rbin = os.path.join(t, "rbin")
         os.makedirs(rbin)
         self.ssh, self.rg = os.path.join(rbin, "ssh"), os.path.join(rbin, "rg")
@@ -4032,6 +4036,57 @@ class FactSearchRemote(unittest.TestCase):
         self.settings(FACT_SEARCH="local")
         found, where, _ = self.search(["tax", "acme"])
         self.assertEqual((where, found[0]["path"], self.calls()), ("local", "wiki/acme.md", 0))
+
+    def test_recent_files_skip_what_the_search_skips(self):
+        self.assertEqual(copilot.recent_files(self.dirs, ["*.mbox", "*.gz"], 15), [])
+        for rel in ("raw/fresh.md", "raw/mail/fresh.mbox", "raw/.hidden/fresh.md", "wiki/.fresh.md"):
+            path = os.path.join(self.notes, *rel.split("/"))
+            with open(path, "w") as f:
+                f.write("x\n")
+        self.assertEqual(copilot.recent_files(self.dirs, ["*.mbox", "*.gz"], 15),
+                         [os.path.join(self.notes, "raw", "fresh.md")])
+
+    def test_recent_files_here_win_over_the_server_copy(self):
+        # the server copy has the old acme.md; here it was just edited, and a new note is not there at all
+        self.script(self.rg, f'exec "{copilot.find_rg() or "false"}" "$@"')
+        if not copilot.find_rg():
+            self.skipTest("ripgrep is not installed here")
+        with open(os.path.join(self.notes, "wiki", "acme.md"), "w", encoding="utf-8") as f:
+            f.write("# ACME\nNew office.\n- ACME tax ID: 99.999.999/0001-99 (changed today)\nOwner: Bia\n")
+        with open(os.path.join(self.notes, "raw", "fresh.md"), "w", encoding="utf-8") as f:
+            f.write("zorblax counter: 7\n")
+        self.settings()
+        info, out = {}, io.StringIO()
+        with contextlib.redirect_stdout(out):
+            found = copilot.fact_search(["tax", "acme"], self.dirs, ["*.mbox", "*.gz"], 10, remote=True, info=info)
+        self.assertEqual((info["search_where"], info["recent"]), ("remote", 2))   # acme.md and fresh.md
+        acme = [s for s in found if s["path"] == "wiki/acme.md"]
+        self.assertEqual(sorted(s["text"] for s in acme), ["# ACME", "- ACME tax ID: 99.999.999/0001-99 (changed today)"])
+        self.assertNotIn("12.345.678", " ".join(s["text"] + s["context"] for s in found))   # the server's old line
+        acme = [s for s in acme if "99.999" in s["text"]]
+        self.assertEqual(acme[0]["context"].splitlines()[-1], "Owner: Bia")       # read here, not there
+        self.assertIn("+2recent", copilot.fact_log({"search_s": 0.1, "found": 1, "search_where": "remote",
+                                                    "recent": 2}))
+        found = copilot.fact_search(["zorblax"], self.dirs, [], 10, remote=True, info=info)
+        self.assertEqual(sorted(s["path"] for s in found), ["raw/fresh.md", "raw/only-there.md"])
+        self.assertEqual(self.calls(), 2)                 # still one call there per round
+        # FACT_RECENT_MIN=0: only the server copy
+        self.settings(FACT_RECENT_MIN="0")
+        info = {}
+        found = copilot.fact_search(["zorblax"], self.dirs, [], 10, remote=True, info=info)
+        self.assertEqual([s["path"] for s in found], ["raw/only-there.md"])
+        self.assertNotIn("recent", info)
+
+    def test_no_recent_search_when_the_server_fails(self):
+        # the whole search runs here then; the recent files are not counted twice
+        with open(os.path.join(self.notes, "raw", "fresh.md"), "w", encoding="utf-8") as f:
+            f.write("zorblax counter: 7\n")
+        self.script(self.rg, "exit 99")
+        self.settings()
+        open(self.down, "w").close()
+        found, where, _ = self.search(["zorblax"])
+        self.assertEqual((where, [(s["path"], s["line"]) for s in found]),
+                         ("local-remote-failed", [("raw/fresh.md", 1)]))
 
     def test_fact_log_names_where(self):
         self.settings()

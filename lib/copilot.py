@@ -873,6 +873,13 @@ class Settings:
                                 "a REMOTE ending in claude (or MEETING_COPILOT_REMOTE_RG): the text search runs here")
         self.fact_search_where = "remote" if where != "local" and can else "local"
         self.fact_search_remote_s = self._num(g, "FACT_SEARCH_REMOTE_S", 3.0)
+        # FACT_RECENT_MIN: with the remote search, the files changed here in the last minutes (the server's copy
+        # may not have them yet) are searched here at the same time; 0: off
+        try:
+            self.fact_recent_min = max(0.0, float(g("FACT_RECENT_MIN", "15")))
+        except ValueError:
+            self.notices.append(f"MEETING_COPILOT_FACT_RECENT_MIN is not a number, using 15: {g('FACT_RECENT_MIN')}")
+            self.fact_recent_min = 15.0
         # https on the LAN listener, with a certificate from a local CA (see lib/tlscert.py), so a phone's
         # camera can be used (a page at http://copilot.local is not a secure context). Default: on when
         # LAN is on and CAMERA or LOOK is on.
@@ -2968,6 +2975,32 @@ def _rg_hits(rg: str, pats: list[str], dirs: list[Path], skip: list[str]) -> lis
     return _rg_out(p)
 
 
+def recent_files(dirs: list[Path], skip: list[str], minutes: float) -> list[str]:
+    """The files in dirs changed in the last minutes, as the text search would read them (no hidden files or
+    folders, no FACT_SKIP names, none over FACT_FILE_MAX_BYTES). A walk with os.scandir: 0.02-0.03 s for 7400
+    files in 108 folders (27/11), against 0.16-0.23 s for mdfind (and Spotlight's state for the Dropbox
+    folder was "unknown"); a folder's own time does not change when a file in it is edited in place, so
+    every folder is listed."""
+    import fnmatch
+    cut, out, stack = time.time() - minutes * 60, [], [str(d) for d in dirs]
+    while stack:
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    if e.name.startswith("."):
+                        continue
+                    if e.is_dir(follow_symlinks=False):
+                        stack.append(e.path)
+                    elif e.is_file() and not any(fnmatch.fnmatch(e.name, g) for g in skip):
+                        st = e.stat()
+                        if st.st_mtime >= cut and st.st_size <= FACT_FILE_MAX_BYTES:
+                            out.append(e.path)
+        except OSError:
+            continue
+    return sorted(out)
+
+
 class FactRemote:
     """The remote text search: after a failure it is left alone for REMOTE_RETRY_S (this machine searches),
     so a machine that is out costs FACT_SEARCH_REMOTE_S once, not every round."""
@@ -3010,8 +3043,18 @@ def _search_hits(terms: list[str], dirs: list[Path], skip: list[str], rg: str | 
                  ctx: dict, info: dict | None) -> list[tuple[str, int, str]]:
     """The lines found: on the remote machine for the folders it has a copy of (when remote and it answers),
     here for the rest and as the fallback. info["search_where"]: remote, local, local-remote-failed (it failed
-    this round) or local-remote-out (it failed in the last REMOTE_RETRY_S, or the remote AI is out)."""
+    this round) or local-remote-out (it failed in the last REMOTE_RETRY_S, or the remote AI is out).
+    The server's copy lags behind (synced every few minutes), so while it searches, the files here changed in
+    the last FACT_RECENT_MIN minutes are searched here at the same time; for those files this machine's lines
+    replace the server's."""
     rg_pats = [term_pattern(t, rg=True) for t in terms]
+    py_pats = [term_pattern(t) for t in terms]
+    rg = find_rg() if rg == "auto" else rg
+
+    def here_hits(places: list) -> list[tuple[str, int, str]]:
+        if not places:
+            return []
+        return _rg_hits(rg, rg_pats, places, skip) if rg else _py_hits(py_pats, places, skip)
     here, where = list(dirs), "local"
     hits: list[tuple[str, int, str]] = []
     there = [d for d in dirs if remote_dir(d, S.remote_paths)] if remote else []
@@ -3019,6 +3062,20 @@ def _search_hits(terms: list[str], dirs: list[Path], skip: list[str], rg: str | 
         if _mono() < FactRemote.off_until or not REMOTE.use():
             where = "local-remote-out"
         else:
+            recent: dict = {}
+
+            def search_recent() -> None:
+                try:
+                    t = _mono()
+                    files = recent_files(there, skip, S.fact_recent_min)
+                    recent["files"] = files
+                    recent["hits"] = here_hits(files)
+                    recent["s"] = _mono() - t
+                except (OSError, RuntimeError, subprocess.SubprocessError) as ex:
+                    recent["error"] = ex
+            th = threading.Thread(target=search_recent, daemon=True) if S.fact_recent_min > 0 else None
+            if th:
+                th.start()
             try:
                 hits = _rg_remote_hits(rg_pats, there, skip, ctx)
                 here, where = [d for d in dirs if d not in there], "remote"
@@ -3031,9 +3088,21 @@ def _search_hits(terms: list[str], dirs: list[Path], skip: list[str], rg: str | 
                       f"(the next try there in {S.remote_retry_s:g} s)", flush=True)
                 hits = []
                 ctx.clear()
-    if here:
-        rg = find_rg() if rg == "auto" else rg
-        hits += _rg_hits(rg, rg_pats, here, skip) if rg else _py_hits([term_pattern(t) for t in terms], here, skip)
+            if th:
+                th.join(FACT_SEARCH_TIMEOUT_S + 1)
+            if where == "remote" and th:
+                if "error" in recent:
+                    raise recent["error"]           # the round fails as a local search failure would
+                if "files" not in recent:
+                    raise RuntimeError("the search of the recent files did not finish")
+                mine = set(recent["files"])
+                if mine:
+                    hits = [h for h in hits if h[0] not in mine] + recent["hits"]
+                    for path in mine:
+                        ctx.pop(path, None)         # their context is read from this machine's file
+                if info is not None:
+                    info["recent"], info["recent_s"] = len(mine), recent["s"]
+    hits += here_hits(here)
     if info is not None:
         info["search_where"] = where
     return hits
@@ -3046,7 +3115,9 @@ def _py_hits(pats: list[str], dirs: list[Path], skip: list[str]) -> list[tuple[s
     hits = []
     t_end = _mono() + FACT_SEARCH_TIMEOUT_S
     for d in dirs:
-        for root, subdirs, files in os.walk(d):
+        # a file (the recent files of a remote search) is searched alone
+        walk = [(os.path.dirname(d), [], [os.path.basename(d)])] if os.path.isfile(d) else os.walk(d)
+        for root, subdirs, files in walk:
             subdirs[:] = sorted(s for s in subdirs if not s.startswith("."))
             for name in sorted(files):
                 if name.startswith(".") or any(fnmatch.fnmatch(name, g) for g in skip):
@@ -3286,7 +3357,8 @@ def fact_log(info: dict) -> str:
         parts.append(f"terms={len(info['terms'])}")       # the words themselves stay out of the log
     if "search_s" in info:
         parts.append(f"search={info['search_s']:.2f}s/{info['found']}"
-                     + (f"/{info['search_where']}" if S.remote and info.get("search_where") else ""))
+                     + (f"/{info['search_where']}" if S.remote and info.get("search_where") else "")
+                     + (f"+{info['recent']}recent/{info.get('recent_s', 0):.2f}s" if info.get("recent") else ""))
     if "pick_s" in info:
         parts.append(f"pick={'failed' if info.get('pick_err') else info.get('pick') or '-'}:"
                      f"{info.get('pick_p', 0):.2f}/{info['pick_s']:.1f}s")
