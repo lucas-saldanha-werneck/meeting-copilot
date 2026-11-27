@@ -15,5 +15,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: ripgrep (the fact search tests run with it and without it)
+        if: runner.os != 'Windows'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+        run: if [ "$RUNNER_OS" = Linux ]; then sudo apt-get install -y ripgrep; else brew install ripgrep; fi
       - run: bash -n bin/meeting-copilot && bash -n install.sh
       - run: python tests/test_copilot.py -v

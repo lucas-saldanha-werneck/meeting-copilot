@@ -206,6 +206,9 @@ Every key:
 | `MEETING_COPILOT_REMOTE_PATHS` | empty | `local=remote` folder pairs (separated by `:`) that map the search folders to their copies on that machine |
 | `MEETING_COPILOT_REMOTE_MCP_CONFIG` | empty | The MCP config file on that machine (`MCP_TOOLS` applies to it); empty: no MCP tools while the AI runs there |
 | `MEETING_COPILOT_REMOTE_FIRST_BYTE_S`, `_REMOTE_RETRY_S` | `6`, `30` | A one-shot call there that prints nothing for this long runs here instead; how often the machine is checked again while it is out (doubling after each failed check, at most 5 min) |
+| `MEETING_COPILOT_FACT_SEARCH` | `remote` with `REMOTE` and `REMOTE_PATHS`, else `local` | Where the fast fact search's text search runs: `remote` (ripgrep on that machine, over its copy of the folders, this Mac as the fallback) or `local`. See [Fast fact search](#fast-fact-search) |
+| `MEETING_COPILOT_FACT_SEARCH_REMOTE_S` | `3` | Seconds the remote text search may take before this Mac searches instead (and keeps searching for `REMOTE_RETRY_S`) |
+| `MEETING_COPILOT_REMOTE_RG` | `REMOTE` with `claude` made `rg` | The command that starts ripgrep on that machine, e.g. `ssh myserver docker exec -i copilot-ai rg` |
 | `MEETING_COPILOT_CONTEXT_FILE` | empty | A text file about you that both AI calls read: your name and role, your projects, what your notes folders and MCP tools hold, words the transcript tends to get wrong. The first 8000 characters are used |
 | `MEETING_COPILOT_LANGUAGE` | empty (the meeting's language) | Language for every suggestion, fact and Look answer, e.g. `Brazilian Portuguese`. The language menu on the page overrides it (see [Language](#language)) |
 | `MEETING_COPILOT_PROMPT_FILE` | empty (the built-in prompt) | A text file that replaces the built-in suggestions prompt. See [Your own prompt](#your-own-prompt) |
@@ -247,8 +250,9 @@ the default then; `tools` keeps only the old way):
    `FACT_GATE_MIN` (0.5): nothing is searched and nothing is shown.
 2. **Search words** come from the new lines with plain rules (no stopwords, no accents, a final s cut);
    the words Jev rates below 0.7 leave the search ("custou", "nota"), the others count as much as Jev says.
-3. **Text search** of the search folders on this machine: ripgrep when installed (`rg` on the PATH or in
-   Homebrew's folders), else a slower Python search. Files matching `FACT_SKIP` (`*.mbox,*.gz`) and hidden
+3. **Text search** of the search folders: on the server with `MEETING_COPILOT_REMOTE` (see below), else on
+   this machine with ripgrep when installed (`rg` on the PATH or in Homebrew's folders), else a slower Python
+   search. Files matching `FACT_SKIP` (`*.mbox,*.gz`) and hidden
    files and folders are skipped; `.gitignore` and `.ignore` files are not followed (both searches read the
    same files). A word counts as a whole word, with or without accents, a plural `s`/`es` allowed. A line
    scores the rarity of each word in it, plus each word in its file or folder name (a WhatsApp export named
@@ -263,12 +267,23 @@ the default then; `tools` keeps only the old way):
 The AI with tools still runs when this cannot answer: the first Jev call out (no key, a timeout, an HTTP
 error; the log says `Jev failed (...), the fact search uses the AI with tools`), no line found, or the small-model call failed (or `FACT_CHECK_MODEL=off` and Jev was unsure). The log line of each
 round has the stages, for example `data ok in 0.6s (found) fast: gate=0.95/0.2s terms=4 search=0.18s/10
-pick=s0:0.98/0.2s picked $0.00013`; the words and the lines stay out of the log. Jev costs about US$0.00001
+pick=s0:0.98/0.2s picked $0.00013` (with `REMOTE`, `search=0.45s/10/remote`: where it ran); the words and the lines stay out of the log. Jev costs about US$0.00001
 per 300 words sent. `tools/bench_facts.py questions.json` runs the same questions through both ways on your
 own notes and prints seconds, cost and right or wrong.
 
-The text search runs on this Mac even with `MEETING_COPILOT_REMOTE`: the notes are local, ripgrep there takes
-0.1-0.5 s, and the same search on the server through ssh took 0.35-1 s (no ripgrep in the container).
+**Where the text search runs.** With `MEETING_COPILOT_REMOTE` and `REMOTE_PATHS` it runs on the server by
+default (`MEETING_COPILOT_FACT_SEARCH=remote`): ripgrep there, one ssh call per round with every word in it,
+over the server's copy of the search folders, with the line above and below each line found in the same answer
+(no second call). Paths come back as this Mac's. The same rules hold (hidden files, `FACT_SKIP`, no
+`.gitignore`, NFD text); the whole-word check and the scoring run here. Why: on an idle Mac ripgrep takes
+0.1-0.5 s, but on a busy Mac (the case the server is for) the search slows down with everything else. The
+server needs ripgrep (the `Dockerfile` in `tools/remote/` installs it; `REMOTE_RG` names another command).
+When the server search fails, takes more than `FACT_SEARCH_REMOTE_S` (3 s) or ripgrep is missing there, the
+round searches here, the log says `remote text search failed (...)`, and the next rounds search here for
+`REMOTE_RETRY_S` (30 s); a search folder with no `REMOTE_PATHS` pair is always searched here.
+**The server's copy is only as new as its last sync** (`sync-notes.sh` from cron, every 10 minutes for
+example): a note written in the last minutes may not be found there. Such a fact can still come from the AI
+with tools (when nothing is found) or from `MEETING_COPILOT_FACT_SEARCH=local`.
 
 ### Your own prompt
 
@@ -495,8 +510,8 @@ MEETING_COPILOT_REMOTE_MCP_CONFIG=/home/node/mcp.json
   has `where=`, and `/state` has `remote` (`on`, `why`, `since`) and `where` in each round.
   `tools/bench_live.py --remote "<command>"` measures rounds through it.
 
-`tools/remote/` has a container for the server: `Dockerfile` (Node and Claude Code; pin the version your Mac
-runs with `CLAUDE_VERSION`), `docker-compose.yml` (memory and CPU caps, no port, an `init` that reaps finished
+`tools/remote/` has a container for the server: `Dockerfile` (Node, Claude Code and ripgrep; pin the version
+your Mac runs with `CLAUDE_VERSION`), `docker-compose.yml` (memory and CPU caps, no port, an `init` that reaps finished
 processes, your notes copy mounted read-only at `/notes`), `entry.sh` (writes the MCP config from a template
 with `${VAR}`s taken from the container's environment) and `sync-notes.sh` (an rclone copy of your search
 folders, run from cron; a copy, not a mount, because Grep reads every file and each read on a mount is a cloud

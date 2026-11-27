@@ -175,6 +175,19 @@
 # checked again while it is out.
 #MEETING_COPILOT_REMOTE_FIRST_BYTE_S=6
 #MEETING_COPILOT_REMOTE_RETRY_S=30
+# Where the fast fact search's text search (ripgrep) runs. remote: on that machine,
+# one call per round over its copy of the search folders (REMOTE_PATHS), so a busy
+# Mac does not slow it down; needs ripgrep there (tools/remote/Dockerfile has it).
+# That copy is only as new as its last sync (sync-notes.sh: every 10 minutes), so a
+# note written in the last minutes may be found only by the AI with tools or by a
+# local search. local: here. Default: remote when REMOTE and REMOTE_PATHS are set.
+#MEETING_COPILOT_FACT_SEARCH=
+# Seconds the remote search may take; slower, failed (or ripgrep missing there) and
+# this round and the next ones for REMOTE_RETRY_S search here instead.
+#MEETING_COPILOT_FACT_SEARCH_REMOTE_S=3
+# The command that starts ripgrep there. Empty: REMOTE with its last word claude
+# made rg (ssh myserver docker exec -i copilot-ai rg).
+#MEETING_COPILOT_REMOTE_RG=
 
 # Intervals in seconds: suggestions, fact search, reading the transcript.
 #MEETING_COPILOT_ASSIST_S=25

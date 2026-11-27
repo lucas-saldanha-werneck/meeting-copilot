@@ -529,6 +529,14 @@ def _tool(value: str, name: str) -> str | None:
     return shutil.which(name) if sys.platform == "darwin" else None
 
 
+def remote_rg_command(remote: list[str]) -> list[str]:
+    """ripgrep on the remote machine: the REMOTE command with its last word claude (or /path/claude) made rg;
+    [] when REMOTE does not end in claude."""
+    if remote and os.path.basename(remote[-1]) == "claude":
+        return remote[:-1] + [remote[-1][:-len("claude")] + "rg"]
+    return []
+
+
 def remote_dir(d: Path, pairs: list[tuple[Path, str]]) -> str | None:
     """Where the local folder d is on the remote machine (MEETING_COPILOT_REMOTE_PATHS); None when no pair has it."""
     for local, there in pairs:
@@ -846,6 +854,25 @@ class Settings:
         self.fact_check_effort = eff
         # file name patterns the text search skips (each .mbox in the notes has a .md summary next to it)
         self.fact_skip = [p.strip() for p in g("FACT_SKIP", "*.mbox,*.gz").split(",") if p.strip()]
+        # FACT_SEARCH: where that text search runs. remote (the default with REMOTE): ripgrep on the remote
+        # machine, one call per round, over its copy of the search folders (REMOTE_PATHS), so a busy Mac does not
+        # slow it down; this machine searches when it fails or takes over FACT_SEARCH_REMOTE_S. local: here.
+        # REMOTE_RG: the command that starts ripgrep there; default: REMOTE with its last word claude -> rg.
+        where = g("FACT_SEARCH").strip().lower()
+        if where not in ("", "remote", "local"):
+            self.notices.append(f"MEETING_COPILOT_FACT_SEARCH must be remote or local, got: {where}")
+            where = ""
+        try:
+            self.remote_rg = shlex.split(g("REMOTE_RG")) or remote_rg_command(self.remote)
+        except ValueError as ex:
+            self.notices.append(f"MEETING_COPILOT_REMOTE_RG could not be read ({ex}): the text search runs here")
+            self.remote_rg = []
+        can = bool(self.remote and self.remote_rg and self.remote_paths)
+        if where == "remote" and not can:
+            self.notices.append("MEETING_COPILOT_FACT_SEARCH=remote needs MEETING_COPILOT_REMOTE, REMOTE_PATHS and "
+                                "a REMOTE ending in claude (or MEETING_COPILOT_REMOTE_RG): the text search runs here")
+        self.fact_search_where = "remote" if where != "local" and can else "local"
+        self.fact_search_remote_s = self._num(g, "FACT_SEARCH_REMOTE_S", 3.0)
         # https on the LAN listener, with a certificate from a local CA (see lib/tlscert.py), so a phone's
         # camera can be used (a page at http://copilot.local is not a secure context). Default: on when
         # LAN is on and CAMERA or LOOK is on.
@@ -1621,11 +1648,11 @@ def ssh_control_path() -> str:
     return p if len(p) + 38 < 100 else os.path.join("/tmp", f"meeting-copilot-{os.getuid()}-%C")
 
 
-def remote_command(args: list[str]) -> list[str]:
-    """MEETING_COPILOT_REMOTE plus the claude arguments. Through ssh the remote shell reads the command line
-    again, so each argument is quoted for it; ssh gets batch mode, a short connect timeout, keep-alives and
-    connection sharing, unless the REMOTE command sets one of those options itself."""
-    base = list(S.remote)
+def remote_command(args: list[str], base: list[str] | None = None) -> list[str]:
+    """MEETING_COPILOT_REMOTE (or base, e.g. REMOTE_RG) plus the arguments. Through ssh the remote shell reads
+    the command line again, so each argument is quoted for it; ssh gets batch mode, a short connect timeout,
+    keep-alives and connection sharing, unless the command sets one of those options itself."""
+    base = list(S.remote if base is None else base)
     if not base or os.path.basename(base[0]) != "ssh":
         return base + args
     given = " ".join(base[1:]).lower()
@@ -2899,28 +2926,116 @@ def find_rg() -> str | None:
     return None
 
 
-def _rg_hits(rg: str, pats: list[str], dirs: list[Path], skip: list[str]) -> list[tuple[str, int, str]]:
+def _rg_args(pats: list[str], skip: list[str], context: int = 0) -> list[str]:
     # --no-ignore: every file a .gitignore/.ignore would hide is searched too, as the Python search does
     # (hidden files and folders stay out in both)
-    args = [rg, "-i", "-n", "--no-heading", "--with-filename", "--null", "--no-messages", "--color", "never",
+    args = ["-i", "-n", "--no-heading", "--with-filename", "--null", "--no-messages", "--color", "never",
             "--no-ignore",
             "--max-columns", str(FACT_LINE_CHARS), "--max-columns-preview", "--max-count", str(FACT_PER_FILE),
             "--max-filesize", str(FACT_FILE_MAX_BYTES)]
+    if context:
+        args += ["--context", str(context)]
     for g in skip:
         args += ["-g", "!" + g]
     for p in pats:
         args += ["-e", p]
-    args += ["--", *[str(d) for d in dirs]]
-    p = subprocess.run(args, capture_output=True, timeout=FACT_SEARCH_TIMEOUT_S)
+    return args
+
+
+def _rg_out(p: subprocess.CompletedProcess, ctx: dict | None = None) -> list[tuple[str, int, str]]:
+    """The lines ripgrep found: (path, number, text). ctx: gets {path: {number: text}} of every line printed,
+    the --context lines too (path NUL number - text; a line found has : after the number)."""
     # 1: no line found; 2: an error, often one unreadable file among lines found (those are kept)
     if p.returncode not in (0, 1) and not (p.returncode == 2 and p.stdout.strip()):
         raise RuntimeError(f"rg exited {p.returncode}")
     hits = []
     for raw in p.stdout.decode("utf-8", "replace").split("\n"):
         path, _, rest = raw.partition("\0")
-        num, _, text = rest.partition(":")
-        if num.isdigit():
-            hits.append((path, int(num), nfc(text.rstrip("\r"))[:FACT_LINE_CHARS]))
+        m = re.match(r"(\d+)([:-])", rest)
+        if not m:
+            continue                         # the "--" between context groups, an empty last line
+        num, text = int(m.group(1)), rest[m.end():].rstrip("\r")
+        if m.group(2) == ":":
+            hits.append((path, num, nfc(text)[:FACT_LINE_CHARS]))
+        if ctx is not None:
+            ctx.setdefault(path, {})[num] = text
+    return hits
+
+
+def _rg_hits(rg: str, pats: list[str], dirs: list[Path], skip: list[str]) -> list[tuple[str, int, str]]:
+    p = subprocess.run([rg, *_rg_args(pats, skip), "--", *[str(d) for d in dirs]], capture_output=True,
+                       timeout=FACT_SEARCH_TIMEOUT_S, stdin=subprocess.DEVNULL)
+    return _rg_out(p)
+
+
+class FactRemote:
+    """The remote text search: after a failure it is left alone for REMOTE_RETRY_S (this machine searches),
+    so a machine that is out costs FACT_SEARCH_REMOTE_S once, not every round."""
+    off_until = 0.0
+    why = ""
+
+
+def _rg_remote_hits(pats: list[str], dirs: list[Path], skip: list[str],
+                    ctx: dict) -> list[tuple[str, int, str]]:
+    """ripgrep on the remote machine (REMOTE_RG), one call, over the remote copy of dirs (REMOTE_PATHS), with
+    one line of context around each line found (so no second call); paths come back as this machine's."""
+    pairs = [(str(d), remote_dir(d, S.remote_paths)) for d in dirs]
+    args = remote_command(_rg_args(pats, skip, context=1) + ["--", *[r for _, r in pairs]], base=S.remote_rg)
+    p = subprocess.run(args, capture_output=True, timeout=S.fact_search_remote_s, stdin=subprocess.DEVNULL)
+    if p.returncode == 255 or p.returncode >= 126:   # ssh failed; rg not found or not runnable there
+        raise RuntimeError(f"exit {p.returncode}: " + p.stderr.decode("utf-8", "replace").strip()[-150:])
+    there: dict = {}
+    hits = _rg_out(p, there)
+    back = sorted(pairs, key=lambda x: -len(x[1]))       # the deepest remote folder first
+
+    def local(path: str) -> str | None:
+        for d, r in back:
+            if path == r or path.startswith(r.rstrip("/") + "/"):
+                rel = path[len(r):].lstrip("/")
+                return os.path.join(d, rel) if rel else d
+        return None
+    out = []
+    for path, num, text in hits:
+        lp = local(path)
+        if lp:
+            out.append((lp, num, text))
+    for path, lines in there.items():
+        lp = local(path)
+        if lp:
+            ctx[lp] = lines
+    return out
+
+
+def _search_hits(terms: list[str], dirs: list[Path], skip: list[str], rg: str | None, remote: bool,
+                 ctx: dict, info: dict | None) -> list[tuple[str, int, str]]:
+    """The lines found: on the remote machine for the folders it has a copy of (when remote and it answers),
+    here for the rest and as the fallback. info["search_where"]: remote, local, local-remote-failed (it failed
+    this round) or local-remote-out (it failed in the last REMOTE_RETRY_S, or the remote AI is out)."""
+    rg_pats = [term_pattern(t, rg=True) for t in terms]
+    here, where = list(dirs), "local"
+    hits: list[tuple[str, int, str]] = []
+    there = [d for d in dirs if remote_dir(d, S.remote_paths)] if remote else []
+    if there:
+        if _mono() < FactRemote.off_until or not REMOTE.use():
+            where = "local-remote-out"
+        else:
+            try:
+                hits = _rg_remote_hits(rg_pats, there, skip, ctx)
+                here, where = [d for d in dirs if d not in there], "remote"
+            except (OSError, RuntimeError, subprocess.SubprocessError) as ex:
+                why = (f"no answer in {S.fact_search_remote_s:g} s" if isinstance(ex, subprocess.TimeoutExpired)
+                       else " ".join(str(ex).split())[:200] or type(ex).__name__)
+                FactRemote.off_until, FactRemote.why = _mono() + S.remote_retry_s, why
+                where = "local-remote-failed"
+                print(f"{clock(now())} data: remote text search failed ({why}), searching here "
+                      f"(the next try there in {S.remote_retry_s:g} s)", flush=True)
+                hits = []
+                ctx.clear()
+    if here:
+        rg = find_rg() if rg == "auto" else rg
+        hits += _rg_hits(rg, rg_pats, here, skip) if rg else _py_hits([term_pattern(t) for t in terms], here, skip)
+    if info is not None:
+        info["search_where"] = where
     return hits
 
 
@@ -2960,17 +3075,19 @@ def _py_hits(pats: list[str], dirs: list[Path], skip: list[str]) -> list[tuple[s
 
 
 def fact_search(terms: list[str], dirs: list[Path], skip: list[str], n: int = 10,
-                rg: str | None = "auto", weights: list[float] | None = None) -> list[dict]:
+                rg: str | None = "auto", weights: list[float] | None = None, remote: bool = False,
+                info: dict | None = None) -> list[dict]:
     """The n best lines for these words in the folders: [{path, line, text, context, score}], best first. A
     line scores the rarity (in this search) of each word in it, plus half that for a word only in its file's
     path (a WhatsApp export named after the company), each times its weight (Jev: how much the word names
-    what is asked; 1 without Jev); near-identical lines count once."""
+    what is asked; 1 without Jev); near-identical lines count once. remote: ripgrep runs on the remote machine
+    (FACT_SEARCH=remote), this machine's search when it fails; info gets search_where."""
     import math
     if not terms or not dirs:
         return []
     pats = [term_pattern(t) for t in terms]
-    rg = find_rg() if rg == "auto" else rg
-    hits = _rg_hits(rg, [term_pattern(t, rg=True) for t in terms], dirs, skip) if rg else _py_hits(pats, dirs, skip)
+    ctx: dict[str, dict[int, str]] = {}      # the lines around each line found, when the remote search sent them
+    hits = _search_hits(terms, dirs, skip, rg, remote, ctx, info)
     if not hits:
         return []
     rxs = [re.compile(p, re.IGNORECASE) for p in pats]
@@ -3009,6 +3126,12 @@ def fact_search(terms: list[str], dirs: list[Path], skip: list[str], n: int = 10
     files: dict[str, list[str]] = {}    # one line of context above and below; each file read once
     for s in out:
         path = s.pop("file")
+        if path in ctx:
+            near = ctx[path]
+            s["context"] = "\n".join(nfc(near[k].strip())[:FACT_LINE_CHARS] for k in range(s["line"] - 1,
+                                                                                            s["line"] + 2)
+                                     if near.get(k, "").strip())
+            continue
         if path not in files:
             try:
                 with open(path, encoding="utf-8", errors="replace", newline="") as f:
@@ -3087,7 +3210,8 @@ def fact_fast(lines: list[dict], seen: int, shown: list[str], msg: str, info: di
     info["terms"] = terms
     t = _mono()
     try:
-        snippets = fact_search(terms, S.search_dirs, S.fact_skip, S.fact_snippets, weights=weights)
+        snippets = fact_search(terms, S.search_dirs, S.fact_skip, S.fact_snippets, weights=weights,
+                               remote=S.fact_search_where == "remote", info=info)
     except (OSError, RuntimeError, subprocess.SubprocessError) as ex:
         info["search_s"], info["found"], info["stage"] = _mono() - t, 0, f"search failed ({type(ex).__name__})"
         return None
@@ -3161,7 +3285,8 @@ def fact_log(info: dict) -> str:
     if "terms" in info:
         parts.append(f"terms={len(info['terms'])}")       # the words themselves stay out of the log
     if "search_s" in info:
-        parts.append(f"search={info['search_s']:.2f}s/{info['found']}")
+        parts.append(f"search={info['search_s']:.2f}s/{info['found']}"
+                     + (f"/{info['search_where']}" if S.remote and info.get("search_where") else ""))
     if "pick_s" in info:
         parts.append(f"pick={'failed' if info.get('pick_err') else info.get('pick') or '-'}:"
                      f"{info.get('pick_p', 0):.2f}/{info['pick_s']:.1f}s")
@@ -5679,6 +5804,9 @@ def main(argv=None) -> None:
     if S.remote:
         print(f"AI calls run on the remote machine ({shlex.join(S.remote)}), and here while it does not answer",
               flush=True)
+        if S.fact_mode == "fast" and S.fact_search_where == "remote":
+            print(f"the fact text search runs there too ({shlex.join(S.remote_rg)}), here when it fails",
+                  flush=True)
     if not S.claude:
         msg = ("claude command not found: only the speaking metrics and warnings will work "
                "(install Claude Code or set MEETING_COPILOT_CLAUDE)")

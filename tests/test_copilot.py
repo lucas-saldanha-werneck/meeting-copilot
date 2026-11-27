@@ -3871,6 +3871,175 @@ class FactSearch(unittest.TestCase):
 
 
 @unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
+class FactSearchRemote(unittest.TestCase):
+    """MEETING_COPILOT_FACT_SEARCH=remote: ripgrep on the remote machine through the fake ssh (tests/fake_ssh.py
+    runs the command with /bin/sh -c here), over a "server" copy of the notes (REMOTE_PATHS), with this
+    machine's search as the fallback."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        t = self.t = os.path.realpath(self.tmp.name)
+        self.notes = fact_notes(t)
+        self.server = os.path.join(t, "server", "notes")
+        shutil.copytree(self.notes, self.server)
+        # a line only the server copy has: found there, shown under this machine's path
+        with open(os.path.join(self.server, "raw", "only-there.md"), "w", encoding="utf-8") as f:
+            f.write("before\nzorblax serial: 42\nafter\n")
+        self.dirs = [copilot.Path(self.notes, "wiki"), copilot.Path(self.notes, "raw")]
+        rbin = os.path.join(t, "rbin")
+        os.makedirs(rbin)
+        self.ssh, self.rg = os.path.join(rbin, "ssh"), os.path.join(rbin, "rg")
+        self.ssh_log, self.down, self.hang = (os.path.join(t, n) for n in ("ssh.jsonl", "down", "hang"))
+        self.script(self.ssh, f'exec "{PY}" "{ROOT}/tests/fake_ssh.py" "$@"')
+        self.old = (copilot.S, dict(os.environ), copilot.FactRemote.off_until)
+        os.environ.update(FAKE_SSH_LOG=self.ssh_log, FAKE_SSH_DOWN=self.down, FAKE_SSH_HANG=self.hang)
+        copilot.REMOTE.reset()
+        copilot.FactRemote.off_until = 0.0
+
+    def tearDown(self):
+        copilot.S, env, copilot.FactRemote.off_until = self.old
+        os.environ.clear()
+        os.environ.update(env)
+        copilot.REMOTE.reset()
+        self.tmp.cleanup()
+
+    def script(self, path, body):
+        with open(path, "w") as f:
+            f.write("#!/bin/sh\n" + body + "\n")
+        os.chmod(path, 0o755)
+
+    def settings(self, **extra):
+        cfg = {"MEETING_COPILOT_DATA_DIR": os.path.join(self.t, "data"), "MEETING_COPILOT_API_CREDIT": "off",
+               "MEETING_COPILOT_SEARCH_DIRS": os.pathsep.join(map(str, self.dirs)),
+               "MEETING_COPILOT_REMOTE": f"{self.ssh} myserver {os.path.dirname(self.rg)}/claude",
+               "MEETING_COPILOT_REMOTE_PATHS": f"{self.notes}={self.server}",
+               "MEETING_COPILOT_FACT_SEARCH_REMOTE_S": "2", "MEETING_COPILOT_REMOTE_RETRY_S": "30"}
+        cfg.update({"MEETING_COPILOT_" + k: v for k, v in extra.items()})
+        copilot.S = copilot.Settings(cfg)
+        return copilot.S
+
+    def calls(self):
+        if not os.path.exists(self.ssh_log):
+            return 0
+        with open(self.ssh_log) as f:
+            return sum(1 for _ in f)
+
+    def search(self, terms, rg="auto"):
+        info, out = {}, io.StringIO()
+        with contextlib.redirect_stdout(out):
+            found = copilot.fact_search(terms, self.dirs, ["*.mbox", "*.gz"], 10, rg=rg,
+                                        remote=copilot.S.fact_search_where == "remote", info=info)
+        return found, info.get("search_where"), out.getvalue()
+
+    def test_settings(self):
+        s = self.settings()
+        self.assertEqual(s.fact_search_where, "remote")
+        self.assertEqual(s.remote_rg, [self.ssh, "myserver", self.rg])
+        self.assertEqual(self.settings(FACT_SEARCH="local").fact_search_where, "local")
+        self.assertEqual(self.settings(REMOTE="").fact_search_where, "local")
+        self.assertEqual(self.settings(REMOTE_PATHS="").fact_search_where, "local")
+        # a REMOTE that does not end in claude: only with REMOTE_RG
+        s = self.settings(REMOTE=f"{self.ssh} myserver my-wrapper", FACT_SEARCH="remote")
+        self.assertEqual(s.fact_search_where, "local")
+        self.assertTrue(any("FACT_SEARCH=remote needs" in n for n in s.notices))
+        s = self.settings(REMOTE=f"{self.ssh} myserver my-wrapper", REMOTE_RG=f"{self.ssh} myserver rg")
+        self.assertEqual((s.fact_search_where, s.remote_rg), ("remote", [self.ssh, "myserver", "rg"]))
+        self.assertTrue(any("FACT_SEARCH must be" in n for n in self.settings(FACT_SEARCH="vps").notices))
+        self.assertEqual(copilot.remote_rg_command(["ssh", "h", "docker", "exec", "-i", "c", "claude"]),
+                         ["ssh", "h", "docker", "exec", "-i", "c", "rg"])
+
+    def test_paths_and_context_come_back_from_one_call(self):
+        # a canned ripgrep "there": its paths are the server's, with --context lines (NUL number - text)
+        acme = os.path.join(self.server, "wiki", "acme.md")
+        there = os.path.join(self.server, "raw", "only-there.md")
+        out = (f"{acme}\\0003-Customer since 2024.\\n{acme}\\0004:- ACME tax ID: 12.345.678/0001-90\\n"
+               f"{acme}\\0005-Owner: Ana\\n--\\n{there}\\0002:tax zorblax 42\\n{there}\\0003-after\\n")
+        self.script(self.rg, f"printf '%s' \"$*\" > '{self.t}/rg-args'\nprintf '{out}'")
+        self.settings()
+        found, where, _ = self.search(["tax", "zorblax"])
+        self.assertEqual(where, "remote")
+        self.assertEqual(self.calls(), 1)
+        by = {s["path"]: s for s in found}
+        self.assertEqual(by["wiki/acme.md"]["context"].splitlines(),
+                         ["Customer since 2024.", "- ACME tax ID: 12.345.678/0001-90", "Owner: Ana"])
+        # only-there.md is not on this machine: its context came in the same answer
+        self.assertEqual(by["raw/only-there.md"]["context"].splitlines(), ["tax zorblax 42", "after"])
+        with open(os.path.join(self.t, "rg-args")) as f:
+            args = f.read()
+        for want in ("--no-ignore", "--context 1", "!*.mbox", os.path.join(self.server, "wiki"),
+                     os.path.join(self.server, "raw")):
+            self.assertIn(want, args)
+        self.assertNotIn(self.notes + "/", args)
+
+    @unittest.skipUnless(copilot.find_rg(), "ripgrep is not installed here")
+    def test_real_ripgrep_there(self):
+        self.script(self.rg, f'exec "{copilot.find_rg()}" "$@"')
+        self.settings()
+        found, where, _ = self.search(["zorblax"])
+        self.assertEqual(where, "remote")
+        self.assertEqual([(s["path"], s["line"], s["context"]) for s in found],
+                         [("raw/only-there.md", 2, "before\nzorblax serial: 42\nafter")])
+        found, _, _ = self.search(["tax", "acme"])
+        self.assertEqual((found[0]["path"], found[0]["line"]), ("wiki/acme.md", 4))
+        text = " ".join(s["text"] for s in found)
+        for skipped in ("00.000.000", "11.111.111", "22.222.222"):   # .mbox, .gz, hidden folder
+            self.assertNotIn(skipped, text)
+        # an NFD file there is found by the word without accents, and the whole-word check still runs here
+        with open(os.path.join(self.server, "raw", "nfd.md"), "w", encoding="utf-8") as f:
+            f.write("Orçamento final: R$ 9\ntaxi fare 30\n")
+        found, _, _ = self.search(["orcamento"])
+        self.assertIn("Orçamento final: R$ 9", [s["text"] for s in found])
+        self.assertNotIn("raw/nfd.md", [s["path"] for s in self.search(["tax"])[0]])
+
+    def test_falls_back_here_when_the_machine_is_out(self):
+        self.script(self.rg, "exit 99")
+        self.settings()
+        open(self.down, "w").close()
+        found, where, log = self.search(["zorblax"])
+        self.assertEqual(where, "local-remote-failed")
+        self.assertIn("remote text search failed", log)
+        self.assertEqual(found, [])                       # this machine has no only-there.md
+        found, where, _ = self.search(["tax", "acme"])
+        self.assertEqual((where, found[0]["path"]), ("local-remote-out", "wiki/acme.md"))
+        self.assertEqual(self.calls(), 1)                 # not tried again before REMOTE_RETRY_S
+        copilot.FactRemote.off_until = 0.0
+        os.remove(self.down)
+        self.script(self.rg, f'exec "{copilot.find_rg() or "false"}" "$@"')
+        if copilot.find_rg():
+            self.assertEqual(self.search(["zorblax"])[1], "remote")
+
+    def test_falls_back_on_a_slow_answer_or_no_ripgrep_there(self):
+        self.script(self.rg, "exit 99")
+        self.settings(FACT_SEARCH_REMOTE_S="0.5")
+        open(self.hang, "w").close()
+        t = time.monotonic()
+        found, where, log = self.search(["tax", "acme"])
+        self.assertLess(time.monotonic() - t, 5)
+        self.assertEqual((where, found[0]["path"]), ("local-remote-failed", "wiki/acme.md"))
+        self.assertIn("no answer in 0.5 s", log)
+        os.remove(self.hang)
+        copilot.FactRemote.off_until = 0.0
+        os.remove(self.rg)                                # "rg: not found" there: exit 127
+        found, where, log = self.search(["tax", "acme"])
+        self.assertEqual((where, found[0]["path"]), ("local-remote-failed", "wiki/acme.md"))
+        self.assertIn("exit 127", log)
+        # rg there exits 2 with nothing found: an error, searched here
+        copilot.FactRemote.off_until = 0.0
+        self.script(self.rg, "exit 2")
+        self.assertEqual(self.search(["tax", "acme"])[1], "local-remote-failed")
+
+    def test_local_setting_never_calls_the_machine(self):
+        self.settings(FACT_SEARCH="local")
+        found, where, _ = self.search(["tax", "acme"])
+        self.assertEqual((where, found[0]["path"], self.calls()), ("local", "wiki/acme.md", 0))
+
+    def test_fact_log_names_where(self):
+        self.settings()
+        self.assertIn("search=0.40s/3/remote", copilot.fact_log({"search_s": 0.4, "found": 3,
+                                                                 "search_where": "remote"}))
+
+
+@unittest.skipIf(WIN, NO_FAKE_CLAUDE_WHY)
 class FactFast(unittest.TestCase):
     """data_round with MEETING_COPILOT_FACT_MODE=fast, a fake Jev on localhost and the fake claude."""
 
